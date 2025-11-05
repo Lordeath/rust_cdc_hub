@@ -11,3 +11,6 @@ common = { path = "common" }
 source = { path = "source" }
 source_mysql = { path = "source/source_mysql" }
 sink = { path = "sink" }
+tokio = "1.48.0"
+serde_yaml = "0.9.34+deprecated"
+serde_json = "1.0.145"

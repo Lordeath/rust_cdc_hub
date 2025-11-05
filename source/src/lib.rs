@@ -1,14 +1,23 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+use common::{CdcConfig, Source, SourceType};
+use std::sync::Arc;
+
+pub struct SourceFactory;
+
+impl SourceFactory {
+    pub fn create_source(config: CdcConfig) -> Arc<dyn Source> {
+        match config.source_type {
+            SourceType::MySQL => Arc::new(source_mysql::MySQLSource::new(config)),
+        }
+    }
 }
+
+// // 这一步允许其他 crate 调用 factory
+// pub use source_mysql;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+        assert_eq!(4, 4);
     }
 }

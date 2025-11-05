@@ -1,14 +1,14 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+use common::{CdcConfig, Sink, SinkType};
+use sink_print::PrintSink;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub struct SinkFactory;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+impl SinkFactory {
+    pub fn create_sink(config: CdcConfig) -> Arc<Mutex<dyn Sink + Send + Sync>> {
+        match config.sink_type {
+            SinkType::Print => Arc::new(Mutex::new(PrintSink::new())),
+        }
     }
 }
