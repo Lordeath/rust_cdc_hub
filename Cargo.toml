@@ -1,5 +1,5 @@
 [workspace]
-members = ["source", "sink", "common"]
+members = ["source","source/source_mysql", "sink", "common"]
 
 [package]
 name = "rust_cdc_hub"
@@ -9,4 +9,5 @@ edition = "2024"
 [dependencies]
 common = { path = "common" }
 source = { path = "source" }
+source_mysql = { path = "source/source_mysql" }
 sink = { path = "sink" }
