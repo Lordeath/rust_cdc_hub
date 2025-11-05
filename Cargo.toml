@@ -1,0 +1,12 @@
+[workspace]
+members = ["source", "sink", "common"]
+
+[package]
+name = "rust_cdc_hub"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common = { path = "common" }
+source = { path = "source" }
+sink = { path = "sink" }
