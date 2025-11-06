@@ -21,14 +21,6 @@ pub struct MySQLSource {
     // db:  DbConn,
 }
 
-// #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, DeriveEntityModel)]
-// #[serde(rename_all = "camelCase")]
-// #[sea_orm(table_name = "running_event")]
-// // #[sea_orm(from_query_result)]
-// pub struct ModelXXX {
-//     pub column_name: String,
-// }
-
 impl MySQLSource {
     pub fn new(config: CdcConfig) -> Self {
         // let config = self.config.clone();
@@ -50,11 +42,6 @@ impl MySQLSource {
         println!("Connecting to MySQL binlog at {}", connection_url.clone());
 
         let server_id: u64 = config.get_u64("server_id");
-        // let binlog_filename = config.get("binlog_filename");
-        // let binlog_position: u32 = config.get_u32("binlog_position");
-        // let gtid_set = config.get("gtid_set");
-
-        // let start_position = StartPosition::Latest;
         let table_name = config.get("table_name");
 
         Self {
@@ -116,36 +103,6 @@ impl MySQLSource {
             order by c.ORDINAL_POSITION
         "#;
 
-        // let params = vec![self.database.clone(), self.table_name.clone()];
-
-        // 3. 创建 Statement，SeaORM 会根据 DbBackend::MySql 使用 `?`作为占位符
-        // let stmt = Statement::from_sql_and_values(DbBackend::MySql, sql, vec![self.database.clone(), self.table_name.clone()]);
-        // 4. 执行查询并将结果映射到 Vec<running_event::Model>
-        // ModelXXX::find_by_statement(stmt)
-        //     .all(&self.db)
-        //     .await
-        //     .unwrap_or_else(|e| {
-        //         panic!("Error executing query: {}", e);
-        //     })
-
-        // let conn = match Database::connect(&self.connection_url).await {
-        //     Ok(c) => c,
-        //     Err(e) => {
-        //         // error!("sea-orm {}", e);
-        //         // error!("sea-orm 数据库连接失败");
-        //         // process::exit(1);
-        //         panic!("sea-orm 数据库连接失败 {}", e)
-        //     }
-        // };
-        //
-        //
-        // conn.query_all(stmt)
-        //     .await
-        //     .unwrap_or_else(|e| panic!("Error executing query: {}", e))
-        //     .into_iter()
-        //     .map(|row| row.get("column_name"))
-        //     .collect()
-
         let pool = MySqlPool::connect(&self.connection_url).await.unwrap();
 
         sqlx::query(sql)
@@ -159,21 +116,15 @@ impl MySQLSource {
             .into_iter()
             .map(|row| row.get("column_name"))
             .collect()
-        //
-        // conn.execute(Statement::from_sql_and_values(
-        //     DbBackend::MySql,
-        //     sql,
-        //     params,
-        // ))
-        // .await
     }
 
     async fn parse_row(
         &self,
         row: RowEvent,
-        data: &mut HashMap<String, Value>,
+        // data: &mut HashMap<String, Value>,
         columns: &mut Mutex<Vec<String>>,
-    ) {
+    ) -> HashMap<String, Value> {
+        let mut data: HashMap<String, Value> = HashMap::new();
         let mut index = 0;
         if columns.lock().await.len() != row.column_values.len() {
             let columns_new = self.fill_table_column().await;
@@ -247,6 +198,7 @@ impl MySQLSource {
             }
             index = index + 1;
         }
+        data
     }
 }
 
@@ -254,7 +206,7 @@ impl MySQLSource {
 impl Source for MySQLSource {
     async fn start(
         &self,
-        mut sink: Arc<tokio::sync::Mutex<dyn Sink + Send + Sync>>,
+        mut sink: Arc<Mutex<dyn Sink + Send + Sync>>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("Starting MySQL binlog source");
         let mut stream = BinlogClient::new(
@@ -278,7 +230,6 @@ impl Source for MySQLSource {
         .await
         .unwrap();
 
-        // let mut columns: Vec<String> = vec![];
         let mut columns: Mutex<Vec<String>> = Mutex::new(vec![]);
         // 这里获取列名
         // columns = self.fill_table_column().await;
@@ -304,9 +255,8 @@ impl Source for MySQLSource {
                             if self.is_target_database_and_table(database_name, table_name) {
                                 println!("WriteRows: {}.{}", database_name, table_name);
                                 for row in event.rows {
-                                    let mut before: HashMap<String, Value> = HashMap::new();
-                                    let mut after: HashMap<String, Value> = HashMap::new();
-                                    self.parse_row(row, &mut after, &mut columns).await;
+                                    let before: HashMap<String, Value> = HashMap::new();
+                                    let after: HashMap<String, Value> = self.parse_row(row, &mut columns).await;
                                     let op = Operation::CREATE;
                                     let data_buffer = DataBuffer { before, after, op };
                                     // sink.lock().await.write_record(&data_buffer);
@@ -321,9 +271,8 @@ impl Source for MySQLSource {
                             if self.is_target_database_and_table(database_name, table_name) {
                                 println!("DeleteRows: {}.{}", database_name, table_name);
                                 for row in event.rows {
-                                    let mut before: HashMap<String, Value> = HashMap::new();
-                                    let mut after: HashMap<String, Value> = HashMap::new();
-                                    self.parse_row(row, &mut before, &mut columns).await;
+                                    let before: HashMap<String, Value> = self.parse_row(row, &mut columns).await;
+                                    let after: HashMap<String, Value> = HashMap::new();
                                     let op = Operation::DELETE;
                                     let data_buffer = DataBuffer { before, after, op };
                                     // sink.lock().await.write_record(&data_buffer);
@@ -338,10 +287,8 @@ impl Source for MySQLSource {
                             if self.is_target_database_and_table(database_name, table_name) {
                                 println!("UpdateRows: {}.{}", database_name, table_name);
                                 for (b, a) in event.rows {
-                                    let mut before: HashMap<String, Value> = HashMap::new();
-                                    let mut after: HashMap<String, Value> = HashMap::new();
-                                    self.parse_row(b, &mut before, &mut columns).await;
-                                    self.parse_row(a, &mut after, &mut columns).await;
+                                    let before: HashMap<String, Value> = self.parse_row(b, &mut columns).await;
+                                    let after: HashMap<String, Value> = self.parse_row(a, &mut columns).await;
                                     let op = Operation::UPDATE;
                                     let data_buffer = DataBuffer { before, after, op };
                                     // sink.lock().await.write_record(&data_buffer);
@@ -352,23 +299,14 @@ impl Source for MySQLSource {
                         _ => {}
                     }
                     Self::flush_with_retry(&mut sink).await;
-                    // retry_3_async(async || sink.lock().await.flush());
                 }
                 Err(e) => {
                     // 打印错误信息，并且继续监听
                     println!("Error: {}", e);
                 }
             }
-            // tokio::time::sleep(Duration::from_secs(5)).await;
-
-            // let data_buffer = common::DataBuffer::new(data);
         }
     }
-}
-struct TableInfo {
-    database_name: String,
-    table_name: String,
-    // columns: Vec<String>,
 }
 
 #[cfg(test)]

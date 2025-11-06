@@ -3,8 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
-use std::{thread, time::Duration};
-use tokio::time::sleep;
 
 #[async_trait]
 pub trait Source: Send + Sync {
