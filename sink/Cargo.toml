@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 common = { path = "../common" }
 sink_print = { path = "sink_print" }
+sink_meilisearch = { path = "sink_meilisearch" }
 tokio = "1.48.0"

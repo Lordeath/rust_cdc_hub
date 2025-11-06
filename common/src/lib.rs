@@ -10,6 +10,7 @@ pub trait Source: Send + Sync {
 }
 
 /// Sink trait: 所有目标端都要实现它
+#[async_trait]
 pub trait Sink {
     /// 连接目标端（如 Kafka、文件、数据库）
     fn connect(&mut self) -> Result<(), Box<dyn Error>>;
@@ -32,6 +33,7 @@ pub enum SourceType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SinkType {
     Print,
+    MeiliSearch,
     // 未来可扩展：Postgres, Kafka, Mongo, 等
 }
 
