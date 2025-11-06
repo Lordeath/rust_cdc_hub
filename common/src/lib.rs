@@ -64,7 +64,7 @@ impl CdcConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataBuffer {
     // pub db: String,
     // pub table: String,
@@ -76,7 +76,7 @@ pub struct DataBuffer {
     // pub timestamp: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     // Str(String),
     // Num(i64),
@@ -121,9 +121,32 @@ pub enum Value {
     Bit(u64),
 }
 
-#[derive(Debug, Clone)]
+impl Value {
+    pub fn to_raw_string(&self) -> String {
+        match self {
+            Value::String(s) => s.to_string(),
+            Value::Tiny(s) => s.to_string(),
+            Value::Short(s) => s.to_string(),
+            Value::Long(s) => s.to_string(),
+            Value::LongLong(s) => s.to_string(),
+            Value::Float(s) => s.to_string(),
+            Value::Double(s) => s.to_string(),
+            Value::Decimal(s) => s.to_string(),
+            Value::Time(s) => s.to_string(),
+            Value::Date(s) => s.to_string(),
+            Value::DateTime(s) => s.to_string(),
+            Value::Timestamp(s) => s.to_string(),
+            Value::Year(s) => s.to_string(),
+            Value::Blob(s) => s.to_string(),
+            Value::Bit(s) => s.to_string(),
+            _ => "null".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Operation {
-    READ,
+    // READ,
     CREATE,
     UPDATE,
     DELETE,

@@ -141,9 +141,7 @@ impl MySQLSource {
             if let ColumnValue::None = column_value {
                 data.insert(column_name, Value::None);
             } else if let ColumnValue::String(bytes) = column_value {
-                println!("string column: {}", String::from_utf8_lossy(&bytes));
                 let value: Value = Value::String(String::from_utf8_lossy(&bytes).to_string());
-                println!("value: {:?}", value);
                 data.insert(column_name, value);
             } else if let ColumnValue::Tiny(v) = column_value {
                 let value: Value = Value::Tiny(v);
