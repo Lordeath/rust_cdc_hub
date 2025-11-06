@@ -1,11 +1,9 @@
 use async_trait::async_trait;
-use common::{CdcConfig, DataBuffer, Operation, Sink, Source, Value};
+use common::{retry_3_async, CdcConfig, DataBuffer, Operation, Sink, Source, Value};
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
-use mysql_binlog_connector_rust::binlog_error::BinlogError;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
 use mysql_binlog_connector_rust::column::json::json_binary::JsonBinary;
 use mysql_binlog_connector_rust::event::event_data::EventData;
-use mysql_binlog_connector_rust::event::event_header::EventHeader;
 use mysql_binlog_connector_rust::event::row_event::RowEvent;
 use std::collections::HashMap;
 use std::error::Error;
@@ -64,26 +62,27 @@ impl Source for MySQLSource {
             self.server_id.clone(),
             StartPosition::Latest,
         )
-        // / Heartbeat interval in seconds
-        // / Server will send a heartbeat event if no binlog events are received within this interval
-        // / If heartbeat_interval_secs=0, server won't send heartbeat events
-        // / default is 0 means not enabled
-        .with_master_heartbeat(Duration::from_secs(5))
-        // / Network operation timeout in seconds
-        // / Maximum wait time for operations like connection establishment and data reading
-        // / default is 60 secs
-        .with_read_timeout(Duration::from_secs(60))
-        // / TCP keepalive idle time and keepalive interval time
-        // / default is (0 secs, 0 secs) means keepalive not enabled
-        .with_keepalive(Duration::from_secs(60), Duration::from_secs(10))
-        .connect()
-        .await
-        .unwrap();
+            // / Heartbeat interval in seconds
+            // / Server will send a heartbeat event if no binlog events are received within this interval
+            // / If heartbeat_interval_secs=0, server won't send heartbeat events
+            // / default is 0 means not enabled
+            .with_master_heartbeat(Duration::from_secs(5))
+            // / Network operation timeout in seconds
+            // / Maximum wait time for operations like connection establishment and data reading
+            // / default is 60 secs
+            .with_read_timeout(Duration::from_secs(60))
+            // / TCP keepalive idle time and keepalive interval time
+            // / default is (0 secs, 0 secs) means keepalive not enabled
+            .with_keepalive(Duration::from_secs(60), Duration::from_secs(10))
+            .connect()
+            .await
+            .unwrap();
 
         let mut columns: Vec<String> = vec![];
         // TODO 这里获取列名
 
         let mut table_map = HashMap::new();
+        let mut table_database_map = HashMap::new();
         //
         loop {
             match stream.read().await {
@@ -106,15 +105,17 @@ impl Source for MySQLSource {
                             println!("TableMap.null_bits: {:?}", event.null_bits);
                             // let columns = event.table_metadata.unwrap().columns.into_iter().map(|m|m.column_name).collect::<Vec<_>>();
                             // println!("TableMap.table_metadata: {:?}", columns);
-                            let table_info = TableInfo{
-                                database_name, table_name
-                            };
-                            table_map.insert(table_id, table_info);
+                            // let table_info = TableInfo{
+                            //     database_name, table_name
+                            // };
+                            table_map.insert(table_id, table_name);
+                            table_database_map.insert(table_id, database_name);
                         }
 
                         EventData::WriteRows(event) => {
-                            let table_name = table_map.get(&event.table_id).map(|t|t.table_name).unwrap().as_str();
-                            println!("WriteRows: {:?}", table_name);
+                            let table_name = table_map.get(&event.table_id).unwrap().as_str();
+                            let database_name = table_database_map.get(&event.table_id).unwrap().as_str();
+                            println!("WriteRows: {}.{}", database_name, table_name);
                             if self.table_name.eq_ignore_ascii_case(table_name) {
                                 for row in event.rows {
                                     let mut before: HashMap<String, Value> = HashMap::new();
@@ -127,8 +128,9 @@ impl Source for MySQLSource {
                             }
                         }
                         EventData::DeleteRows(event) => {
-                            let table_name = table_map.get(&event.table_id).map(|t|t.table_name).unwrap().as_str();
-                            println!("DeleteRows: {:?}", table_name);
+                            let table_name = table_map.get(&event.table_id).unwrap().as_str();
+                            let database_name = table_database_map.get(&event.table_id).unwrap().as_str();
+                            println!("DeleteRows: {}.{}", database_name, table_name);
                             if self.table_name.eq_ignore_ascii_case(table_name) {
                                 for row in event.rows {
                                     let mut before: HashMap<String, Value> = HashMap::new();
@@ -141,8 +143,9 @@ impl Source for MySQLSource {
                             }
                         }
                         EventData::UpdateRows(event) => {
-                            let table_name = table_map.get(&event.table_id).map(|t|t.table_name).unwrap().as_str();
-                            println!("UpdateRows: {:?} {:?}", table_name, self.table_name);
+                            let table_name = table_map.get(&event.table_id).unwrap().as_str();
+                            let database_name = table_database_map.get(&event.table_id).unwrap().as_str();
+                            println!("UpdateRows: {}.{}", database_name, table_name);
                             if self.table_name.eq_ignore_ascii_case(table_name) {
                                 for (b, a) in event.rows {
                                     let mut before: HashMap<String, Value> = HashMap::new();
@@ -152,12 +155,14 @@ impl Source for MySQLSource {
                                     let op = Operation::UPDATE;
                                     let data_buffer = DataBuffer { before, after, op };
                                     sink.lock().await.write_record(data_buffer);
+                                    // retry_3_async(async || sink.lock().await.write_record(data_buffer));
                                 }
                             }
                         }
                         _ => {}
                     }
                     sink.lock().await.flush();
+                    // retry_3_async(async || sink.lock().await.flush());
                 }
                 Err(e) => {
                     // 打印错误信息，并且继续监听

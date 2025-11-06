@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 use std::{thread, time::Duration};
+use tokio::time::sleep;
 
 #[async_trait]
 pub trait Source: Send + Sync {
@@ -152,3 +153,37 @@ pub enum Operation {
 //         }
 //     }
 // }
+
+
+
+pub async fn retry_3_async<F, Fut, T, E>(op: F) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    retry_async(op, 3, Duration::from_secs(3)).await
+}
+
+pub async fn retry_async<F, Fut, T, E>(
+    mut op: F,
+    retries: u32,
+    delay: Duration,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    let mut attempts = 0;
+
+    loop {
+        match op().await {
+            Ok(result) => return Ok(result),
+            Err(e) if attempts < retries => {
+                attempts += 1;
+                eprintln!("Retry {}/{} failed, retrying...", attempts, retries);
+                sleep(delay).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
