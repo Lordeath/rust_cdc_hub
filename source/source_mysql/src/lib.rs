@@ -58,7 +58,7 @@ impl MySQLSource {
     ) {
         let mut loop_count = 0;
         loop {
-            let sink_result = sink.lock().await.write_record(&data_buffer);
+            let sink_result = sink.lock().await.write_record(&data_buffer).await;
             match sink_result {
                 Ok(_) => {
                     break;
@@ -75,7 +75,7 @@ impl MySQLSource {
     async fn flush_with_retry(sink: &mut Arc<Mutex<dyn Sink + Send + Sync>>) {
         let mut loop_count = 0;
         loop {
-            let sink_result = sink.lock().await.flush();
+            let sink_result = sink.lock().await.flush().await;
             match sink_result {
                 Ok(_) => {
                     break;
@@ -87,6 +87,7 @@ impl MySQLSource {
                 panic!("flush error");
             }
         }
+        ()
     }
 
     fn is_target_database_and_table(&self, database_name: &str, table_name: &str) -> bool {
@@ -211,7 +212,7 @@ impl Source for MySQLSource {
         println!("Starting MySQL binlog source");
         let mut stream = BinlogClient::new(
             self.connection_url.as_str(),
-            self.server_id.clone(),
+            self.server_id,
             StartPosition::Latest,
         )
         // / Heartbeat interval in seconds
@@ -256,7 +257,8 @@ impl Source for MySQLSource {
                                 println!("WriteRows: {}.{}", database_name, table_name);
                                 for row in event.rows {
                                     let before: HashMap<String, Value> = HashMap::new();
-                                    let after: HashMap<String, Value> = self.parse_row(row, &mut columns).await;
+                                    let after: HashMap<String, Value> =
+                                        self.parse_row(row, &mut columns).await;
                                     let op = Operation::CREATE;
                                     let data_buffer = DataBuffer { before, after, op };
                                     // sink.lock().await.write_record(&data_buffer);
@@ -271,7 +273,8 @@ impl Source for MySQLSource {
                             if self.is_target_database_and_table(database_name, table_name) {
                                 println!("DeleteRows: {}.{}", database_name, table_name);
                                 for row in event.rows {
-                                    let before: HashMap<String, Value> = self.parse_row(row, &mut columns).await;
+                                    let before: HashMap<String, Value> =
+                                        self.parse_row(row, &mut columns).await;
                                     let after: HashMap<String, Value> = HashMap::new();
                                     let op = Operation::DELETE;
                                     let data_buffer = DataBuffer { before, after, op };
@@ -287,8 +290,10 @@ impl Source for MySQLSource {
                             if self.is_target_database_and_table(database_name, table_name) {
                                 println!("UpdateRows: {}.{}", database_name, table_name);
                                 for (b, a) in event.rows {
-                                    let before: HashMap<String, Value> = self.parse_row(b, &mut columns).await;
-                                    let after: HashMap<String, Value> = self.parse_row(a, &mut columns).await;
+                                    let before: HashMap<String, Value> =
+                                        self.parse_row(b, &mut columns).await;
+                                    let after: HashMap<String, Value> =
+                                        self.parse_row(a, &mut columns).await;
                                     let op = Operation::UPDATE;
                                     let data_buffer = DataBuffer { before, after, op };
                                     // sink.lock().await.write_record(&data_buffer);

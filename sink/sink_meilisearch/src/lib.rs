@@ -1,7 +1,7 @@
 use common::{CdcConfig, DataBuffer, Sink};
-use std::error::Error;
-use std::sync::{Arc, Mutex};
 use meilisearch_sdk::client::Client;
+use std::error::Error;
+use meilisearch_sdk::macro_helper::async_trait;
 
 pub struct MeiliSearchSink {
     meili_url: String,
@@ -33,16 +33,18 @@ impl MeiliSearchSink {
     }
 }
 
+#[async_trait]
 impl Sink for MeiliSearchSink {
-    fn connect(&mut self) -> Result<(), Box<dyn Error>> {
-        // self.client.health().await
-        // async {
-        //     self.client.health().await.unwrap().status;
-        // }.
+    async fn connect(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        println!(
+            "meili_url: {}, meili_master_key: {}, meili_table_name: {}, meili_table_pk: {}",
+            self.meili_url, self.meili_master_key, self.meili_table_name, self.meili_table_pk
+        );
+        println!("meili_url: {}", self.client.health().await.unwrap().status);
         Ok(())
     }
 
-    fn write_record(&mut self, record: &DataBuffer) -> Result<(), Box<dyn Error>> {
+    async fn write_record(&self, record: &DataBuffer) -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("进入print");
         println!("{:?}", record);
 

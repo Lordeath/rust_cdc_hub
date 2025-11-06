@@ -1,20 +1,25 @@
-use common::{DataBuffer, Sink};
+use common::{CdcConfig, DataBuffer, Sink};
 use std::error::Error;
+use async_trait::async_trait;
 
-pub struct PrintSink {}
+pub struct PrintSink {
+    config: CdcConfig,
+}
 
 impl PrintSink {
-    pub fn new() -> Self {
-        PrintSink {}
+    pub fn new(config: CdcConfig) -> Self {
+        PrintSink { config }
     }
 }
 
+#[async_trait]
 impl Sink for PrintSink {
-    fn connect(&mut self) -> Result<(), Box<dyn Error>> {
+    async fn connect(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        println!("{}", self.config.config.len());
         Ok(())
     }
 
-    fn write_record(&mut self, record: &DataBuffer) -> Result<(), Box<dyn Error>> {
+    async fn write_record(&self, record: &DataBuffer) -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("进入print");
         println!("{:?}", record);
 

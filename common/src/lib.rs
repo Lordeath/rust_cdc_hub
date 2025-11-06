@@ -6,20 +6,23 @@ use std::sync::Arc;
 
 #[async_trait]
 pub trait Source: Send + Sync {
-    async fn start(&self, sink: Arc<tokio::sync::Mutex<dyn Sink + Send + Sync>>) -> Result<(), Box<dyn Error + Send + Sync>>;
+    async fn start(
+        &self,
+        sink: Arc<tokio::sync::Mutex<dyn Sink + Send + Sync>>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>>;
 }
 
 /// Sink trait: 所有目标端都要实现它
 #[async_trait]
-pub trait Sink {
+pub trait Sink: Send + Sync {
     /// 连接目标端（如 Kafka、文件、数据库）
-    fn connect(&mut self) -> Result<(), Box<dyn Error>>;
+    async fn connect(&self) -> Result<(), Box<dyn Error + Send + Sync>>;
 
     /// 写入一条数据（可以是 json 或结构化 map）
-    fn write_record(&mut self, record: &DataBuffer) -> Result<(), Box<dyn Error>>;
+    async fn write_record(&self, record: &DataBuffer) -> Result<(), Box<dyn Error + Send + Sync>>;
 
     /// 刷新缓冲区（可选）
-    fn flush(&mut self) -> Result<(), Box<dyn Error>> {
+    async fn flush(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok(())
     }
 }

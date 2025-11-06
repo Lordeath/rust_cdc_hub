@@ -14,7 +14,7 @@ async fn main() {
 
     let source: Arc<dyn Source> = SourceFactory::create_source(config.clone());
     let sink = SinkFactory::create_sink(config.clone());
-    let _ = sink.lock().await.connect();
+    let _ = sink.lock().await.connect().await;
     let _ = source.start(sink).await;
 }
 
