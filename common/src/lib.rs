@@ -17,7 +17,7 @@ pub trait Sink {
     fn connect(&mut self) -> Result<(), Box<dyn Error>>;
 
     /// 写入一条数据（可以是 json 或结构化 map）
-    fn write_record(&mut self, record: DataBuffer) -> Result<(), Box<dyn Error>>;
+    fn write_record(&mut self, record: &DataBuffer) -> Result<(), Box<dyn Error>>;
 
     /// 刷新缓冲区（可选）
     fn flush(&mut self) -> Result<(), Box<dyn Error>> {

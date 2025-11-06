@@ -14,7 +14,7 @@ impl Sink for PrintSink {
         Ok(())
     }
 
-    fn write_record(&mut self, record: DataBuffer) -> Result<(), Box<dyn Error>> {
+    fn write_record(&mut self, record: &DataBuffer) -> Result<(), Box<dyn Error>> {
         println!("进入print");
         println!("{:?}", record);
 
