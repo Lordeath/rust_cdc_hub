@@ -9,6 +9,8 @@ pub struct MeiliSearchSink {
     client: Client,
     meili_table_name: String,
     meili_table_pk: String,
+    // ✅ 新增两个字段
+    initialized: tokio::sync::RwLock<bool>, // 判断是否第一次 flush（用锁保护并发安全）
 }
 
 impl MeiliSearchSink {
@@ -27,6 +29,7 @@ impl MeiliSearchSink {
             client,
             meili_table_name,
             meili_table_pk,
+            initialized: tokio::sync::RwLock::new(false),
         }
     }
 }
@@ -64,42 +67,32 @@ impl Sink for MeiliSearchSink {
                     .add_or_replace(&docs, Some(self.meili_table_pk.as_str()))
                     .await;
                 match result {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        if !*self.initialized.read().await {
+                            // ✅ 获取字段名
+                            let field_names = record.after.keys().cloned().collect::<Vec<_>>();
+                            let _ = self
+                                .client
+                                .index(self.meili_table_name.as_str())
+                                .set_filterable_attributes(&field_names)
+                                .await;
+                            *self.initialized.write().await = true;
+                        }
+                    }
                     Err(e) => {
                         println!("Error: {}", e);
                     }
                 }
             }
             Operation::UPDATE => {
-                // ✅ 取主键字符串
-                let pk = record.after.get(&self.meili_table_pk);
-                match pk {
-                    None => {}
-                    Some(pk_value) => {
-                        let pk_str = pk_value.to_raw_string();
-                        self.client
-                            .index(self.meili_table_name.as_str())
-                            .delete_document(pk_str)
-                            .await?;
-                    }
-                }
-
                 let docs = vec![&record.after];
                 let result = self
                     .client
                     .index(self.meili_table_name.as_str())
-                    .add_or_replace(&docs, None)
+                    .add_or_replace(&docs, Some(self.meili_table_pk.as_str()))
                     .await;
                 match result {
-                    Ok(r) => {
-                        r.wait_for_completion(&self.client, None, None).await?;
-                        // println!("task_id: {}", r.task_uid);
-                        // println!("result json: {}", serde_json::to_string(&r));
-                        // println!("update_type: {}", r.update_type.to);
-                        // println!("status: {}", r.status);
-                        // println!("index_uid: {}", r.index_uid.unwrap_or_else(-1).to_string());
-
-                    }
+                    Ok(_) => {}
                     Err(e) => {
                         println!("Error: {}", e);
                     }
@@ -111,7 +104,7 @@ impl Sink for MeiliSearchSink {
                 match pk {
                     None => {}
                     Some(pk_value) => {
-                        let pk_str = pk_value.to_raw_string();
+                        let pk_str = pk_value.to_string();
                         self.client
                             .index(self.meili_table_name.as_str())
                             .delete_document(pk_str)

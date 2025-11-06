@@ -1,8 +1,10 @@
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
+use serde::de::Visitor;
 
 #[async_trait]
 pub trait Source: Send + Sync {
@@ -76,7 +78,7 @@ pub struct DataBuffer {
     // pub timestamp: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum Value {
     // Str(String),
     // Num(i64),
@@ -122,7 +124,7 @@ pub enum Value {
 }
 
 impl Value {
-    pub fn to_raw_string(&self) -> String {
+    pub fn to_string(&self) -> String {
         match self {
             Value::String(s) => s.to_string(),
             Value::Tiny(s) => s.to_string(),
@@ -141,6 +143,81 @@ impl Value {
             Value::Bit(s) => s.to_string(),
             _ => "null".to_string(),
         }
+    }
+}
+
+
+impl Serialize for Value {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Value::None => serializer.serialize_none(),
+            Value::String(s)
+            | Value::Decimal(s)
+            | Value::Time(s)
+            | Value::Date(s)
+            | Value::DateTime(s)
+            | Value::Blob(s) => serializer.serialize_str(s),
+            Value::Tiny(v) => serializer.serialize_i8(*v),
+            Value::Short(v) => serializer.serialize_i16(*v),
+            Value::Long(v) => serializer.serialize_i32(*v),
+            Value::LongLong(v) => serializer.serialize_i64(*v),
+            Value::Float(v) => serializer.serialize_f32(*v),
+            Value::Double(v) => serializer.serialize_f64(*v),
+            Value::Timestamp(v) => serializer.serialize_i64(*v),
+            Value::Year(v) => serializer.serialize_u16(*v),
+            Value::Bit(v) => serializer.serialize_u64(*v),
+        }
+    }
+}
+
+// 如果你需要从 JSON 反序列化回来，也可以加上这个：
+impl<'de> Deserialize<'de> for Value {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ValueVisitor;
+
+        impl<'de> Visitor<'de> for ValueVisitor {
+            type Value = Value;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a JSON primitive or null")
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> where E: de::Error {
+                Ok(Value::None)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> where E: de::Error {
+                Ok(Value::None)
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> where E: de::Error {
+                Ok(Value::String(v.to_string()))
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E> where E: de::Error {
+                Ok(Value::String(v))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> where E: de::Error {
+                Ok(Value::LongLong(v))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> where E: de::Error {
+                Ok(Value::Bit(v))
+            }
+
+            fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> where E: de::Error {
+                Ok(Value::Double(v))
+            }
+        }
+
+        deserializer.deserialize_any(ValueVisitor)
     }
 }
 
