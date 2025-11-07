@@ -10,14 +10,3 @@ impl SourceFactory {
         }
     }
 }
-
-// // 这一步允许其他 crate 调用 factory
-// pub use source_mysql;
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(4, 4);
-    }
-}
