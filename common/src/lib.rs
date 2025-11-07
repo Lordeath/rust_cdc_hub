@@ -141,7 +141,7 @@ impl Value {
             Value::Year(s) => s.to_string(),
             Value::Blob(s) => s.to_string(),
             Value::Bit(s) => s.to_string(),
-            _ => "null".to_string(),
+            Value::None => "null".to_string(),
         }
     }
 }
