@@ -144,16 +144,16 @@ impl MySQLSource {
                 let value: Value = Value::String(String::from_utf8_lossy(&bytes).to_string());
                 data.insert(column_name, value);
             } else if let ColumnValue::Tiny(v) = column_value {
-                let value: Value = Value::Tiny(v);
+                let value: Value = Value::Int8(v);
                 data.insert(column_name, value);
             } else if let ColumnValue::Short(v) = column_value {
-                let value: Value = Value::Short(v);
+                let value: Value = Value::Int16(v);
                 data.insert(column_name, value);
             } else if let ColumnValue::Long(v) = column_value {
-                let value: Value = Value::Integer(v);
+                let value: Value = Value::Int32(v);
                 data.insert(column_name, value);
             } else if let ColumnValue::LongLong(v) = column_value {
-                let value: Value = Value::LongLong(v);
+                let value: Value = Value::Int64(v);
                 data.insert(column_name, value);
             } else if let ColumnValue::Float(v) = column_value {
                 let value: Value = Value::Float(v);

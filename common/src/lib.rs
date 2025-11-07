@@ -85,13 +85,13 @@ pub enum Value {
     // Bool(bool),
     None,
     // A 8 bit signed integer
-    Tiny(i8),
+    Int8(i8),
     // A 16 bit signed integer
-    Short(i16),
+    Int16(i16),
     // A 32 bit signed integer
-    Integer(i32),
+    Int32(i32),
     // A 64 bit signed integer
-    LongLong(i64),
+    Int64(i64),
     // A 32 bit floating point number
     Float(f32),
     // A 64 bit floating point number
@@ -127,10 +127,10 @@ impl Value {
     pub fn to_string(&self) -> String {
         match self {
             Value::String(s) => s.to_string(),
-            Value::Tiny(s) => s.to_string(),
-            Value::Short(s) => s.to_string(),
-            Value::Integer(s) => s.to_string(),
-            Value::LongLong(s) => s.to_string(),
+            Value::Int8(s) => s.to_string(),
+            Value::Int16(s) => s.to_string(),
+            Value::Int32(s) => s.to_string(),
+            Value::Int64(s) => s.to_string(),
             Value::Float(s) => s.to_string(),
             Value::Double(s) => s.to_string(),
             Value::Decimal(s) => s.to_string(),
@@ -160,10 +160,10 @@ impl Serialize for Value {
             | Value::Date(s)
             | Value::DateTime(s)
             | Value::Blob(s) => serializer.serialize_str(s),
-            Value::Tiny(v) => serializer.serialize_i8(*v),
-            Value::Short(v) => serializer.serialize_i16(*v),
-            Value::Integer(v) => serializer.serialize_i32(*v),
-            Value::LongLong(v) => serializer.serialize_i64(*v),
+            Value::Int8(v) => serializer.serialize_i8(*v),
+            Value::Int16(v) => serializer.serialize_i16(*v),
+            Value::Int32(v) => serializer.serialize_i32(*v),
+            Value::Int64(v) => serializer.serialize_i64(*v),
             Value::Float(v) => serializer.serialize_f32(*v),
             Value::Double(v) => serializer.serialize_f64(*v),
             Value::Timestamp(v) => serializer.serialize_i64(*v),
@@ -205,7 +205,7 @@ impl<'de> Deserialize<'de> for Value {
             }
 
             fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> where E: de::Error {
-                Ok(Value::LongLong(v))
+                Ok(Value::Int64(v))
             }
 
             fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> where E: de::Error {
