@@ -13,7 +13,7 @@ async fn main() {
     let config: CdcConfig = load_config(&config_path).expect("Failed to load config");
 
     let source: Arc<Mutex<dyn Source>> = SourceFactory::create_source(config.clone()).await;
-    let sink = SinkFactory::create_sink(config.clone()).await;
+    let sink = SinkFactory::create_sink(config).await;
     let _ = sink.lock().await.connect().await;
     // let _ = source.start(sink).await;
 
