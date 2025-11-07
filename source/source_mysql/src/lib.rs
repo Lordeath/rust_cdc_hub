@@ -59,7 +59,6 @@ impl MySQLSource {
 
         Self {
             connection_url,
-            // server_id,
             database,
             table_name,
             streams,
@@ -237,6 +236,75 @@ impl MySQLSource {
         }
         data
     }
+
+    async fn push_data(&mut self, mut sink: &mut Arc<Mutex<dyn Sink + Send + Sync>>, mut columns: &mut Mutex<Vec<String>>, table_map: &mut HashMap<u64, String>, table_database_map: &mut HashMap<u64, String>, data: EventData) {
+        match data {
+            EventData::TableMap(event) => {
+                let table_name = event.table_name;
+                let table_id = event.table_id;
+                let database_name = event.database_name;
+                table_map.insert(table_id, table_name);
+                table_database_map.insert(table_id, database_name);
+            }
+            EventData::WriteRows(event) => {
+                let table_name = table_map.get(&event.table_id).unwrap().as_str();
+                let database_name =
+                    table_database_map.get(&event.table_id).unwrap().as_str();
+                if self.is_target_database_and_table(database_name, table_name) {
+                    println!("WriteRows: {}.{}", database_name, table_name);
+                    for row in event.rows {
+                        let before: HashMap<String, Value> = HashMap::new();
+                        let after: HashMap<String, Value> =
+                            self.parse_row(row, &mut columns).await;
+                        let op = Operation::CREATE;
+                        let data_buffer = DataBuffer { before, after, op };
+                        // sink.lock().await.write_record(&data_buffer);
+                        Self::write_record_with_retry(&mut sink, &data_buffer)
+                            .await;
+                    }
+                }
+            }
+            EventData::DeleteRows(event) => {
+                let table_name = table_map.get(&event.table_id).unwrap().as_str();
+                let database_name =
+                    table_database_map.get(&event.table_id).unwrap().as_str();
+                if self.is_target_database_and_table(database_name, table_name) {
+                    println!("DeleteRows: {}.{}", database_name, table_name);
+                    for row in event.rows {
+                        let before: HashMap<String, Value> =
+                            self.parse_row(row, &mut columns).await;
+                        let after: HashMap<String, Value> = HashMap::new();
+                        let op = Operation::DELETE;
+                        let data_buffer = DataBuffer { before, after, op };
+                        // sink.lock().await.write_record(&data_buffer);
+                        Self::write_record_with_retry(&mut sink, &data_buffer)
+                            .await;
+                    }
+                }
+            }
+            EventData::UpdateRows(event) => {
+                let table_name = table_map.get(&event.table_id).unwrap().as_str();
+                let database_name =
+                    table_database_map.get(&event.table_id).unwrap().as_str();
+                if self.is_target_database_and_table(database_name, table_name) {
+                    println!("UpdateRows: {}.{}", database_name, table_name);
+                    for (b, a) in event.rows {
+                        let before: HashMap<String, Value> =
+                            self.parse_row(b, &mut columns).await;
+                        let after: HashMap<String, Value> =
+                            self.parse_row(a, &mut columns).await;
+                        let op = Operation::UPDATE;
+                        let data_buffer = DataBuffer { before, after, op };
+                        // sink.lock().await.write_record(&data_buffer);
+                        Self::write_record_with_retry(&mut sink, &data_buffer)
+                            .await;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Self::flush_with_retry(&mut sink).await;
+    }
 }
 
 #[async_trait]
@@ -246,113 +314,20 @@ impl Source for MySQLSource {
         mut sink: Arc<Mutex<dyn Sink + Send + Sync>>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("Starting MySQL binlog source");
-        // let mut stream = BinlogClient::new(
-        //     self.connection_url.as_str(),
-        //     self.server_id,
-        //     StartPosition::Latest,
-        // )
-        // // / Heartbeat interval in seconds
-        // // / Server will send a heartbeat event if no binlog events are received within this interval
-        // // / If heartbeat_interval_secs=0, server won't send heartbeat events
-        // // / default is 0 means not enabled
-        // .with_master_heartbeat(Duration::from_secs(5))
-        // // / Network operation timeout in seconds
-        // // / Maximum wait time for operations like connection establishment and data reading
-        // // / default is 60 secs
-        // .with_read_timeout(Duration::from_secs(60))
-        // // / TCP keepalive idle time and keepalive interval time
-        // // / default is (0 secs, 0 secs) means keepalive not enabled
-        // .with_keepalive(Duration::from_secs(60), Duration::from_secs(10))
-        // .connect()
-        // .await
-        // .unwrap();
-        // let mut stream = &mut self.streams[0];
-
         let mut columns: Mutex<Vec<String>> = Mutex::new(vec![]);
         // 这里获取列名
         // columns = self.fill_table_column().await;
 
         let mut table_map = HashMap::new();
         let mut table_database_map = HashMap::new();
-        //
         loop {
-            // let streams = &mut self.streams;
-
-            // self.streams.into_iter().for_each(async |stream| {
-            //
-            // });
             let max = self.streams.len();
             for i in 0..max {
                 let stream = &mut self.streams[i];
 
                 match stream.read().await {
                     Ok((_header, data)) => {
-                        match data {
-                            EventData::TableMap(event) => {
-                                let table_name = event.table_name;
-                                let table_id = event.table_id;
-                                let database_name = event.database_name;
-                                table_map.insert(table_id, table_name);
-                                table_database_map.insert(table_id, database_name);
-                            }
-                            EventData::WriteRows(event) => {
-                                let table_name = table_map.get(&event.table_id).unwrap().as_str();
-                                let database_name =
-                                    table_database_map.get(&event.table_id).unwrap().as_str();
-                                if self.is_target_database_and_table(database_name, table_name) {
-                                    println!("WriteRows: {}.{}", database_name, table_name);
-                                    for row in event.rows {
-                                        let before: HashMap<String, Value> = HashMap::new();
-                                        let after: HashMap<String, Value> =
-                                            self.parse_row(row, &mut columns).await;
-                                        let op = Operation::CREATE;
-                                        let data_buffer = DataBuffer { before, after, op };
-                                        // sink.lock().await.write_record(&data_buffer);
-                                        Self::write_record_with_retry(&mut sink, &data_buffer)
-                                            .await;
-                                    }
-                                }
-                            }
-                            EventData::DeleteRows(event) => {
-                                let table_name = table_map.get(&event.table_id).unwrap().as_str();
-                                let database_name =
-                                    table_database_map.get(&event.table_id).unwrap().as_str();
-                                if self.is_target_database_and_table(database_name, table_name) {
-                                    println!("DeleteRows: {}.{}", database_name, table_name);
-                                    for row in event.rows {
-                                        let before: HashMap<String, Value> =
-                                            self.parse_row(row, &mut columns).await;
-                                        let after: HashMap<String, Value> = HashMap::new();
-                                        let op = Operation::DELETE;
-                                        let data_buffer = DataBuffer { before, after, op };
-                                        // sink.lock().await.write_record(&data_buffer);
-                                        Self::write_record_with_retry(&mut sink, &data_buffer)
-                                            .await;
-                                    }
-                                }
-                            }
-                            EventData::UpdateRows(event) => {
-                                let table_name = table_map.get(&event.table_id).unwrap().as_str();
-                                let database_name =
-                                    table_database_map.get(&event.table_id).unwrap().as_str();
-                                if self.is_target_database_and_table(database_name, table_name) {
-                                    println!("UpdateRows: {}.{}", database_name, table_name);
-                                    for (b, a) in event.rows {
-                                        let before: HashMap<String, Value> =
-                                            self.parse_row(b, &mut columns).await;
-                                        let after: HashMap<String, Value> =
-                                            self.parse_row(a, &mut columns).await;
-                                        let op = Operation::UPDATE;
-                                        let data_buffer = DataBuffer { before, after, op };
-                                        // sink.lock().await.write_record(&data_buffer);
-                                        Self::write_record_with_retry(&mut sink, &data_buffer)
-                                            .await;
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                        Self::flush_with_retry(&mut sink).await;
+                        self.push_data(&mut sink, &mut columns, &mut table_map, &mut table_database_map, data).await;
                     }
                     Err(e) => {
                         // 打印错误信息，并且继续监听
@@ -360,10 +335,6 @@ impl Source for MySQLSource {
                     }
                 }
             }
-
-            // for stream in streams {
-            //
-            // }
         }
     }
 }
