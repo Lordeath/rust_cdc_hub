@@ -1,15 +1,15 @@
 use async_trait::async_trait;
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::de::Visitor;
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
-use serde::de::Visitor;
 
 #[async_trait]
 pub trait Source: Send + Sync {
     async fn start(
-        &self,
+        &mut self,
         sink: Arc<tokio::sync::Mutex<dyn Sink + Send + Sync>>,
     ) -> Result<(), Box<dyn Error + Send + Sync>>;
 }
@@ -146,7 +146,6 @@ impl Value {
     }
 }
 
-
 impl Serialize for Value {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -188,31 +187,52 @@ impl<'de> Deserialize<'de> for Value {
                 formatter.write_str("a JSON primitive or null")
             }
 
-            fn visit_none<E>(self) -> Result<Self::Value, E> where E: de::Error {
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
                 Ok(Value::None)
             }
 
-            fn visit_unit<E>(self) -> Result<Self::Value, E> where E: de::Error {
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
                 Ok(Value::None)
             }
 
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> where E: de::Error {
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
                 Ok(Value::String(v.to_string()))
             }
 
-            fn visit_string<E>(self, v: String) -> Result<Self::Value, E> where E: de::Error {
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
                 Ok(Value::String(v))
             }
 
-            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> where E: de::Error {
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
                 Ok(Value::Int64(v))
             }
 
-            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> where E: de::Error {
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
                 Ok(Value::Bit(v))
             }
 
-            fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> where E: de::Error {
+            fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
                 Ok(Value::Double(v))
             }
         }

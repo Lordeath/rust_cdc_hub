@@ -4,7 +4,7 @@ use common::{CdcConfig, Source};
 use sink::SinkFactory;
 use source::SourceFactory;
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{env, fs, process};
 
 #[tokio::main]
@@ -12,10 +12,15 @@ async fn main() {
     let config_path = get_env("CONFIG_PATH");
     let config: CdcConfig = load_config(&config_path).expect("Failed to load config");
 
-    let source: Arc<dyn Source> = SourceFactory::create_source(config.clone()).await;
+    let source: Arc<Mutex<dyn Source>> = SourceFactory::create_source(config.clone()).await;
     let sink = SinkFactory::create_sink(config.clone()).await;
     let _ = sink.lock().await.connect().await;
-    let _ = source.start(sink).await;
+    // let _ = source.start(sink).await;
+
+    {
+        let src = source.lock();
+        let _ = src.expect("REASON").start(sink).await;
+    }
 }
 
 fn get_env(key: &str) -> String {
