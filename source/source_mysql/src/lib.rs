@@ -150,7 +150,7 @@ impl MySQLSource {
                 let value: Value = Value::Short(v);
                 data.insert(column_name, value);
             } else if let ColumnValue::Long(v) = column_value {
-                let value: Value = Value::Long(v);
+                let value: Value = Value::Integer(v);
                 data.insert(column_name, value);
             } else if let ColumnValue::LongLong(v) = column_value {
                 let value: Value = Value::LongLong(v);
