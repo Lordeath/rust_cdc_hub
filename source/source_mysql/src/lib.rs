@@ -138,63 +138,87 @@ impl MySQLSource {
 
         for column_value in row.column_values {
             let column_name = columns.lock().await[index].clone();
-            if let ColumnValue::None = column_value {
-                data.insert(column_name, Value::None);
-            } else if let ColumnValue::String(bytes) = column_value {
-                let value: Value = Value::String(String::from_utf8_lossy(&bytes).to_string());
-                data.insert(column_name, value);
-            } else if let ColumnValue::Tiny(v) = column_value {
-                let value: Value = Value::Int8(v);
-                data.insert(column_name, value);
-            } else if let ColumnValue::Short(v) = column_value {
-                let value: Value = Value::Int16(v);
-                data.insert(column_name, value);
-            } else if let ColumnValue::Long(v) = column_value {
-                let value: Value = Value::Int32(v);
-                data.insert(column_name, value);
-            } else if let ColumnValue::LongLong(v) = column_value {
-                let value: Value = Value::Int64(v);
-                data.insert(column_name, value);
-            } else if let ColumnValue::Float(v) = column_value {
-                let value: Value = Value::Float(v);
-                data.insert(column_name, value);
-            } else if let ColumnValue::Double(v) = column_value {
-                let value: Value = Value::Double(v);
-                data.insert(column_name, value);
-            } else if let ColumnValue::Decimal(v) = column_value {
-                let value: Value = Value::Decimal(v);
-                data.insert(column_name, value);
-            } else if let ColumnValue::Time(v) = column_value {
-                let value: Value = Value::Time(v);
-                data.insert(column_name, value);
-            } else if let ColumnValue::Date(v) = column_value {
-                let value: Value = Value::Date(v);
-                data.insert(column_name, value);
-            } else if let ColumnValue::DateTime(v) = column_value {
-                let value: Value = Value::DateTime(v);
-                data.insert(column_name, value);
-            } else if let ColumnValue::Timestamp(v) = column_value {
-                let value: Value = Value::Timestamp(v);
-                data.insert(column_name, value);
-            } else if let ColumnValue::Year(v) = column_value {
-                let value: Value = Value::Year(v);
-                data.insert(column_name, value);
-            } else if let ColumnValue::Blob(v) = column_value {
-                let value: Value = Value::String(String::from_utf8_lossy(&v).to_string());
-                data.insert(column_name, value);
-            } else if let ColumnValue::Json(v) = column_value {
-                let value: Value = Value::String(String::from_utf8_lossy(&v).to_string());
-                data.insert(column_name, value);
-            } else {
-                columns
-                    .lock()
-                    .await
-                    .iter()
-                    .for_each(|column_name| println!("column: {}", column_name));
-                println!("column_name: {:?}", column_name);
-                println!("column_value: {:?}", column_value);
-                panic!("unsupported column value type")
+            match column_value {
+                ColumnValue::None => {
+                    data.insert(column_name, Value::None);
+                }
+                ColumnValue::Tiny(v) => {
+                    data.insert(column_name, Value::Int8(v));
+                }
+                ColumnValue::Short(v) => {
+                    let value: Value = Value::Int16(v);
+                    data.insert(column_name, value);
+                }
+                ColumnValue::Long(v) => {
+                    let value: Value = Value::Int32(v);
+                    data.insert(column_name, value);
+                }
+                ColumnValue::LongLong(v) => {
+                    let value: Value = Value::Int64(v);
+                    data.insert(column_name, value);
+                }
+                ColumnValue::Float(v) => {
+                    let value: Value = Value::Float(v);
+                    data.insert(column_name, value);
+                }
+                ColumnValue::Double(v) => {
+                    let value: Value = Value::Double(v);
+                    data.insert(column_name, value);
+                }
+                ColumnValue::Decimal(v) => {
+                    let value: Value = Value::Decimal(v);
+                    data.insert(column_name, value);
+                }
+                ColumnValue::Time(v) => {
+                    let value: Value = Value::Time(v);
+                    data.insert(column_name, value);
+                }
+                ColumnValue::Date(v) => {
+                    let value: Value = Value::Date(v);
+                    data.insert(column_name, value);
+                }
+                ColumnValue::DateTime(v) => {
+                    let value: Value = Value::DateTime(v);
+                    data.insert(column_name, value);
+                }
+                ColumnValue::Timestamp(v) => {
+                    let value: Value = Value::Timestamp(v);
+                    data.insert(column_name, value);
+                }
+                ColumnValue::Year(v) => {
+                    let value: Value = Value::Year(v);
+                    data.insert(column_name, value);
+                }
+                ColumnValue::String(v) => {
+                    let value: Value = Value::String(String::from_utf8_lossy(&v).to_string());
+                    data.insert(column_name, value);
+                }
+                ColumnValue::Blob(v) => {
+                    let value: Value = Value::String(String::from_utf8_lossy(&v).to_string());
+                    data.insert(column_name, value);
+                }
+                ColumnValue::Bit(v) => {
+                    let value: Value = Value::Bit(v);
+                    data.insert(column_name, value);
+                }
+                // ColumnValue::Set(v) => { data.insert(column_name, Value::Int8(v))}
+                // ColumnValue::Enum(v) => { data.insert(column_name, Value::Int8(v))}
+                ColumnValue::Json(v) => {
+                    let value: Value = Value::String(String::from_utf8_lossy(&v).to_string());
+                    data.insert(column_name, value);
+                }
+                _ => {
+                    columns
+                        .lock()
+                        .await
+                        .iter()
+                        .for_each(|column_name| println!("column: {}", column_name));
+                    println!("column_name: {:?}", column_name);
+                    println!("column_value: {:?}", column_value);
+                    panic!("unsupported column value type")
+                }
             }
+
             index = index + 1;
         }
         data
