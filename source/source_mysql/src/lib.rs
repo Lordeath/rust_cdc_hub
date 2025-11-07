@@ -22,7 +22,7 @@ pub struct MySQLSource {
 }
 
 impl MySQLSource {
-    pub fn new(config: CdcConfig) -> Self {
+    pub async fn new(config: CdcConfig) -> Self {
         // let config = self.config.clone();
         // 使用map 拼接成 connection_url
         let username = config.get("username");

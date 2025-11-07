@@ -12,8 +12,8 @@ async fn main() {
     let config_path = get_env("CONFIG_PATH");
     let config: CdcConfig = load_config(&config_path).expect("Failed to load config");
 
-    let source: Arc<dyn Source> = SourceFactory::create_source(config.clone());
-    let sink = SinkFactory::create_sink(config.clone());
+    let source: Arc<dyn Source> = SourceFactory::create_source(config.clone()).await;
+    let sink = SinkFactory::create_sink(config.clone()).await;
     let _ = sink.lock().await.connect().await;
     let _ = source.start(sink).await;
 }
