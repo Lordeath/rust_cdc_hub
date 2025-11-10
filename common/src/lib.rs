@@ -158,7 +158,7 @@ impl Serialize for Value {
             | Value::Time(s)
             | Value::Date(s)
             | Value::DateTime(s)
-            | Value::Blob(s) => serializer.serialize_str(s),
+            | Value::Blob(s) => serializer.serialize_str(s.as_str()),
             Value::Int8(v) => serializer.serialize_i8(*v),
             Value::Int16(v) => serializer.serialize_i16(*v),
             Value::Int32(v) => serializer.serialize_i32(*v),
