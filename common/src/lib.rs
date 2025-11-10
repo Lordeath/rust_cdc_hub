@@ -46,22 +46,38 @@ pub enum SinkType {
 pub struct CdcConfig {
     pub source_type: SourceType,
     pub sink_type: SinkType,
-    pub config: HashMap<String, String>,
+    pub source_config: Vec<HashMap<String, String>>,
+    pub sink_config: Vec<HashMap<String, String>>,
 }
 
 impl CdcConfig {
-    pub fn get(&self, key: &str) -> String {
-        match self.config.get(key) {
+
+    pub fn source(&self, key: &str, index: usize) ->String {
+        match self.source_config[index].get(key) {
             None => "".to_string(),
             Some(v) => v.clone(),
         }
     }
-    pub fn get_u64(&self, key: &str) -> u64 {
-        let value = self.get(key);
+
+    pub fn sink(&self, key: &str, index: usize) ->String {
+        match self.sink_config[index].get(key) {
+            None => "".to_string(),
+            Some(v) => v.clone(),
+        }
+    }
+
+    pub fn first_source(&self, key: &str) -> String {
+        self.source(key, 0)
+    }
+    pub fn first_sink(&self, key: &str) -> String {
+        self.sink(key, 0)
+    }
+    pub fn first_u64_source(&self, key: &str) -> u64 {
+        let value = self.first_source(key);
         value.parse::<u64>().unwrap_or_else(|_| 0)
     }
-    pub fn get_u32(&self, key: &str) -> u32 {
-        let value = self.get(key);
+    pub fn first_u32_source(&self, key: &str) -> u32 {
+        let value = self.first_source(key);
         value.parse::<u32>().unwrap_or_else(|_| 0)
     }
 }

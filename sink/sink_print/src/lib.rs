@@ -15,7 +15,7 @@ impl PrintSink {
 #[async_trait]
 impl Sink for PrintSink {
     async fn connect(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        println!("{}", self.config.config.len());
+        println!("{}", self.config.source_config.len());
         Ok(())
     }
 

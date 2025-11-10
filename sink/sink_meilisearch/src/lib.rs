@@ -15,10 +15,10 @@ pub struct MeiliSearchSink {
 
 impl MeiliSearchSink {
     pub fn new(config: CdcConfig) -> Self {
-        let meili_url = config.get("meili_url");
-        let meili_master_key = config.get("meili_master_key");
-        let meili_table_name = config.get("table_name");
-        let meili_table_pk = config.get("meili_table_pk");
+        let meili_url = config.first_sink("meili_url");
+        let meili_master_key = config.first_sink("meili_master_key");
+        let meili_table_name = config.first_sink("table_name");
+        let meili_table_pk = config.first_sink("meili_table_pk");
 
         // Create a client (without sending any request so that can't fail)
         let client = Client::new(meili_url.as_str(), Some(meili_master_key.as_str())).unwrap();
