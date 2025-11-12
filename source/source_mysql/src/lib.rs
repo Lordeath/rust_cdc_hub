@@ -256,8 +256,8 @@ impl Source for MySQLSource {
             let max = self.streams.len();
             for i in 0..max {
                 // let stream_bind: StreamBind = self.streams[i].into();
-                let stream: &mut BinlogStream = &mut (self).streams[i];
-                let config: &MysqlSourceConfigDetail = &mut (self).mysql_source[i];
+                let stream: &mut BinlogStream = &mut self.streams[i];
+                let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
 
                 match stream.read().await {
                     Ok((_header, data)) => {
