@@ -1,10 +1,10 @@
 source_type: MySQL
 sink_type: Print
-config:
-  host: localhost
-  port: 3306
-  username: root
-  password: <PASSWORD>
-  database: test
-  table_name: test
-  server_id: 1000
+source_config:
+  - host: localhost
+    port: 3306
+    username: root
+    password: <PASSWORD>
+    database: test
+    table_name: test
+    server_id: 1000
