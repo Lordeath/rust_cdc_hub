@@ -1,6 +1,7 @@
 use common::{CdcConfig, DataBuffer, Sink};
 use std::error::Error;
 use async_trait::async_trait;
+use tracing::info;
 
 pub struct PrintSink {
     config: CdcConfig,
@@ -15,13 +16,13 @@ impl PrintSink {
 #[async_trait]
 impl Sink for PrintSink {
     async fn connect(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        println!("{}", self.config.source_config.len());
+        info!("{}", self.config.source_config.len());
         Ok(())
     }
 
     async fn write_record(&self, record: &DataBuffer) -> Result<(), Box<dyn Error + Send + Sync>> {
-        println!("进入print");
-        println!("{:?}", record);
+        info!("进入print");
+        info!("{:?}", record);
 
         Ok(())
     }

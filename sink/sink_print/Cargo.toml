@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 common = { path = "../../common" }
 async-trait = "0.1.89"
+tracing = "0.1"

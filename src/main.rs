@@ -7,8 +7,34 @@ use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::{env, fs, process};
 
+use tracing::subscriber::set_global_default;
+use tracing::{debug, error, info, trace, warn};
+use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::FormatTime;
+use chrono::Local;
+
+
 #[tokio::main]
 async fn main() {
+    // 设置 tracing 日志格式，自动输出文件名、行号和函数名
+    let subscriber = FmtSubscriber::builder()
+        .with_env_filter("info")
+        .with_file(true)
+        .with_line_number(true)
+        .with_target(true)
+        .with_timer(CustomTime)
+        .finish();
+
+    tracing_log::LogTracer::init().expect("Failed to set logger");
+    set_global_default(subscriber).expect("setting default subscriber failed");
+
+    trace!("App 启动");
+    debug!("App 启动");
+    info!("App 启动");
+    warn!("App 启动");
+    error!("App 启动");
+
     let config_path = get_env("CONFIG_PATH");
     let config: CdcConfig = load_config(&config_path).expect("Failed to load config");
 
@@ -27,7 +53,7 @@ fn get_env(key: &str) -> String {
     match env::var(key) {
         Ok(val) => val,
         Err(_) => {
-            eprintln!("缺少环境变量 {}", key);
+            error!("缺少环境变量 {}", key);
             process::exit(1); // 优雅退出，返回码1
         }
     }
@@ -44,5 +70,15 @@ pub fn load_config(path: &str) -> Result<CdcConfig, Box<dyn Error>> {
         Ok(cfg)
     } else {
         Err("Unsupported config file format".into())
+    }
+}
+
+struct CustomTime;
+
+impl FormatTime for CustomTime {
+    fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
+        // 将时间格式化为所需的日期和时间格式
+        let datetime = Local::now().format("%Y-%m-%d %H:%M:%S%.6f");
+        write!(w, "{}", datetime)
     }
 }

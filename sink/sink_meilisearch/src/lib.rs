@@ -2,6 +2,7 @@ use common::{CdcConfig, DataBuffer, Operation, Sink};
 use meilisearch_sdk::client::Client;
 use meilisearch_sdk::macro_helper::async_trait;
 use std::error::Error;
+use tracing::{error, info};
 
 pub struct MeiliSearchSink {
     meili_url: String,
@@ -19,6 +20,18 @@ impl MeiliSearchSink {
         let meili_master_key = config.first_sink("meili_master_key");
         let meili_table_name = config.first_sink("table_name");
         let meili_table_pk = config.first_sink("meili_table_pk");
+        if meili_url.is_empty() {
+            panic!("meili_url is empty");
+        }
+        if meili_master_key.is_empty() {
+            panic!("meili_master_key is empty");
+        }
+        if meili_table_name.is_empty() {
+            panic!("meili_table_name is empty");
+        }
+        if meili_table_pk.is_empty() {
+            panic!("meili_table_pk is empty");
+        }
 
         // Create a client (without sending any request so that can't fail)
         let client = Client::new(meili_url.as_str(), Some(meili_master_key.as_str())).unwrap();
@@ -37,11 +50,11 @@ impl MeiliSearchSink {
 #[async_trait]
 impl Sink for MeiliSearchSink {
     async fn connect(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        println!(
+        info!(
             "meili_url: {}, meili_master_key: {}, meili_table_name: {}, meili_table_pk: {}",
             self.meili_url, self.meili_master_key, self.meili_table_name, self.meili_table_pk
         );
-        println!("meili_url: {}", self.client.health().await.unwrap().status);
+        info!("meili_url: {}", self.client.health().await.unwrap().status);
         let _ = self
             .client
             .create_index(
@@ -53,7 +66,7 @@ impl Sink for MeiliSearchSink {
             .client
             .index(self.meili_table_name.as_str())
             .set_primary_key(self.meili_table_pk.as_str());
-        println!("初始化完毕");
+        info!("初始化完毕");
         Ok(())
     }
 
@@ -80,7 +93,7 @@ impl Sink for MeiliSearchSink {
                         }
                     }
                     Err(e) => {
-                        println!("Error: {}", e);
+                        error!("Error: {}", e);
                     }
                 }
             }
@@ -94,7 +107,7 @@ impl Sink for MeiliSearchSink {
                 match result {
                     Ok(_) => {}
                     Err(e) => {
-                        println!("Error: {}", e);
+                        error!("Error: {}", e);
                     }
                 }
             }

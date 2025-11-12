@@ -13,6 +13,7 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tracing::{error, info};
 
 pub struct MySQLSource {
     // config: SourceConfig,
@@ -244,7 +245,7 @@ impl Source for MySQLSource {
         &mut self,
         mut sink: Arc<Mutex<dyn Sink + Send + Sync>>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        println!("Starting MySQL binlog source");
+        info!("Starting MySQL binlog source");
         let mut columns: Mutex<Vec<String>> = Mutex::new(vec![]);
         // 这里获取列名
         // columns = self.fill_table_column().await;
@@ -272,7 +273,7 @@ impl Source for MySQLSource {
                                 let table_name = table_map.get(&event.table_id).unwrap().as_str();
                                 let database_name = table_database_map.get(&event.table_id).unwrap().as_str();
                                 if (&config).is_target_database_and_table(database_name, table_name) {
-                                    println!("WriteRows: {}.{}", database_name, table_name);
+                                    info!("WriteRows: {}.{}", database_name, table_name);
                                     for row in event.rows {
                                         let before: HashMap<String, Value> = HashMap::new();
                                         let after: HashMap<String, Value> =
@@ -288,7 +289,7 @@ impl Source for MySQLSource {
                                 let table_name = table_map.get(&event.table_id).unwrap().as_str();
                                 let database_name = table_database_map.get(&event.table_id).unwrap().as_str();
                                 if (&config).is_target_database_and_table(database_name, table_name) {
-                                    println!("DeleteRows: {}.{}", database_name, table_name);
+                                    info!("DeleteRows: {}.{}", database_name, table_name);
                                     for row in event.rows {
                                         let before: HashMap<String, Value> =
                                             parse_row(row, &mut columns, &config).await;
@@ -304,7 +305,7 @@ impl Source for MySQLSource {
                                 let table_name = table_map.get(&event.table_id).unwrap().as_str();
                                 let database_name = table_database_map.get(&event.table_id).unwrap().as_str();
                                 if (&config).is_target_database_and_table(database_name, table_name) {
-                                    println!("UpdateRows: {}.{}", database_name, table_name);
+                                    info!("UpdateRows: {}.{}", database_name, table_name);
                                     for (b, a) in event.rows {
                                         let before: HashMap<String, Value> =
                                             parse_row(b, &mut columns, &config).await;
@@ -333,7 +334,7 @@ impl Source for MySQLSource {
                     }
                     Err(e) => {
                         // 打印错误信息，并且继续监听
-                        println!("Error: {}", e);
+                        error!("Error: {}", e);
                     }
                 }
             }
@@ -436,9 +437,9 @@ async fn parse_row(
                     .lock()
                     .await
                     .iter()
-                    .for_each(|column_name| println!("column: {}", column_name));
-                println!("column_name: {:?}", column_name);
-                println!("column_value: {:?}", column_value);
+                    .for_each(|column_name| error!("column: {}", column_name));
+                error!("column_name: {:?}", column_name);
+                error!("column_value: {:?}", column_value);
                 panic!("unsupported column value type")
             }
         }
