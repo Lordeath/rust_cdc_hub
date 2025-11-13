@@ -7,13 +7,12 @@ use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::{env, fs, process};
 
+use chrono::Local;
 use tracing::subscriber::set_global_default;
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::FmtSubscriber;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
-use chrono::Local;
-
 
 #[tokio::main]
 async fn main() {

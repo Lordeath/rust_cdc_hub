@@ -16,20 +16,9 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 
 pub struct MySQLSource {
-    // config: SourceConfig,
-    // server_id: u64,
-    // start_position: StartPosition,
-    // database: String,
-    // table_name: String,
-    // db:  DbConn,
     streams: Vec<BinlogStream>, // ✅ 多个流
     mysql_source: Vec<MysqlSourceConfigDetail>,
 }
-
-// struct StreamBind {
-//     stream: BinlogStream,
-//     config: MysqlSourceConfigDetail,
-// }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MysqlSourceConfig {
@@ -52,10 +41,11 @@ struct MysqlSourceConfigDetail {
 impl MysqlSourceConfig {
     pub async fn new(config: CdcConfig) -> Self {
         let size = config.source_config.len();
-        let mut table_name_list: Vec<String> = vec![];
         let mut mysql_source: Vec<MysqlSourceConfigDetail> = vec![];
         let table_name = config.first_source("table_name");
-        // table_name_list: Vec<String>,
+        // TODO 后续要支持多张表
+        let table_name_list: Vec<String> = vec![table_name.clone()];
+
         for i in 0..size {
             let username = config.source("username", i);
             let password = config.source("password", i);
@@ -81,9 +71,6 @@ impl MysqlSourceConfig {
                 server_id,
                 connection_url,
             });
-            if !(&table_name_list).into_iter().any(|x| x == &table_name) {
-                table_name_list.push(table_name.clone());
-            }
         }
         MysqlSourceConfig {
             table_name_list,
@@ -125,48 +112,10 @@ impl MysqlSourceConfigDetail {
 
 impl MySQLSource {
     pub async fn new(config: CdcConfig) -> Self {
-        // let config = self.config.clone();
-        // 使用map 拼接成 connection_url
-        // let username = config.first_source("username");
-        // let password = config.first_source("password");
-        // let host = config.first_source("host");
-        // let port = config.first_source("port");
-        // let database = config.first_source("database");
-        // let connection_url = format!(
-        //     "mysql://{}:{}@{}:{}/{}",
-        //     username,
-        //     password,
-        //     host,
-        //     port,
-        //     database.clone()
-        // );
-        //
-        // println!("Connecting to MySQL binlog at {}", connection_url.clone());
-        //
-        // let server_id: u64 = config.first_u64_source("server_id");
-        // let table_name = config.first_source("table_name");
         let mut streams: Vec<BinlogStream> = vec![];
         let mut mysql_source: Vec<MysqlSourceConfigDetail> = vec![];
-
-        // let binlog_filename = "mysql-bin.000001";
-        // let binlog_position = 4;
-        //
-        // let position: StartPosition = match config.get("start_position") {
-        //     Some(start_position) => {
-        //         // 从当前的binlog来进行分析，获取当前的binlog位置
-        //
-        //         StartPosition::BinlogPosition(binlog_filename, binlog_position)
-        //         // let start_position = match start_position.parse::<u64>() {
-        //         //     Ok(start_position) => StartPosition::Position(start_position),
-        //         //     Err(_) => StartPosition::Latest,
-        //         // };
-        //     },
-        //     None => StartPosition::Latest,
-        // };
-        // TODO 这里支持多个数据源配置
-
+        // 这里支持多个数据源配置
         let cfg: MysqlSourceConfig = MysqlSourceConfig::new(config).await;
-
         let size = cfg.mysql_source.len();
         for i in 0..size {
             let server_id: u64 = cfg.mysql_source[i].server_id;
@@ -182,16 +131,9 @@ impl MySQLSource {
 
             streams.push(client);
             mysql_source.push(cfg.mysql_source[i].clone());
-            // streams.push(StreamBind {
-            //     stream: client,
-            //     config: cfg.mysql_source[i],
-            // });
         }
 
         Self {
-            // connection_url,
-            // database,
-            // table_name,
             streams,
             mysql_source,
         }
@@ -204,11 +146,8 @@ impl MySQLSource {
         let mut loop_count = 0;
         loop {
             let sink_result = sink.lock().await.write_record(&data_buffer).await;
-            match sink_result {
-                Ok(_) => {
-                    break;
-                }
-                Err(_) => {}
+            if sink_result.is_ok() {
+                break;
             }
             loop_count += 1;
             if loop_count >= 3 {
@@ -221,18 +160,14 @@ impl MySQLSource {
         let mut loop_count = 0;
         loop {
             let sink_result = sink.lock().await.flush().await;
-            match sink_result {
-                Ok(_) => {
-                    break;
-                }
-                Err(_) => {}
+            if sink_result.is_ok() {
+                break;
             }
             loop_count += 1;
             if loop_count >= 3 {
                 panic!("flush error");
             }
         }
-        ()
     }
 }
 
@@ -327,16 +262,6 @@ impl Source for MySQLSource {
                             _ => {}
                         }
                         Self::flush_with_retry(&mut sink).await;
-
-                        // self.push_data(
-                        //     &mut sink,
-                        //     &mut columns,
-                        //     &mut table_map,
-                        //     &mut table_database_map,
-                        //     data,
-                        //     config,
-                        // )
-                        // .await;
                     }
                     Err(e) => {
                         // 打印错误信息，并且继续监听
@@ -448,7 +373,7 @@ async fn parse_row(
             }
         }
 
-        index = index + 1;
+        index += 1;
     }
     data
 }
