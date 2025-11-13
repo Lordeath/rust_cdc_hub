@@ -54,6 +54,7 @@ impl MysqlSourceConfig {
         let size = config.source_config.len();
         let mut table_name_list: Vec<String> = vec![];
         let mut mysql_source: Vec<MysqlSourceConfigDetail> = vec![];
+        let table_name = config.first_source("table_name");
         // table_name_list: Vec<String>,
         for i in 0..size {
             let username = config.source("username", i);
@@ -61,18 +62,14 @@ impl MysqlSourceConfig {
             let host = config.source("host", i);
             let port = config.source("port", i);
             let database = config.source("database", i);
-            let table_name = config.source("table_name", i);
-            let server_id: u64 = config
-                .source("server_id", i)
-                .parse::<u64>()
-                .unwrap_or_else(|_| 0);
+            let server_id: u64 = config.source("server_id", i).parse::<u64>().unwrap_or(0);
             let connection_url = format!(
                 "mysql://{}:{}@{}:{}/{}",
                 username,
                 password,
                 host,
                 port,
-                database.clone()
+                database.clone(),
             );
             mysql_source.push(MysqlSourceConfigDetail {
                 username,
@@ -85,7 +82,7 @@ impl MysqlSourceConfig {
                 connection_url,
             });
             if !(&table_name_list).into_iter().any(|x| x == &table_name) {
-                table_name_list.push(table_name);
+                table_name_list.push(table_name.clone());
             }
         }
         MysqlSourceConfig {
@@ -174,13 +171,14 @@ impl MySQLSource {
         for i in 0..size {
             let server_id: u64 = cfg.mysql_source[i].server_id;
             let connection_url = cfg.mysql_source[i].connection_url.clone();
-            let client: BinlogStream = BinlogClient::new(&connection_url, server_id, StartPosition::Latest)
-                .with_master_heartbeat(Duration::from_secs(5))
-                .with_read_timeout(Duration::from_secs(60))
-                .with_keepalive(Duration::from_secs(60), Duration::from_secs(10))
-                .connect()
-                .await
-                .unwrap();
+            let client: BinlogStream =
+                BinlogClient::new(&connection_url, server_id, StartPosition::Latest)
+                    .with_master_heartbeat(Duration::from_secs(5))
+                    .with_read_timeout(Duration::from_secs(60))
+                    .with_keepalive(Duration::from_secs(60), Duration::from_secs(10))
+                    .connect()
+                    .await
+                    .unwrap();
 
             streams.push(client);
             mysql_source.push(cfg.mysql_source[i].clone());
@@ -236,7 +234,6 @@ impl MySQLSource {
         }
         ()
     }
-
 }
 
 #[async_trait]
@@ -271,8 +268,10 @@ impl Source for MySQLSource {
                             }
                             EventData::WriteRows(event) => {
                                 let table_name = table_map.get(&event.table_id).unwrap().as_str();
-                                let database_name = table_database_map.get(&event.table_id).unwrap().as_str();
-                                if (&config).is_target_database_and_table(database_name, table_name) {
+                                let database_name =
+                                    table_database_map.get(&event.table_id).unwrap().as_str();
+                                if (&config).is_target_database_and_table(database_name, table_name)
+                                {
                                     info!("WriteRows: {}.{}", database_name, table_name);
                                     for row in event.rows {
                                         let before: HashMap<String, Value> = HashMap::new();
@@ -281,14 +280,17 @@ impl Source for MySQLSource {
                                         let op = Operation::CREATE;
                                         let data_buffer = DataBuffer { before, after, op };
                                         // sink.lock().await.write_record(&data_buffer);
-                                        Self::write_record_with_retry(&mut sink, &data_buffer).await;
+                                        Self::write_record_with_retry(&mut sink, &data_buffer)
+                                            .await;
                                     }
                                 }
                             }
                             EventData::DeleteRows(event) => {
                                 let table_name = table_map.get(&event.table_id).unwrap().as_str();
-                                let database_name = table_database_map.get(&event.table_id).unwrap().as_str();
-                                if (&config).is_target_database_and_table(database_name, table_name) {
+                                let database_name =
+                                    table_database_map.get(&event.table_id).unwrap().as_str();
+                                if (&config).is_target_database_and_table(database_name, table_name)
+                                {
                                     info!("DeleteRows: {}.{}", database_name, table_name);
                                     for row in event.rows {
                                         let before: HashMap<String, Value> =
@@ -297,14 +299,17 @@ impl Source for MySQLSource {
                                         let op = Operation::DELETE;
                                         let data_buffer = DataBuffer { before, after, op };
                                         // sink.lock().await.write_record(&data_buffer);
-                                        Self::write_record_with_retry(&mut sink, &data_buffer).await;
+                                        Self::write_record_with_retry(&mut sink, &data_buffer)
+                                            .await;
                                     }
                                 }
                             }
                             EventData::UpdateRows(event) => {
                                 let table_name = table_map.get(&event.table_id).unwrap().as_str();
-                                let database_name = table_database_map.get(&event.table_id).unwrap().as_str();
-                                if (&config).is_target_database_and_table(database_name, table_name) {
+                                let database_name =
+                                    table_database_map.get(&event.table_id).unwrap().as_str();
+                                if (&config).is_target_database_and_table(database_name, table_name)
+                                {
                                     info!("UpdateRows: {}.{}", database_name, table_name);
                                     for (b, a) in event.rows {
                                         let before: HashMap<String, Value> =
@@ -314,7 +319,8 @@ impl Source for MySQLSource {
                                         let op = Operation::UPDATE;
                                         let data_buffer = DataBuffer { before, after, op };
                                         // sink.lock().await.write_record(&data_buffer);
-                                        Self::write_record_with_retry(&mut sink, &data_buffer).await;
+                                        Self::write_record_with_retry(&mut sink, &data_buffer)
+                                            .await;
                                     }
                                 }
                             }
@@ -341,8 +347,6 @@ impl Source for MySQLSource {
         }
     }
 }
-
-
 
 async fn parse_row(
     row: RowEvent,
