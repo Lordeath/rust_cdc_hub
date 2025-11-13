@@ -4,7 +4,9 @@ use common::{CdcConfig, Source};
 use sink::SinkFactory;
 use source::SourceFactory;
 use std::error::Error;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
+use tokio::sync::Mutex;
+
 use std::{env, fs, process};
 
 use chrono::Local;
@@ -38,14 +40,13 @@ async fn main() {
     let config: CdcConfig = load_config(&config_path).expect("Failed to load config");
 
     let source: Arc<Mutex<dyn Source>> = SourceFactory::create_source(config.clone()).await;
+    info!("成功创建source");
     let sink = SinkFactory::create_sink(config).await;
+    info!("成功创建sink");
     let _ = sink.lock().await.connect().await;
-    // let _ = source.start(sink).await;
-
-    {
-        let src = source.lock();
-        let _ = src.expect("REASON").start(sink).await;
-    }
+    info!("成功连接到sink");
+    let _ = source.lock().await.start(sink).await;
+    info!("程序结束");
 }
 
 fn get_env(key: &str) -> String {
