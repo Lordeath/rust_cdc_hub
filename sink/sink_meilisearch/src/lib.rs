@@ -151,12 +151,14 @@ impl Sink for MeiliSearchSink {
                 .await
         {
             error!("Batch upsert error: {}", e);
+            return Err(Box::new(e));
         }
 
         if !deletes.is_empty()
             && let Err(e) = index.delete_documents(&deletes).await
         {
             error!("Batch delete error: {}", e);
+            return Err(Box::new(e));
         }
 
         Ok(())
