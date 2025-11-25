@@ -5,12 +5,13 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[async_trait]
 pub trait Source: Send + Sync {
     async fn start(
         &mut self,
-        sink: Arc<tokio::sync::Mutex<dyn Sink + Send + Sync>>,
+        sink: Arc<Mutex<dyn Sink + Send + Sync>>,
     ) -> Result<(), Box<dyn Error + Send + Sync>>;
 }
 
@@ -74,11 +75,11 @@ impl CdcConfig {
     }
     pub fn first_u64_source(&self, key: &str) -> u64 {
         let value = self.first_source(key);
-        value.parse::<u64>().unwrap_or_else(|_| 0)
+        value.parse::<u64>().unwrap_or(0)
     }
     pub fn first_u32_source(&self, key: &str) -> u32 {
         let value = self.first_source(key);
-        value.parse::<u32>().unwrap_or_else(|_| 0)
+        value.parse::<u32>().unwrap_or(0)
     }
 }
 
@@ -140,7 +141,7 @@ pub enum Value {
 }
 
 impl Value {
-    pub fn to_string(&self) -> String {
+    pub fn resolve_string(&self) -> String {
         match self {
             Value::String(s) => s.to_string(),
             Value::Int8(s) => s.to_string(),

@@ -6,4 +6,4 @@ edition = "2024"
 [dependencies]
 common = { path = "../common" }
 source_mysql = { path = "source_mysql" }
-tokio = "1.48.0"
+tokio = { version = "1", features = ["full"] }

@@ -65,7 +65,8 @@ impl Sink for MeiliSearchSink {
         let _ = self
             .client
             .index(self.meili_table_name.as_str())
-            .set_primary_key(self.meili_table_pk.as_str());
+            .set_primary_key(self.meili_table_pk.as_str())
+            .await;
         info!("初始化完毕");
         Ok(())
     }
@@ -117,7 +118,7 @@ impl Sink for MeiliSearchSink {
                 match pk {
                     None => {}
                     Some(pk_value) => {
-                        let pk_str = pk_value.to_string();
+                        let pk_str = pk_value.resolve_string();
                         self.client
                             .index(self.meili_table_name.as_str())
                             .delete_document(pk_str)

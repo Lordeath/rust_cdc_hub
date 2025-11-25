@@ -145,7 +145,7 @@ impl MySQLSource {
     ) {
         let mut loop_count = 0;
         loop {
-            let sink_result = sink.lock().await.write_record(&data_buffer).await;
+            let sink_result = sink.lock().await.write_record(data_buffer).await;
             if sink_result.is_ok() {
                 break;
             }
@@ -205,13 +205,13 @@ impl Source for MySQLSource {
                                 let table_name = table_map.get(&event.table_id).unwrap().as_str();
                                 let database_name =
                                     table_database_map.get(&event.table_id).unwrap().as_str();
-                                if (&config).is_target_database_and_table(database_name, table_name)
+                                if config.is_target_database_and_table(database_name, table_name)
                                 {
                                     info!("WriteRows: {}.{}", database_name, table_name);
                                     for row in event.rows {
                                         let before: HashMap<String, Value> = HashMap::new();
                                         let after: HashMap<String, Value> =
-                                            parse_row(row, &mut columns, &config).await;
+                                            parse_row(row, &mut columns, config).await;
                                         let op = Operation::CREATE;
                                         let data_buffer = DataBuffer { before, after, op };
                                         // sink.lock().await.write_record(&data_buffer);
@@ -224,12 +224,12 @@ impl Source for MySQLSource {
                                 let table_name = table_map.get(&event.table_id).unwrap().as_str();
                                 let database_name =
                                     table_database_map.get(&event.table_id).unwrap().as_str();
-                                if (&config).is_target_database_and_table(database_name, table_name)
+                                if config.is_target_database_and_table(database_name, table_name)
                                 {
                                     info!("DeleteRows: {}.{}", database_name, table_name);
                                     for row in event.rows {
                                         let before: HashMap<String, Value> =
-                                            parse_row(row, &mut columns, &config).await;
+                                            parse_row(row, &mut columns, config).await;
                                         let after: HashMap<String, Value> = HashMap::new();
                                         let op = Operation::DELETE;
                                         let data_buffer = DataBuffer { before, after, op };
@@ -243,14 +243,14 @@ impl Source for MySQLSource {
                                 let table_name = table_map.get(&event.table_id).unwrap().as_str();
                                 let database_name =
                                     table_database_map.get(&event.table_id).unwrap().as_str();
-                                if (&config).is_target_database_and_table(database_name, table_name)
+                                if config.is_target_database_and_table(database_name, table_name)
                                 {
                                     info!("UpdateRows: {}.{}", database_name, table_name);
                                     for (b, a) in event.rows {
                                         let before: HashMap<String, Value> =
-                                            parse_row(b, &mut columns, &config).await;
+                                            parse_row(b, &mut columns, config).await;
                                         let after: HashMap<String, Value> =
-                                            parse_row(a, &mut columns, &config).await;
+                                            parse_row(a, &mut columns, config).await;
                                         let op = Operation::UPDATE;
                                         let data_buffer = DataBuffer { before, after, op };
                                         // sink.lock().await.write_record(&data_buffer);

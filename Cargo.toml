@@ -10,7 +10,7 @@ edition = "2024"
 common = { path = "common" }
 source = { path = "source" }
 sink = { path = "sink" }
-tokio = "1.48"
+tokio = { version = "1", features = ["full"] }
 serde_yaml = "0.9"
 serde_json = "1.0"
 tracing = "0.1"
