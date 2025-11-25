@@ -1,4 +1,7 @@
+extern crate core;
+
 use async_trait::async_trait;
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use common::{CdcConfig, DataBuffer, Operation, Sink, Source, Value};
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
@@ -8,7 +11,8 @@ use mysql_binlog_connector_rust::event::row_event::RowEvent;
 use serde::Deserialize;
 use serde::Serialize;
 use sqlx::mysql::MySqlRow;
-use sqlx::{Column, MySqlPool, Row};
+use sqlx::types::BigDecimal;
+use sqlx::{Column, MySqlPool, Row, ValueRef};
 use sqlx::{MySql, Pool, TypeInfo};
 use std::collections::HashMap;
 use std::error::Error;
@@ -153,21 +157,104 @@ impl MysqlSourceConfigDetail {
         for (_, column) in row.columns().iter().enumerate() {
             // let value = row.get(i);
             let name = column.name().to_string();
-            let value = match column.type_info().name() {
-                "INT" | "BIGINT" => match row.try_get::<i64, _>(name.as_str()) {
-                    Ok(v) => Value::Int64(v),
-                    Err(_) => Value::None,
-                },
-                "VARCHAR" | "TEXT" => match row.try_get::<String, _>(name.as_str()) {
-                    Ok(v) => Value::String(v),
-                    Err(_) => Value::None,
-                },
-                "FLOAT" | "DOUBLE" => match row.try_get::<f64, _>(name.as_str()) {
-                    Ok(v) => Value::Double(v),
-                    Err(_) => Value::None,
-                },
-                _ => panic!("Unsupported column type: {}", column.type_info().name()),
+            let is_null = row
+                .try_get_raw(name.as_str())
+                .expect("mysql_row_to_hashmap")
+                .is_null();
+
+            let value = if is_null {
+                Value::None
+            } else {
+                match column.type_info().name() {
+                    "INT" => match row.try_get::<i32, _>(name.as_str()) {
+                        Ok(v) => Value::Int32(v),
+                        Err(e) => {
+                            error!("类型转换失败: {}", column.type_info().name());
+                            error!("{}", e);
+                            panic!("类型转换失败: {}", column.type_info().name());
+                        }
+                    },
+                    "BIGINT" => match row.try_get::<i64, _>(name.as_str()) {
+                        Ok(v) => Value::Int64(v),
+                        Err(e) => {
+                            error!("类型转换失败: {}", column.type_info().name());
+                            error!("{}", e);
+                            panic!("类型转换失败: {}", column.type_info().name());
+                        }
+                    },
+                    "TINYINT" => match row.try_get::<i8, _>(name.as_str()) {
+                        Ok(v) => Value::Int8(v),
+                        Err(e) => {
+                            error!("类型转换失败: {}", column.type_info().name());
+                            error!("{}", e);
+                            panic!("类型转换失败: {}", column.type_info().name());
+                        }
+                    },
+                    "DATE" => match row.try_get::<NaiveDate, _>(name.as_str()) {
+                        Ok(v) => Value::String(v.to_string()),
+                        Err(e) => {
+                            error!("类型转换失败: {}", column.type_info().name());
+                            error!("{}", e);
+                            panic!("类型转换失败: {}", column.type_info().name());
+                        },
+                    },
+                    "DATETIME" => match row.try_get::<NaiveDateTime, _>(name.as_str()) {
+                        Ok(v) => Value::String(v.to_string()),
+                        Err(e) => {
+                            error!("类型转换失败: {}", column.type_info().name());
+                            error!("{}", e);
+                            panic!("类型转换失败: {}", column.type_info().name());
+                        },
+                    },
+                    "TIMESTAMP" => match row.try_get::<DateTime<Utc>, _>(name.as_str()) {
+                        Ok(v) => {
+                            // 推荐：将带时区的 DateTime<Utc> 转换为 Unix 时间戳（i64 秒数）
+                            let timestamp_sec = v.timestamp();
+
+                            // 假设您的 Value::Timestamp 接受 i64
+                            Value::Timestamp(timestamp_sec)
+
+                            // 另一种选择：如果您需要 NaiveDateTime (不带时区)
+                            // Value::NaiveDateTime(v.naive_utc())
+                        },
+                        Err(e) => {
+                            // ... 错误处理保持不变
+                            error!("类型转换失败: {}", column.type_info().name());
+                            error!("{}", e);
+                            panic!("类型转换失败: {}", column.type_info().name());
+                        }
+                    },
+                    "VARCHAR" | "TEXT" => match row.try_get::<String, _>(name.as_str()) {
+                        Ok(v) => Value::String(v),
+                        Err(e) => {
+                            error!("类型转换失败: {}", column.type_info().name());
+                            error!("{}", e);
+                            panic!("类型转换失败: {}", column.type_info().name());
+                        }
+                    },
+                    "FLOAT" | "DOUBLE" => match row.try_get::<f64, _>(name.as_str()) {
+                        Ok(v) => Value::Double(v),
+                        Err(e) => {
+                            error!("类型转换失败: {}", column.type_info().name());
+                            error!("{}", e);
+                            panic!("类型转换失败: {}", column.type_info().name());
+                        }
+                    },
+                    "DECIMAL" => match row.try_get::<BigDecimal, _>(name.as_str()) {
+                        Ok(v) => Value::Decimal(v.to_string()), // 假设您有 Value::Decimal 变体
+                        Err(e) => {
+                            error!("类型转换失败: {}", column.type_info().name());
+                            error!("{}", e);
+                            panic!("类型转换失败: {}", column.type_info().name());
+                        }
+                    },
+                    _ => {
+                        error!("Unsupported column type: {}", column.type_info().name());
+                        panic!("Unsupported column type: {}", column.type_info().name())
+                    }
+                }
             };
+
             result.insert(column.name().to_string(), value);
         }
         result
@@ -255,7 +342,8 @@ impl Source for MySQLSource {
                 // 这里进行循环，一批一批进行数据写入
                 let mut id: i64 = 0;
                 loop {
-                    let data_buffer_list: Vec<DataBuffer> = config.extract_init_data(id, pool).await;
+                    let data_buffer_list: Vec<DataBuffer> =
+                        config.extract_init_data(id, pool).await;
                     let len = data_buffer_list.len();
                     for j in 0..len {
                         // info!("写入数据 {}", j);
