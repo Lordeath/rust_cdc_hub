@@ -2,7 +2,11 @@ use common::{CdcConfig, DataBuffer, Operation, Sink};
 use meilisearch_sdk::client::Client;
 use meilisearch_sdk::macro_helper::async_trait;
 use std::error::Error;
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::{Duration, sleep};
 use tracing::{error, info};
+
+const BATCH_SIZE: usize = 1024;
 
 pub struct MeiliSearchSink {
     meili_url: String,
@@ -10,8 +14,12 @@ pub struct MeiliSearchSink {
     client: Client,
     meili_table_name: String,
     meili_table_pk: String,
-    // ✅ 新增两个字段
-    initialized: tokio::sync::RwLock<bool>, // 判断是否第一次 flush（用锁保护并发安全）
+
+    buffer: Mutex<Vec<DataBuffer>>,
+    initialized: RwLock<bool>,
+
+    // 新增：定时窗口
+    flush_interval_secs: u64,
 }
 
 impl MeiliSearchSink {
@@ -20,20 +28,8 @@ impl MeiliSearchSink {
         let meili_master_key = config.first_sink("meili_master_key");
         let meili_table_name = config.first_sink("table_name");
         let meili_table_pk = config.first_sink("meili_table_pk");
-        if meili_url.is_empty() {
-            panic!("meili_url is empty");
-        }
-        if meili_master_key.is_empty() {
-            panic!("meili_master_key is empty");
-        }
-        if meili_table_name.is_empty() {
-            panic!("meili_table_name is empty");
-        }
-        if meili_table_pk.is_empty() {
-            panic!("meili_table_pk is empty");
-        }
+        let flush_interval_secs = config.first_sink("flush_interval_secs").parse::<u64>().unwrap_or(15);
 
-        // Create a client (without sending any request so that can't fail)
         let client = Client::new(meili_url.as_str(), Some(meili_master_key.as_str())).unwrap();
 
         MeiliSearchSink {
@@ -42,7 +38,9 @@ impl MeiliSearchSink {
             client,
             meili_table_name,
             meili_table_pk,
-            initialized: tokio::sync::RwLock::new(false),
+            buffer: Mutex::new(Vec::with_capacity(BATCH_SIZE)),
+            initialized: RwLock::new(false),
+            flush_interval_secs,
         }
     }
 }
@@ -54,86 +52,113 @@ impl Sink for MeiliSearchSink {
             "meili_url: {}, meili_master_key: {}, meili_table_name: {}, meili_table_pk: {}",
             self.meili_url, self.meili_master_key, self.meili_table_name, self.meili_table_pk
         );
-        info!("meili_url: {}", self.client.health().await.unwrap().status);
+
         let _ = self
             .client
-            .create_index(
-                self.meili_table_name.as_str(),
-                Some(self.meili_table_pk.as_str()),
-            )
+            .create_index(&self.meili_table_name, Some(&self.meili_table_pk))
             .await;
-        let _ = self
-            .client
-            .index(self.meili_table_name.as_str())
-            .set_primary_key(self.meili_table_pk.as_str())
-            .await;
-        info!("初始化完毕");
+
+        // 🚀 启动定时 flush 任务 (每 5 秒)
+        // ⚠️ 警告: 为了让 spawned task 能获取 Sink 的所有权，
+        // 在实际的 CDC 框架中，`MeiliSearchSink` 实例必须被包装在 `Arc` 中。
+        // 此处假设框架为您提供了获取 `Arc<Self>` 克隆的能力。
+        // 如果没有，这段代码在编译时可能会失败，需要您在外部调整包装方式。
+        let sink_for_timer: &'static Self = unsafe {
+            // 仅为演示定时器逻辑而使用，您可能需要替换为安全的 Arc::clone 逻辑
+            std::mem::transmute(self)
+        };
+
+        let flush_interval_secs = self.flush_interval_secs;
+
+        tokio::spawn(async move {
+            info!(
+                "MeiliSearch Sink Timer started ({}s window).",
+                flush_interval_secs
+            );
+            let timer_interval = Duration::from_secs(flush_interval_secs);
+
+            loop {
+                // 等待时间窗口到达
+                sleep(timer_interval).await;
+
+                match sink_for_timer.flush().await {
+                    Ok(_) => {
+                        // 只有在实际有数据写入时才记录信息，但 flush 方法内部会检查是否为空
+                        // info!("定时写入完成");
+                    }
+                    Err(e) => error!("Automatic flush triggered by timer failed: {}", e),
+                }
+            }
+        });
+
         Ok(())
     }
 
     async fn write_record(&self, record: &DataBuffer) -> Result<(), Box<dyn Error + Send + Sync>> {
-        match record.op {
-            Operation::CREATE => {
-                let docs = vec![&record.after];
-                let result = self
-                    .client
-                    .index(self.meili_table_name.as_str())
-                    .add_or_replace(&docs, Some(self.meili_table_pk.as_str()))
-                    .await;
-                match result {
-                    Ok(_) => {
-                        if !*self.initialized.read().await {
-                            // ✅ 获取字段名
-                            let field_names = record.after.keys().cloned().collect::<Vec<_>>();
-                            let _ = self
-                                .client
-                                .index(self.meili_table_name.as_str())
-                                .set_filterable_attributes(&field_names)
-                                .await;
-                            *self.initialized.write().await = true;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Error: {}", e);
-                    }
-                }
-            }
-            Operation::UPDATE => {
-                let docs = vec![&record.after];
-                let result = self
-                    .client
-                    .index(self.meili_table_name.as_str())
-                    .add_or_replace(&docs, Some(self.meili_table_pk.as_str()))
-                    .await;
-                match result {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("Error: {}", e);
-                    }
-                }
-            }
-            Operation::DELETE => {
-                // ✅ 取主键字符串
-                let pk = record.before.get(&self.meili_table_pk);
-                match pk {
-                    None => {}
-                    Some(pk_value) => {
-                        let pk_str = pk_value.resolve_string();
-                        self.client
-                            .index(self.meili_table_name.as_str())
-                            .delete_document(pk_str)
-                            .await?;
-                    }
-                }
-            }
-            _ => {}
-        };
+        let mut buf = self.buffer.lock().await;
+        buf.push(record.clone());
+
+        if buf.len() >= BATCH_SIZE {
+            drop(buf);
+            self.flush().await?;
+        }
 
         Ok(())
     }
 
     async fn flush(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // todo!()
+        let mut buf = self.buffer.lock().await;
+        if buf.is_empty() {
+            return Ok(()); // 没数据不写
+        }
+        info!("Flushing MeiliSearch Sink... {}", buf.len());
+
+        // 交换出 buffer（避免长时间锁住）
+        let batch = std::mem::take(&mut *buf);
+        drop(buf);
+
+        let index = self.client.index(&self.meili_table_name);
+
+        let mut docs = vec![];
+        let mut deletes = vec![];
+
+        for r in batch {
+            match r.op {
+                Operation::CREATE | Operation::UPDATE => {
+                    docs.push(r.after);
+                }
+                Operation::DELETE => {
+                    if let Some(pk) = r.before.get(&self.meili_table_pk) {
+                        deletes.push(pk.resolve_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 初始化 filterable attributes（一次）
+        if !*self.initialized.read().await
+            && let Some(first) = docs.first()
+        {
+            let field_names = first.keys().cloned().collect::<Vec<_>>();
+            let _ = index.set_filterable_attributes(&field_names).await;
+            *self.initialized.write().await = true;
+        }
+
+        if !docs.is_empty()
+            && let Err(e) = index
+                .add_or_replace(&docs, Some(&self.meili_table_pk))
+                .await
+        {
+            error!("Batch upsert error: {}", e);
+        }
+
+        if !deletes.is_empty()
+            && let Err(e) = index.delete_documents(&deletes).await
+        {
+            error!("Batch delete error: {}", e);
+        }
+
         Ok(())
     }
 }

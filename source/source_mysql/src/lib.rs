@@ -258,7 +258,7 @@ impl Source for MySQLSource {
                     let data_buffer_list: Vec<DataBuffer> = config.extract_init_data(id, pool).await;
                     let len = data_buffer_list.len();
                     for j in 0..len {
-                        info!("写入数据 {}", j);
+                        // info!("写入数据 {}", j);
                         let data_buffer = &data_buffer_list[j];
                         Self::write_record_with_retry(&mut sink, data_buffer).await;
                         let this_id =
