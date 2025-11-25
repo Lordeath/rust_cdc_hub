@@ -166,7 +166,7 @@ impl MysqlSourceConfigDetail {
                     Ok(v) => Value::Double(v),
                     Err(_) => Value::None,
                 },
-                _ => Value::None,
+                _ => panic!("Unsupported column type: {}", column.type_info().name()),
             };
             result.insert(column.name().to_string(), value);
         }
