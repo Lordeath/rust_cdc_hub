@@ -85,14 +85,9 @@ impl CdcConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataBuffer {
-    // pub db: String,
-    // pub table: String,
     pub before: HashMap<String, Value>,
     pub after: HashMap<String, Value>,
     pub op: Operation,
-    // pub binlog_file: String,
-    // pub binlog_position: u64,
-    // pub timestamp: u64,
 }
 
 #[derive(Debug, Clone)]

@@ -113,8 +113,6 @@ impl MysqlSourceConfigDetail {
             .bind(self.database.clone())
             .bind(self.table_name.clone())
             .fetch_all(pool)
-            // .execute(&mut *tx.acquire().await?)
-            // .execute(pool)
             .await
             .unwrap_or_else(|e| panic!("Error executing query: {}", e))
             .into_iter()
@@ -134,7 +132,6 @@ impl MysqlSourceConfigDetail {
             self.table_name, self.pk_column, id, self.pk_column, LOOP_PACE
         );
 
-        // let pool = MySqlPool::connect(&self.connection_url).await.unwrap();
         info!("extract_init_data: {}", sql);
         // 查询 Row，而不是 HashMap
         let rows: Vec<MySqlRow> = sqlx::query(&sql)
@@ -154,8 +151,8 @@ impl MysqlSourceConfigDetail {
 
     fn mysql_row_to_hashmap(&self, row: &MySqlRow) -> HashMap<String, Value> {
         let mut result = HashMap::new();
-        for (_, column) in row.columns().iter().enumerate() {
-            // let value = row.get(i);
+        for row_column in row.columns().iter().enumerate() {
+            let column = row_column.1;
             let name = column.name().to_string();
             let is_null = row
                 .try_get_raw(name.as_str())
@@ -227,9 +224,6 @@ impl MysqlSourceConfigDetail {
 
                             // 假设您的 Value::Timestamp 接受 i64
                             Value::Timestamp(timestamp_sec)
-
-                            // 另一种选择：如果您需要 NaiveDateTime (不带时区)
-                            // Value::NaiveDateTime(v.naive_utc())
                         }
                         Err(e) => {
                             // ... 错误处理保持不变
@@ -296,7 +290,6 @@ impl MySQLSource {
                     .unwrap();
 
             streams.push(client);
-            // mysql_source.push(cfg.mysql_source[i].clone());
             mysql_source.push(cfg.mysql_source[i].clone());
             let pool: Pool<MySql> = MySqlPool::connect(&connection_url).await.unwrap();
             pools.push(pool);
@@ -359,9 +352,7 @@ impl Source for MySQLSource {
                     let data_buffer_list: Vec<DataBuffer> =
                         config.extract_init_data(id, pool).await;
                     let len = data_buffer_list.len();
-                    for j in 0..len {
-                        // info!("写入数据 {}", j);
-                        let data_buffer = &data_buffer_list[j];
+                    for data_buffer in data_buffer_list.iter().take(len) {
                         Self::write_record_with_retry(&mut sink, data_buffer).await;
                         let this_id =
                             data_buffer.after.get(&config.pk_column).unwrap_or_else(|| {
@@ -389,14 +380,11 @@ impl Source for MySQLSource {
         info!("Starting MySQL binlog source");
         let mut columns: Mutex<Vec<String>> = Mutex::new(vec![]);
         // 这里获取列名
-        // columns = self.fill_table_column().await;
-
         let mut table_map = HashMap::new();
         let mut table_database_map = HashMap::new();
         loop {
             let max = self.streams.len();
             for i in 0..max {
-                // let stream_bind: StreamBind = self.streams[i].into();
                 let stream: &mut BinlogStream = &mut self.streams[i];
                 let pool: &mut Pool<MySql> = &mut self.pools[i];
                 let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
@@ -423,7 +411,6 @@ impl Source for MySQLSource {
                                             parse_row(row, &mut columns, config, pool).await;
                                         let op = Operation::CREATE;
                                         let data_buffer = DataBuffer { before, after, op };
-                                        // sink.lock().await.write_record(&data_buffer);
                                         Self::write_record_with_retry(&mut sink, &data_buffer)
                                             .await;
                                     }
@@ -441,7 +428,6 @@ impl Source for MySQLSource {
                                         let after: HashMap<String, Value> = HashMap::new();
                                         let op = Operation::DELETE;
                                         let data_buffer = DataBuffer { before, after, op };
-                                        // sink.lock().await.write_record(&data_buffer);
                                         Self::write_record_with_retry(&mut sink, &data_buffer)
                                             .await;
                                     }
@@ -460,7 +446,6 @@ impl Source for MySQLSource {
                                             parse_row(a, &mut columns, config, pool).await;
                                         let op = Operation::UPDATE;
                                         let data_buffer = DataBuffer { before, after, op };
-                                        // sink.lock().await.write_record(&data_buffer);
                                         Self::write_record_with_retry(&mut sink, &data_buffer)
                                             .await;
                                     }
@@ -482,7 +467,6 @@ impl Source for MySQLSource {
 
 async fn parse_row(
     row: RowEvent,
-    // data: &mut HashMap<String, Value>,
     columns: &mut Mutex<Vec<String>>,
     config: &MysqlSourceConfigDetail,
     pool: &mut Pool<MySql>,
