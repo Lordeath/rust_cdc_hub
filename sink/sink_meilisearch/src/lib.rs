@@ -16,7 +16,6 @@ pub struct MeiliSearchSink {
 
     buffer: Mutex<Vec<DataBuffer>>,
     initialized: RwLock<bool>,
-
 }
 
 impl MeiliSearchSink {
@@ -25,7 +24,6 @@ impl MeiliSearchSink {
         let meili_master_key = config.first_sink("meili_master_key");
         let meili_table_name = config.first_sink("table_name");
         let meili_table_pk = config.first_sink("meili_table_pk");
-
 
         let client = Client::new(meili_url.as_str(), Some(meili_master_key.as_str())).unwrap();
 
@@ -54,7 +52,6 @@ impl Sink for MeiliSearchSink {
             .create_index(&self.meili_table_name, Some(&self.meili_table_pk))
             .await;
 
-
         Ok(())
     }
 
@@ -64,18 +61,23 @@ impl Sink for MeiliSearchSink {
 
         if buf.len() >= BATCH_SIZE {
             drop(buf);
-            self.flush().await?;
+            self.flush(false).await?;
         }
 
         Ok(())
     }
 
-    async fn flush(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn flush(&self, from_timer: bool) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut buf = self.buffer.lock().await;
+        if from_timer {
+            info!("Flushing MeiliSearch Sink by timer... {}", buf.len());
+        } else if !buf.is_empty() {
+            info!("Flushing MeiliSearch Sink by signal... {}", buf.len());
+        }
         if buf.is_empty() {
             return Ok(()); // 没数据不写
         }
-        info!("Flushing MeiliSearch Sink... {}", buf.len());
+        // info!("Flushing MeiliSearch Sink... {}", buf.len());
 
         // 交换出 buffer（避免长时间锁住）
         let batch = std::mem::take(&mut *buf);

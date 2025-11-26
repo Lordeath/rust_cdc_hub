@@ -25,7 +25,7 @@ pub trait Sink: Send + Sync {
     async fn write_record(&self, record: &DataBuffer) -> Result<(), Box<dyn Error + Send + Sync>>;
 
     /// 刷新缓冲区（可选）
-    async fn flush(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn flush(&self, _from_timer: bool) -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok(())
     }
 }

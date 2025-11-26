@@ -66,12 +66,8 @@ fn add_flush_timer(config: CdcConfig, sink: &Arc<Mutex<dyn Sink + Send + Sync>>)
             // 等待时间窗口到达
             sleep(timer_interval).await;
 
-            match sink_for_timer.lock().await.flush().await {
-                Ok(_) => {
-                    // 只有在实际有数据写入时才记录信息，但 flush 方法内部会检查是否为空
-                    // info!("定时写入完成");
-                }
-                Err(e) => error!("Automatic flush triggered by timer failed: {}", e),
+            if let Err(e) = sink_for_timer.lock().await.flush(true).await {
+                error!("Automatic flush triggered by timer failed: {}", e)
             }
         }
     });

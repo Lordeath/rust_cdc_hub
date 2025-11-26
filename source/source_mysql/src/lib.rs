@@ -19,7 +19,7 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 const LOOP_PACE: usize = 8192;
 
@@ -135,7 +135,10 @@ impl MysqlSourceConfigDetail {
             self.table_name, self.pk_column, id, self.pk_column, LOOP_PACE
         );
 
-        info!("extract_init_data: {}", sql);
+        debug!(
+            "extract_init_data: [{}.{}] {} {}",
+            self.database, self.table_name, self.pk_column, id
+        );
         // 查询 Row，而不是 HashMap
         let rows: Vec<MySqlRow> = sqlx::query(&sql)
             .fetch_all(pool)
@@ -326,7 +329,7 @@ impl MySQLSource {
     async fn flush_with_retry(sink: &mut Arc<Mutex<dyn Sink + Send + Sync>>) {
         let mut loop_count = 0;
         loop {
-            let sink_result = sink.lock().await.flush().await;
+            let sink_result = sink.lock().await.flush(false).await;
             if sink_result.is_ok() {
                 break;
             }
@@ -372,7 +375,7 @@ impl Source for MySQLSource {
                             id = *this_id;
                         }
                     }
-                    info!("当前最大id为 {}", id);
+                    debug!("当前最大id为 {}", id);
                     if len != LOOP_PACE {
                         break;
                     }
