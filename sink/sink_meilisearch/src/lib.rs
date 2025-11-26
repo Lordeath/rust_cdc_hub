@@ -6,7 +6,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, sleep};
 use tracing::{error, info};
 
-const BATCH_SIZE: usize = 1024;
+const BATCH_SIZE: usize = 8192;
 
 pub struct MeiliSearchSink {
     meili_url: String,
