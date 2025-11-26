@@ -3,7 +3,6 @@ use meilisearch_sdk::client::Client;
 use meilisearch_sdk::macro_helper::async_trait;
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{Duration, sleep};
 use tracing::{error, info};
 
 const BATCH_SIZE: usize = 8192;
@@ -18,8 +17,6 @@ pub struct MeiliSearchSink {
     buffer: Mutex<Vec<DataBuffer>>,
     initialized: RwLock<bool>,
 
-    // 新增：定时窗口
-    flush_interval_secs: u64,
 }
 
 impl MeiliSearchSink {
@@ -28,10 +25,7 @@ impl MeiliSearchSink {
         let meili_master_key = config.first_sink("meili_master_key");
         let meili_table_name = config.first_sink("table_name");
         let meili_table_pk = config.first_sink("meili_table_pk");
-        let flush_interval_secs = config
-            .first_sink("flush_interval_secs")
-            .parse::<u64>()
-            .unwrap_or(15);
+
 
         let client = Client::new(meili_url.as_str(), Some(meili_master_key.as_str())).unwrap();
 
@@ -43,7 +37,6 @@ impl MeiliSearchSink {
             meili_table_pk,
             buffer: Mutex::new(Vec::with_capacity(BATCH_SIZE)),
             initialized: RwLock::new(false),
-            flush_interval_secs,
         }
     }
 }
@@ -61,38 +54,6 @@ impl Sink for MeiliSearchSink {
             .create_index(&self.meili_table_name, Some(&self.meili_table_pk))
             .await;
 
-        // 🚀 启动定时 flush 任务 (每 5 秒)
-        // ⚠️ 警告: 为了让 spawned task 能获取 Sink 的所有权，
-        // 在实际的 CDC 框架中，`MeiliSearchSink` 实例必须被包装在 `Arc` 中。
-        // 此处假设框架为您提供了获取 `Arc<Self>` 克隆的能力。
-        // 如果没有，这段代码在编译时可能会失败，需要您在外部调整包装方式。
-        let sink_for_timer: &'static Self = unsafe {
-            // 仅为演示定时器逻辑而使用，您可能需要替换为安全的 Arc::clone 逻辑
-            std::mem::transmute(self)
-        };
-
-        let flush_interval_secs = self.flush_interval_secs;
-
-        tokio::spawn(async move {
-            info!(
-                "MeiliSearch Sink Timer started ({}s window).",
-                flush_interval_secs
-            );
-            let timer_interval = Duration::from_secs(flush_interval_secs);
-
-            loop {
-                // 等待时间窗口到达
-                sleep(timer_interval).await;
-
-                match sink_for_timer.flush().await {
-                    Ok(_) => {
-                        // 只有在实际有数据写入时才记录信息，但 flush 方法内部会检查是否为空
-                        // info!("定时写入完成");
-                    }
-                    Err(e) => error!("Automatic flush triggered by timer failed: {}", e),
-                }
-            }
-        });
 
         Ok(())
     }

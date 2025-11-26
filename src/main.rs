@@ -1,15 +1,16 @@
 extern crate core;
 
-use common::{CdcConfig, Source};
+use common::{CdcConfig, Sink, Source};
 use sink::SinkFactory;
 use source::SourceFactory;
 use std::error::Error;
-use std::sync::{Arc};
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use std::{env, fs, process};
-
 use chrono::Local;
+use std::time::Duration;
+use std::{env, fs, process};
+use tokio::time::sleep;
 use tracing::subscriber::set_global_default;
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::FmtSubscriber;
@@ -41,12 +42,39 @@ async fn main() {
 
     let source: Arc<Mutex<dyn Source>> = SourceFactory::create_source(config.clone()).await;
     info!("成功创建source");
-    let sink = SinkFactory::create_sink(config).await;
+    let sink = SinkFactory::create_sink(config.clone()).await;
     info!("成功创建sink");
     let _ = sink.lock().await.connect().await;
     info!("成功连接到sink");
-    let _ = source.lock().await.start(sink).await;
+    add_flush_timer(config, &sink);
+    info!("成功增加flush timer");
+    let _ = source.lock().await.start(sink.clone()).await;
     info!("程序结束");
+}
+
+fn add_flush_timer(config: CdcConfig, sink: &Arc<Mutex<dyn Sink + Send + Sync>>) {
+    let flush_interval_secs = config
+        .first_sink("flush_interval_secs")
+        .parse::<u64>()
+        .unwrap_or(15);
+    let sink_for_timer = sink.clone();
+    tokio::spawn(async move {
+        info!("MeiliSearch Sink Timer started ({}s window).", flush_interval_secs);
+        let timer_interval = Duration::from_secs(flush_interval_secs);
+
+        loop {
+            // 等待时间窗口到达
+            sleep(timer_interval).await;
+
+            match sink_for_timer.lock().await.flush().await {
+                Ok(_) => {
+                    // 只有在实际有数据写入时才记录信息，但 flush 方法内部会检查是否为空
+                    // info!("定时写入完成");
+                }
+                Err(e) => error!("Automatic flush triggered by timer failed: {}", e),
+            }
+        }
+    });
 }
 
 fn get_env(key: &str) -> String {
