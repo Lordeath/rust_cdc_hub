@@ -93,11 +93,13 @@ impl MysqlSourceConfig {
 }
 
 impl MysqlSourceConfigDetail {
+    #[inline]
     fn is_target_database_and_table(&self, database_name: &str, table_name: &str) -> bool {
         self.database.eq_ignore_ascii_case(database_name)
             && self.table_name.eq_ignore_ascii_case(table_name)
     }
 
+    #[inline]
     async fn fill_table_column(&self, pool: &Pool<MySql>) -> Vec<String> {
         let sql = r#"
             select COLUMN_NAME as column_name from information_schema.`COLUMNS` c
@@ -120,6 +122,7 @@ impl MysqlSourceConfigDetail {
             .collect()
     }
 
+    #[inline]
     async fn extract_init_data(&self, id: i64, pool: &Pool<MySql>) -> Vec<DataBuffer> {
         let sql = format!(
             r#"
@@ -149,6 +152,7 @@ impl MysqlSourceConfigDetail {
         result
     }
 
+    #[inline]
     fn mysql_row_to_hashmap(&self, row: &MySqlRow) -> HashMap<String, Value> {
         let mut result = HashMap::new();
         for row_column in row.columns().iter().enumerate() {
