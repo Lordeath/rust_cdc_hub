@@ -354,7 +354,7 @@ impl Source for MySQLSource {
                 let pool: &mut Pool<MySql> = &mut self.pools[i];
                 let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
                 // 这里进行循环，一批一批进行数据写入
-                let mut id: i64 = 0;
+                let mut id: i64 = i64::MIN;
                 loop {
                     let data_buffer_list: Vec<DataBuffer> =
                         config.extract_init_data(id, pool).await;
