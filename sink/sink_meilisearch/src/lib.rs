@@ -28,7 +28,10 @@ impl MeiliSearchSink {
         let meili_master_key = config.first_sink("meili_master_key");
         let meili_table_name = config.first_sink("table_name");
         let meili_table_pk = config.first_sink("meili_table_pk");
-        let flush_interval_secs = config.first_sink("flush_interval_secs").parse::<u64>().unwrap_or(15);
+        let flush_interval_secs = config
+            .first_sink("flush_interval_secs")
+            .parse::<u64>()
+            .unwrap_or(15);
 
         let client = Client::new(meili_url.as_str(), Some(meili_master_key.as_str())).unwrap();
 

@@ -182,6 +182,20 @@ impl MysqlSourceConfigDetail {
                             panic!("类型转换失败: {}", column.type_info().name());
                         }
                     },
+                    "BOOLEAN" => match row.try_get::<bool, _>(name.as_str()) {
+                        Ok(v) => {
+                            if v {
+                                Value::Int8(0)
+                            } else {
+                                Value::Int8(1)
+                            }
+                        }
+                        Err(e) => {
+                            error!("类型转换失败: {}", column.type_info().name());
+                            error!("{}", e);
+                            panic!("类型转换失败: {}", column.type_info().name());
+                        }
+                    },
                     "TINYINT" => match row.try_get::<i8, _>(name.as_str()) {
                         Ok(v) => Value::Int8(v),
                         Err(e) => {
@@ -196,7 +210,7 @@ impl MysqlSourceConfigDetail {
                             error!("类型转换失败: {}", column.type_info().name());
                             error!("{}", e);
                             panic!("类型转换失败: {}", column.type_info().name());
-                        },
+                        }
                     },
                     "DATETIME" => match row.try_get::<NaiveDateTime, _>(name.as_str()) {
                         Ok(v) => Value::String(v.to_string()),
@@ -204,7 +218,7 @@ impl MysqlSourceConfigDetail {
                             error!("类型转换失败: {}", column.type_info().name());
                             error!("{}", e);
                             panic!("类型转换失败: {}", column.type_info().name());
-                        },
+                        }
                     },
                     "TIMESTAMP" => match row.try_get::<DateTime<Utc>, _>(name.as_str()) {
                         Ok(v) => {
@@ -216,7 +230,7 @@ impl MysqlSourceConfigDetail {
 
                             // 另一种选择：如果您需要 NaiveDateTime (不带时区)
                             // Value::NaiveDateTime(v.naive_utc())
-                        },
+                        }
                         Err(e) => {
                             // ... 错误处理保持不变
                             error!("类型转换失败: {}", column.type_info().name());
