@@ -3,6 +3,7 @@ use sink_meilisearch::MeiliSearchSink;
 use sink_print::PrintSink;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use sink_mysql::MySqlSink;
 
 pub struct SinkFactory;
 
@@ -11,6 +12,7 @@ impl SinkFactory {
         match config.sink_type {
             SinkType::Print => Arc::new(Mutex::new(PrintSink::new(config))),
             SinkType::MeiliSearch => Arc::new(Mutex::new(MeiliSearchSink::new(config))),
+            SinkType::MySQL => Arc::new(Mutex::new(MySqlSink::new(config).await)),
         }
     }
 }

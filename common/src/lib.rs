@@ -40,6 +40,7 @@ pub enum SourceType {
 pub enum SinkType {
     Print,
     MeiliSearch,
+    MySQL,
     // 未来可扩展：Postgres, Kafka, Mongo, 等
 }
 
@@ -52,15 +53,14 @@ pub struct CdcConfig {
 }
 
 impl CdcConfig {
-
-    pub fn source(&self, key: &str, index: usize) ->String {
+    pub fn source(&self, key: &str, index: usize) -> String {
         match self.source_config[index].get(key) {
             None => "".to_string(),
             Some(v) => v.clone(),
         }
     }
 
-    pub fn sink(&self, key: &str, index: usize) ->String {
+    pub fn sink(&self, key: &str, index: usize) -> String {
         match self.sink_config[index].get(key) {
             None => "".to_string(),
             Some(v) => v.clone(),
@@ -88,6 +88,24 @@ pub struct DataBuffer {
     pub before: HashMap<String, Value>,
     pub after: HashMap<String, Value>,
     pub op: Operation,
+}
+
+// pub const VALUE_NONE: Value = Value::None;
+
+impl DataBuffer {
+    pub fn get_pk_before(&self, pk_name: &str) -> &Value {
+        self.before.get(pk_name).unwrap_or_else(|| &Value::None)
+    }
+    pub fn get_pk_after(&self, pk_name: &str) -> &Value {
+        self.after.get(pk_name).unwrap_or_else(|| &Value::None)
+    }
+    pub fn get_pk(&self, pk_name: &str) -> &Value {
+        let mut result = self.get_pk_after(pk_name);
+        if result.is_none() {
+            result = self.get_pk_before(pk_name);
+        }
+        result
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +172,13 @@ impl Value {
             Value::Blob(s) => s.to_string(),
             Value::Bit(s) => s.to_string(),
             Value::None => "null".to_string(),
+        }
+    }
+    
+    pub fn is_none(&self) -> bool {
+        match self {
+            Value::None => {true}
+            _ => false
         }
     }
 }
