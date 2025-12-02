@@ -5,7 +5,7 @@ use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
 
-const BATCH_SIZE: usize = 8192;
+const BATCH_SIZE: usize = 100;
 
 pub struct MySqlSink {
     pool: Pool<MySql>,
@@ -138,6 +138,7 @@ impl Sink for MySqlSink {
             let updates_sql = columns
                 .iter()
                 .map(|c| format!("`{}` = VALUES(`{}`)", c, c))
+                .filter(|c| c != pk_name)
                 .collect::<Vec<_>>()
                 .join(",");
 
@@ -148,19 +149,18 @@ impl Sink for MySqlSink {
                 self.table_name, cols_str, values_sql, updates_sql
             );
 
-            info!("sql: {}", sql.clone());
+            // info!("sql: {}", sql.clone());
 
             let mut query = sqlx::query(&sql);
 
             for row in &inserts {
                 for col in &columns {
-                    let v = row.get(col).map(|v| v.resolve_string());
-                    match v {
-                        Some(v) => query = query.bind(v),
-                        // None => query = query.bind(sqlx::types::Json(serde_json::Value::Null)),
-                        _ => {
-                            panic!("绑定sql参数出错")
-                        }
+                    // let value = row.get(col);
+                    let v = row.get(col).map(|v| v.resolve_string()).unwrap_or_else(|| "null".to_string());
+                    if v == "null" {
+                        query = query.bind(None::<String>);
+                    } else {
+                        query = query.bind(v);
                     }
                 }
             }

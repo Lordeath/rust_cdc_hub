@@ -1,6 +1,7 @@
 use async_trait::async_trait;
+use chrono::DateTime;
 use serde::de::Visitor;
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -167,18 +168,28 @@ impl Value {
             Value::Time(s) => s.to_string(),
             Value::Date(s) => s.to_string(),
             Value::DateTime(s) => s.to_string(),
-            Value::Timestamp(s) => s.to_string(),
+            Value::Timestamp(s) => {
+                let ts_ms = *s;
+                let secs = ts_ms / 1000;
+                let nanos = ((ts_ms % 1000) * 1_000_000) as u32;
+
+                let dt = DateTime::from_timestamp(secs, nanos)
+                    .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap())
+                    .naive_utc();
+
+                dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+            }
             Value::Year(s) => s.to_string(),
             Value::Blob(s) => s.to_string(),
             Value::Bit(s) => s.to_string(),
             Value::None => "null".to_string(),
         }
     }
-    
+
     pub fn is_none(&self) -> bool {
         match self {
-            Value::None => {true}
-            _ => false
+            Value::None => true,
+            _ => false,
         }
     }
 }
