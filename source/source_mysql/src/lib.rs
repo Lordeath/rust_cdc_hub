@@ -227,10 +227,17 @@ impl MysqlSourceConfigDetail {
                     "TIMESTAMP" => match row.try_get::<DateTime<Utc>, _>(name.as_str()) {
                         Ok(v) => {
                             // 推荐：将带时区的 DateTime<Utc> 转换为 Unix 时间戳（i64 秒数）
-                            let timestamp_sec = v.timestamp();
+                            let ts_ms = v.timestamp_millis();
+                            let secs = ts_ms / 1000;
+                            let nanos = ((ts_ms % 1000) * 1_000_000) as u32;
 
-                            // 假设您的 Value::Timestamp 接受 i64
-                            Value::Timestamp(timestamp_sec)
+                            let dt = DateTime::from_timestamp(secs, nanos)
+                                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap())
+                                .naive_utc();
+
+                            let x = dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+                            // 使用 DateTime
+                            Value::DateTime(x)
                         }
                         Err(e) => {
                             // ... 错误处理保持不变

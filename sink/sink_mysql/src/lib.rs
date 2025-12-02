@@ -5,7 +5,7 @@ use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
 
-const BATCH_SIZE: usize = 100;
+const BATCH_SIZE: usize = 256;
 
 pub struct MySqlSink {
     pool: Pool<MySql>,

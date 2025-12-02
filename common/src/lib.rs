@@ -95,10 +95,10 @@ pub struct DataBuffer {
 
 impl DataBuffer {
     pub fn get_pk_before(&self, pk_name: &str) -> &Value {
-        self.before.get(pk_name).unwrap_or_else(|| &Value::None)
+        self.before.get(pk_name).unwrap_or(&Value::None)
     }
     pub fn get_pk_after(&self, pk_name: &str) -> &Value {
-        self.after.get(pk_name).unwrap_or_else(|| &Value::None)
+        self.after.get(pk_name).unwrap_or(&Value::None)
     }
     pub fn get_pk(&self, pk_name: &str) -> &Value {
         let mut result = self.get_pk_after(pk_name);
@@ -187,10 +187,7 @@ impl Value {
     }
 
     pub fn is_none(&self) -> bool {
-        match self {
-            Value::None => true,
-            _ => false,
-        }
+        matches!(self, Value::None)
     }
 }
 
