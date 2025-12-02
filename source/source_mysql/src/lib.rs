@@ -2,7 +2,7 @@ extern crate core;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
-use common::{CdcConfig, DataBuffer, Operation, Sink, Source, Value};
+use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, Source, Value};
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
@@ -336,7 +336,7 @@ impl MySQLSource {
     async fn flush_with_retry(sink: &mut Arc<Mutex<dyn Sink + Send + Sync>>) {
         let mut loop_count = 0;
         loop {
-            let sink_result = sink.lock().await.flush(false).await;
+            let sink_result = sink.lock().await.flush(FlushByOperation::Retry).await;
             if sink_result.is_ok() {
                 break;
             }

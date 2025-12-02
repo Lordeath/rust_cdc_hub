@@ -1,4 +1,4 @@
-use common::{CdcConfig, DataBuffer, Operation, Sink};
+use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink};
 use meilisearch_sdk::macro_helper::async_trait;
 use sqlx::{MySql, MySqlPool, Pool};
 use std::error::Error;
@@ -64,24 +64,31 @@ impl Sink for MySqlSink {
 
         if buf.len() >= BATCH_SIZE {
             drop(buf);
-            self.flush(false).await?;
+            self.flush(FlushByOperation::Signal).await?;
         }
 
         Ok(())
     }
 
-    async fn flush(&self, from_timer: bool) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn flush(&self, flush_by_operation: FlushByOperation) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut buf = self.buffer.lock().await;
 
+        match flush_by_operation {
+            FlushByOperation::Timer => {info!("Flushing MeiliSearch Sink by timer... {}", buf.len());}
+            FlushByOperation::Init => {
+                if !buf.is_empty() {
+                    info!("Flushing MeiliSearch Sink by init... {}", buf.len());
+                }
+            }
+            FlushByOperation::Signal => {
+                if !buf.is_empty() {
+                    info!("Flushing MeiliSearch Sink by signal... {}", buf.len());
+                }
+            }
+            FlushByOperation::Retry => {info!("Flushing MeiliSearch Sink by retry... {}", buf.len());}
+        }
         if buf.is_empty() {
             return Ok(());
-        }
-
-        let size = buf.len();
-        if from_timer {
-            info!("Flushing MySQL Sink by timer... {}", size);
-        } else {
-            info!("Flushing MySQL Sink by signal... {}", size);
         }
 
         let batch = std::mem::take(&mut *buf);

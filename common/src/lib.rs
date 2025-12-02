@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use serde::de::Visitor;
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+use chrono::{DateTime, FixedOffset, Utc};
 use tokio::sync::Mutex;
 
 #[async_trait]
@@ -25,7 +26,7 @@ pub trait Sink: Send + Sync {
     async fn write_record(&self, record: &DataBuffer) -> Result<(), Box<dyn Error + Send + Sync>>;
 
     /// 刷新缓冲区（可选）
-    async fn flush(&self, _from_timer: bool) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn flush(&self, _from_timer: FlushByOperation) -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok(())
     }
 }
@@ -108,6 +109,13 @@ impl DataBuffer {
     }
 }
 
+pub enum FlushByOperation {
+    Timer,
+    Init,
+    Signal,
+    Retry,
+}
+
 #[derive(Debug, Clone)]
 pub enum Value {
     // Str(String),
@@ -167,7 +175,20 @@ impl Value {
             Value::Time(s) => s.to_string(),
             Value::Date(s) => s.to_string(),
             Value::DateTime(s) => s.to_string(),
-            Value::Timestamp(s) => s.to_string(),
+            // === ⭐ Timestamp 格式化（微秒 → "YYYY-MM-DD HH:MM:SS"）===
+            Value::Timestamp(micros) => {
+                let secs = micros / 1_000_000;
+                let sub_us = (micros % 1_000_000) as u32;
+
+                let utc_dt = DateTime::<Utc>::from_timestamp(secs, sub_us * 1000)
+                    .expect("invalid timestamp");
+
+                // 转成东八区
+                let offset = FixedOffset::east_opt(8 * 3600).unwrap();
+                let dt_utc8 = utc_dt.with_timezone(&offset);
+
+                dt_utc8.format("%Y-%m-%d %H:%M:%S").to_string()
+            }
             Value::Year(s) => s.to_string(),
             Value::Blob(s) => s.to_string(),
             Value::Bit(s) => s.to_string(),
@@ -284,4 +305,37 @@ pub enum Operation {
     TRUNCATE,
     MESSAGE,
     OTHER,
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_string_timestamp() {
+        // 2025-12-02 11:38:28 UTC → 微秒级：1764646708000000
+        let ts = Value::Timestamp(1764646708000000);
+        let s = ts.resolve_string();
+
+        assert_eq!(s, "2025-12-02 11:38:28");
+    }
+
+    #[test]
+    fn test_resolve_string_string() {
+        let v = Value::String("hello".to_string());
+        assert_eq!(v.resolve_string(), "hello");
+    }
+
+    #[test]
+    fn test_resolve_string_int() {
+        let v = Value::Int32(123);
+        assert_eq!(v.resolve_string(), "123");
+    }
+
+    #[test]
+    fn test_resolve_string_none() {
+        let v = Value::None;
+        assert_eq!(v.resolve_string(), "null");
+    }
 }

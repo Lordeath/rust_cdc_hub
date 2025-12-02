@@ -1,6 +1,6 @@
 extern crate core;
 
-use common::{CdcConfig, Sink, Source};
+use common::{CdcConfig, FlushByOperation, Sink, Source};
 use sink::SinkFactory;
 use source::SourceFactory;
 use std::error::Error;
@@ -66,7 +66,7 @@ fn add_flush_timer(config: CdcConfig, sink: &Arc<Mutex<dyn Sink + Send + Sync>>)
             // 等待时间窗口到达
             sleep(timer_interval).await;
 
-            if let Err(e) = sink_for_timer.lock().await.flush(true).await {
+            if let Err(e) = sink_for_timer.lock().await.flush(FlushByOperation::Timer).await {
                 error!("Automatic flush triggered by timer failed: {}", e)
             }
         }

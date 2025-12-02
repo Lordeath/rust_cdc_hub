@@ -1,4 +1,4 @@
-use common::{CdcConfig, DataBuffer, Operation, Sink};
+use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink};
 use meilisearch_sdk::client::Client;
 use meilisearch_sdk::macro_helper::async_trait;
 use std::error::Error;
@@ -61,19 +61,29 @@ impl Sink for MeiliSearchSink {
 
         if buf.len() >= BATCH_SIZE {
             drop(buf);
-            self.flush(false).await?;
+            self.flush(FlushByOperation::Signal).await?;
         }
 
         Ok(())
     }
 
-    async fn flush(&self, from_timer: bool) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn flush(&self, flush_by_operation: FlushByOperation) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut buf = self.buffer.lock().await;
-        if from_timer {
-            info!("Flushing MeiliSearch Sink by timer... {}", buf.len());
-        } else if !buf.is_empty() {
-            info!("Flushing MeiliSearch Sink by signal... {}", buf.len());
+        match flush_by_operation {
+            FlushByOperation::Timer => {info!("Flushing MeiliSearch Sink by timer... {}", buf.len());}
+            FlushByOperation::Init => {
+                if !buf.is_empty() {
+                    info!("Flushing MeiliSearch Sink by init... {}", buf.len());
+                }
+            }
+            FlushByOperation::Signal => {
+                if !buf.is_empty() {
+                    info!("Flushing MeiliSearch Sink by signal... {}", buf.len());
+                }
+            }
+            FlushByOperation::Retry => {info!("Flushing MeiliSearch Sink by retry... {}", buf.len());}
         }
+
         if buf.is_empty() {
             return Ok(()); // 没数据不写
         }
