@@ -336,7 +336,7 @@ impl MySQLSource {
     async fn flush_with_retry(sink: &mut Arc<Mutex<dyn Sink + Send + Sync>>) {
         let mut loop_count = 0;
         loop {
-            let sink_result = sink.lock().await.flush(FlushByOperation::Retry).await;
+            let sink_result = sink.lock().await.flush(FlushByOperation::Cdc).await;
             if sink_result.is_ok() {
                 break;
             }

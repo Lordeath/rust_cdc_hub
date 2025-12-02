@@ -113,7 +113,7 @@ pub enum FlushByOperation {
     Timer,
     Init,
     Signal,
-    Retry,
+    Cdc,
 }
 
 #[derive(Debug, Clone)]

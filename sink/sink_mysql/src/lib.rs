@@ -70,11 +70,16 @@ impl Sink for MySqlSink {
         Ok(())
     }
 
-    async fn flush(&self, flush_by_operation: FlushByOperation) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn flush(
+        &self,
+        flush_by_operation: FlushByOperation,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut buf = self.buffer.lock().await;
 
         match flush_by_operation {
-            FlushByOperation::Timer => {info!("Flushing Mysql Sink by timer... {}", buf.len());}
+            FlushByOperation::Timer => {
+                info!("Flushing Mysql Sink by timer... {}", buf.len());
+            }
             FlushByOperation::Init => {
                 if !buf.is_empty() {
                     info!("Flushing Mysql Sink by init... {}", buf.len());
@@ -85,7 +90,11 @@ impl Sink for MySqlSink {
                     info!("Flushing Mysql Sink by signal... {}", buf.len());
                 }
             }
-            FlushByOperation::Retry => {info!("Flushing Mysql Sink by retry... {}", buf.len());}
+            FlushByOperation::Cdc => {
+                if !buf.is_empty() {
+                    info!("Flushing Mysql Sink by cdc... {}", buf.len());
+                }
+            }
         }
         if buf.is_empty() {
             return Ok(());
@@ -163,7 +172,10 @@ impl Sink for MySqlSink {
             for row in &inserts {
                 for col in &columns {
                     // let value = row.get(col);
-                    let v = row.get(col).map(|v| v.resolve_string()).unwrap_or_else(|| "null".to_string());
+                    let v = row
+                        .get(col)
+                        .map(|v| v.resolve_string())
+                        .unwrap_or_else(|| "null".to_string());
                     if v == "null" {
                         query = query.bind(None::<String>);
                     } else {
