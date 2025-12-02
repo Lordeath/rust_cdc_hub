@@ -74,18 +74,18 @@ impl Sink for MySqlSink {
         let mut buf = self.buffer.lock().await;
 
         match flush_by_operation {
-            FlushByOperation::Timer => {info!("Flushing MeiliSearch Sink by timer... {}", buf.len());}
+            FlushByOperation::Timer => {info!("Flushing Mysql Sink by timer... {}", buf.len());}
             FlushByOperation::Init => {
                 if !buf.is_empty() {
-                    info!("Flushing MeiliSearch Sink by init... {}", buf.len());
+                    info!("Flushing Mysql Sink by init... {}", buf.len());
                 }
             }
             FlushByOperation::Signal => {
                 if !buf.is_empty() {
-                    info!("Flushing MeiliSearch Sink by signal... {}", buf.len());
+                    info!("Flushing Mysql Sink by signal... {}", buf.len());
                 }
             }
-            FlushByOperation::Retry => {info!("Flushing MeiliSearch Sink by retry... {}", buf.len());}
+            FlushByOperation::Retry => {info!("Flushing Mysql Sink by retry... {}", buf.len());}
         }
         if buf.is_empty() {
             return Ok(());
