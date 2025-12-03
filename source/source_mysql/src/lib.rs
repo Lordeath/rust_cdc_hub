@@ -301,7 +301,7 @@ impl MySQLSource {
                     .with_keepalive(Duration::from_secs(60), Duration::from_secs(10))
                     .connect()
                     .await
-                    .unwrap();
+                    .expect("Failed to connect to MySQL server");
 
             streams.push(client);
             mysql_source.push(cfg.mysql_source[i].clone());

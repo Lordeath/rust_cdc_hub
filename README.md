@@ -1,3 +1,105 @@
+# 如何编译
+```sh
+git clone https://github.com/Lordeath/rust_cdc_hub.git
+cd rust_cdc_hub
+cargo b -r
+```
+
+# 如何使用
+## 源码运行
+```sh
+# 下载代码
+git clone https://github.com/Lordeath/rust_cdc_hub.git
+cd rust_cdc_hub
+# 设置环境变量
+export CONFIG_PATH=/mnt/d/project/meilisearch/config_example_meili.yaml
+# 以release的方式运行
+cargo run -r
+```
+
+## 直接运行
+使用编译出来的程序运行
+```sh
+export CONFIG_PATH=/mnt/d/project/meilisearch/config_example_meili.yaml
+./rust_cdc_hub
+
+```
+## docker运行
+```sh
+# 用rust镜像
+docker run --name rust_cdc_hub --rm -it -e CONFIG_PATH=/config_example_meili.yaml -v /mnt/d/project/meilisearch/config_example_meili.yaml:/config_example_meili.yaml -v /mnt/d/project/rust_cdc_hub/target/release:/app rust:latest /app/rust_cdc_hub
+# 用debian镜像（更加轻便）
+docker run --name rust_cdc_hub --rm -it -e CONFIG_PATH=/config_example_meili.yaml -v /mnt/d/project/meilisearch/config_example_meili.yaml:/config_example_meili.yaml -v /mnt/d/project/rust_cdc_hub/target/release:/app debian:stable-20251117 /app/rust_cdc_hub
+
+```
+
+## 自己打包成docker image
+
+```sh
+# 默认使用 debian:stable-20251117
+# 这里把 XXXXXXXXXXXXXX 替换成你的镜像名称
+docker build --network host -t XXXXXXXXXXXXXX:0.0.1 -f "./debian.dockerfile" .
+
+```
+
+## 使用docker镜像运行
+```sh
+# 使用镜像
+docker run --name rust_cdc_hub --rm -it -e CONFIG_PATH=/config_example_meili.yaml -v /mnt/d/project/meilisearch/config_example_meili.yaml:/config_example_meili.yaml fangxiangmin/rust_cdc_hub:0.0.1
+
+```
+
+
+
+# 配置文件示例
+## Mysql 到 Meilisearch
+```yaml
+source_type: MySQL
+sink_type: MeiliSearch
+source_config:
+  - host: 192.168.1.103
+    port: 3306
+    username: root
+    password: XXXXXXXXXXX
+    database: XXX
+    table_name: table_name_XXXXXXXXXX
+    server_id: 10000
+    pk_column: id
+
+sink_config:
+  - meili_url: http://192.168.1.103:17700
+    meili_master_key: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+    table_name: table_name_XXXXXXXXXX
+    meili_table_pk: id
+
+```
+## Mysql 到 Mysql
+```yaml
+source_type: MySQL
+sink_type: MySQL
+source_config:
+  - host: 192.168.1.103
+    port: 3306
+    username: root
+    password: XXXXXXXXXXX
+    database: XXX
+    table_name: table_name_XXXXXXXXXX
+    server_id: 10000
+    pk_column: id
+
+sink_config:
+  - host: 192.168.1.104
+    port: 3306
+    username: root
+    password: XXXXXXXXXXX
+    database: test
+    table_name: table_name_XXXXXXXXXX
+    pk_column: id
+
+```
+
+## Mysql 到 控制台打印
+
 # 想要实现的功能
 - [x] mysql数据源
 - [x] meilisearch 的 sink
