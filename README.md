@@ -107,6 +107,7 @@ sink_config:
 - [ ] mysql的sink时，自动建表，自动建库，自动加字段
 - [ ] starrocks 的 sink
 - [ ] starrocks的sink时，自动建表，自动建库，自动加字段
+- [ ] 断点续传，挂掉之后自动重启，然后继续执行之前的作业
 
 
 # 后续想要做的
