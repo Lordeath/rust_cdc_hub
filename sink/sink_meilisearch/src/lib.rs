@@ -61,7 +61,7 @@ impl Sink for MeiliSearchSink {
 
         if buf.len() >= BATCH_SIZE {
             drop(buf);
-            self.flush(FlushByOperation::Signal).await?;
+            self.flush_with_retry(&FlushByOperation::Signal).await;
         }
 
         Ok(())
@@ -69,7 +69,7 @@ impl Sink for MeiliSearchSink {
 
     async fn flush(
         &self,
-        flush_by_operation: FlushByOperation,
+        flush_by_operation: &FlushByOperation,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut buf = self.buffer.lock().await;
         match flush_by_operation {
@@ -106,8 +106,10 @@ impl Sink for MeiliSearchSink {
 
         let mut docs = vec![];
         let mut deletes = vec![];
+        let mut cache_for_roll_back: Vec<DataBuffer> = vec![];
 
         for r in batch {
+            cache_for_roll_back.push(r.clone());
             match r.op {
                 Operation::CREATE | Operation::UPDATE => {
                     docs.push(r.after);
@@ -136,6 +138,11 @@ impl Sink for MeiliSearchSink {
                 .await
         {
             error!("Batch upsert error: {}", e);
+            error!("need do it again: {}", cache_for_roll_back.len());
+            let mut buf = self.buffer.lock().await;
+            for cached_data_buffer in cache_for_roll_back {
+                buf.push(cached_data_buffer);
+            }
             return Err(Box::new(e));
         }
 
@@ -143,6 +150,11 @@ impl Sink for MeiliSearchSink {
             && let Err(e) = index.delete_documents(&deletes).await
         {
             error!("Batch delete error: {}", e);
+            error!("need do it again: {}", cache_for_roll_back.len());
+            let mut buf = self.buffer.lock().await;
+            for cached_data_buffer in cache_for_roll_back {
+                buf.push(cached_data_buffer);
+            }
             return Err(Box::new(e));
         }
 

@@ -333,19 +333,6 @@ impl MySQLSource {
         }
     }
 
-    async fn flush_with_retry(sink: &mut Arc<Mutex<dyn Sink + Send + Sync>>) {
-        let mut loop_count = 0;
-        loop {
-            let sink_result = sink.lock().await.flush(FlushByOperation::Cdc).await;
-            if sink_result.is_ok() {
-                break;
-            }
-            loop_count += 1;
-            if loop_count >= 3 {
-                panic!("flush error");
-            }
-        }
-    }
 }
 
 #[async_trait]
@@ -467,7 +454,8 @@ impl Source for MySQLSource {
                             }
                             _ => {}
                         }
-                        Self::flush_with_retry(&mut sink).await;
+                        sink.lock().await.flush_with_retry(&FlushByOperation::Cdc).await;
+                        // flush_with_retry(&mut sink).await;
                     }
                     Err(e) => {
                         // 打印错误信息，并且继续监听

@@ -64,7 +64,7 @@ impl Sink for MySqlSink {
 
         if buf.len() >= BATCH_SIZE {
             drop(buf);
-            self.flush(FlushByOperation::Signal).await?;
+            self.flush_with_retry(&FlushByOperation::Signal).await;
         }
 
         Ok(())
@@ -72,7 +72,7 @@ impl Sink for MySqlSink {
 
     async fn flush(
         &self,
-        flush_by_operation: FlushByOperation,
+        flush_by_operation: &FlushByOperation,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut buf = self.buffer.lock().await;
 
@@ -108,7 +108,9 @@ impl Sink for MySqlSink {
 
         let pk_name = self.pk_column.as_str();
 
+        let mut cache_for_roll_back: Vec<DataBuffer> = vec![];
         for r in batch {
+            cache_for_roll_back.push(r.clone());
             match r.op {
                 Operation::CREATE | Operation::UPDATE => inserts.push(r.after),
                 Operation::DELETE => {
@@ -186,6 +188,11 @@ impl Sink for MySqlSink {
 
             if let Err(e) = query.execute(&self.pool).await {
                 error!("MySQL batch UPSERT error: {:?}", e);
+                error!("need do it again: {}", cache_for_roll_back.len());
+                let mut buf = self.buffer.lock().await;
+                for cached_data_buffer in cache_for_roll_back {
+                    buf.push(cached_data_buffer);
+                }
                 return Err(Box::new(e));
             }
         }
@@ -211,6 +218,11 @@ impl Sink for MySqlSink {
 
             if let Err(e) = query.execute(&self.pool).await {
                 error!("MySQL batch delete error: {:?}", e);
+                error!("need do it again: {}", cache_for_roll_back.len());
+                let mut buf = self.buffer.lock().await;
+                for cached_data_buffer in cache_for_roll_back {
+                    buf.push(cached_data_buffer);
+                }
                 return Err(Box::new(e));
             }
         }

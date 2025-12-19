@@ -31,3 +31,5 @@ nbdist/
 /.mvn/
 /mvnw
 /mvnw.cmd
+
+config_example_mysql.yaml

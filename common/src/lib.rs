@@ -5,8 +5,10 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 use chrono::{DateTime, FixedOffset, Utc};
 use tokio::sync::Mutex;
+use tracing::error;
 
 #[async_trait]
 pub trait Source: Send + Sync {
@@ -25,8 +27,24 @@ pub trait Sink: Send + Sync {
     /// 写入一条数据（可以是 json 或结构化 map）
     async fn write_record(&self, record: &DataBuffer) -> Result<(), Box<dyn Error + Send + Sync>>;
 
+    async fn flush_with_retry(&self, from_timer: &FlushByOperation) {
+        let mut loop_count = 0;
+        loop {
+            let sink_result = self.flush(from_timer).await;
+            if sink_result.is_ok() {
+                break;
+            }
+            error!("error occurred {} loop_count: {}", sink_result.err().unwrap().to_string(), loop_count);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            loop_count += 1;
+            if loop_count >= 30 {
+                panic!("flush error");
+            }
+        }
+    }
+
     /// 刷新缓冲区（可选）
-    async fn flush(&self, _from_timer: FlushByOperation) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn flush(&self, _from_timer: &FlushByOperation) -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok(())
     }
 }
@@ -306,6 +324,7 @@ pub enum Operation {
     MESSAGE,
     OTHER,
 }
+
 
 
 #[cfg(test)]

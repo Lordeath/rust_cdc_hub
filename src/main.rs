@@ -39,7 +39,7 @@ async fn main() {
 
     let config_path = get_env("CONFIG_PATH");
     let config: CdcConfig = load_config(&config_path).expect("Failed to load config");
-
+    info!("Config Loaded");
     let source: Arc<Mutex<dyn Source>> = SourceFactory::create_source(config.clone()).await;
     info!("成功创建source");
     let sink = SinkFactory::create_sink(config.clone()).await;
@@ -66,7 +66,7 @@ fn add_flush_timer(config: CdcConfig, sink: &Arc<Mutex<dyn Sink + Send + Sync>>)
             // 等待时间窗口到达
             sleep(timer_interval).await;
 
-            if let Err(e) = sink_for_timer.lock().await.flush(FlushByOperation::Timer).await {
+            if let Err(e) = sink_for_timer.lock().await.flush(&FlushByOperation::Timer).await {
                 error!("Automatic flush triggered by timer failed: {}", e)
             }
         }
