@@ -2,7 +2,7 @@ extern crate core;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
-use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, Source, Value};
+use common::{CdcConfig, DataBuffer, Operation, Sink, Source, Value};
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
@@ -19,7 +19,7 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 
 const LOOP_PACE: usize = 8192;
 
@@ -405,7 +405,7 @@ impl Source for MySQLSource {
                                 let database_name =
                                     table_database_map.get(&event.table_id).unwrap().as_str();
                                 if config.is_target_database_and_table(database_name, table_name) {
-                                    info!("WriteRows: {}.{}", database_name, table_name);
+                                    trace!("WriteRows: {}.{}", database_name, table_name);
                                     for row in event.rows {
                                         let before: HashMap<String, Value> = HashMap::new();
                                         let after: HashMap<String, Value> =
@@ -422,7 +422,7 @@ impl Source for MySQLSource {
                                 let database_name =
                                     table_database_map.get(&event.table_id).unwrap().as_str();
                                 if config.is_target_database_and_table(database_name, table_name) {
-                                    info!("DeleteRows: {}.{}", database_name, table_name);
+                                    trace!("DeleteRows: {}.{}", database_name, table_name);
                                     for row in event.rows {
                                         let before: HashMap<String, Value> =
                                             parse_row(row, &mut columns, config, pool).await;
@@ -439,7 +439,7 @@ impl Source for MySQLSource {
                                 let database_name =
                                     table_database_map.get(&event.table_id).unwrap().as_str();
                                 if config.is_target_database_and_table(database_name, table_name) {
-                                    info!("UpdateRows: {}.{}", database_name, table_name);
+                                    trace!("UpdateRows: {}.{}", database_name, table_name);
                                     for (b, a) in event.rows {
                                         let before: HashMap<String, Value> =
                                             parse_row(b, &mut columns, config, pool).await;
@@ -454,7 +454,7 @@ impl Source for MySQLSource {
                             }
                             _ => {}
                         }
-                        sink.lock().await.flush_with_retry(&FlushByOperation::Cdc).await;
+                        // sink.lock().await.flush_with_retry(&FlushByOperation::Cdc).await;
                         // flush_with_retry(&mut sink).await;
                     }
                     Err(e) => {
