@@ -1,0 +1,17 @@
+source_type: MySQL
+sink_type: MeiliSearch
+source_config:
+  - host: 192.168.1.103
+    port: 3306
+    username: XXXX
+    password: XXXXXXXXXXXXXXX
+    database: yifangpaoyouhui
+    table_name: table_name
+    server_id: 10000
+    pk_column: pk_column_name
+
+sink_config:
+  - meili_url: http://192.168.1.103:17700
+    meili_master_key: XXXXXXXXXXXXXXX
+    table_name: table_name
+    meili_table_pk: pk_column_name

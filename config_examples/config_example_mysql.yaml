@@ -1,0 +1,20 @@
+source_type: MySQL
+sink_type: MySQL
+source_config:
+  - host: 127.0.0.1
+    port: 3306
+    username: XXXXXXXXXXXXX
+    password: XXXXXXXXXXXXXX
+    database: XXXXXXXXXXXXX
+    table_name: table_name
+    server_id: 10000
+    pk_column: pk_column_name
+
+sink_config:
+  - host: 127.0.0.1
+    port: 3306
+    username: XXXXXXXXX
+    password: XXXXXXXXXXXXXXXXXX
+    database: test
+    table_name: table_name
+    pk_column: pk_column_name
