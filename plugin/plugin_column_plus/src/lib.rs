@@ -79,7 +79,7 @@ impl Plugin for PluginPlus {
             });
         }
 
-        Ok(DataBuffer{
+        Ok(DataBuffer {
             op: data_original.op,
             table_name: data_original.table_name,
             before: data_original.before,
