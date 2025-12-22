@@ -123,7 +123,7 @@ impl MysqlSourceConfigDetail {
     }
 
     #[inline]
-    async fn extract_init_data(&self, id: i64, pool: &Pool<MySql>) -> Vec<DataBuffer> {
+    async fn extract_init_data(&self, table_name: &str, id: i64, pool: &Pool<MySql>) -> Vec<DataBuffer> {
         let sql = format!(
             r#"
             select *
@@ -132,7 +132,7 @@ impl MysqlSourceConfigDetail {
             order by {}
             limit {}
         "#,
-            self.table_name, self.pk_column, id, self.pk_column, LOOP_PACE
+            table_name, self.pk_column, id, self.pk_column, LOOP_PACE
         );
 
         debug!(
@@ -351,8 +351,9 @@ impl Source for MySQLSource {
                 // 这里进行循环，一批一批进行数据写入
                 let mut id: i64 = i64::MIN;
                 loop {
+                    let table_name = config.table_name.clone();
                     let data_buffer_list: Vec<DataBuffer> =
-                        config.extract_init_data(id, pool).await;
+                        config.extract_init_data(&table_name, id, pool).await;
                     let len = data_buffer_list.len();
                     for data_buffer in data_buffer_list.iter().take(len) {
                         Self::write_record_with_retry(&mut sink, data_buffer).await;
