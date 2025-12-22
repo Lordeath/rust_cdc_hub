@@ -2,7 +2,7 @@ extern crate core;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
-use common::{CdcConfig, DataBuffer, Operation, Sink, Source, Value};
+use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, Source, Value};
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
@@ -344,6 +344,7 @@ impl Source for MySQLSource {
         {
             info!("开始MySQL数据源初始化");
             let max = self.pools.len();
+            let mut count = 0;
             for i in 0..max {
                 let pool: &mut Pool<MySql> = &mut self.pools[i];
                 let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
@@ -369,13 +370,15 @@ impl Source for MySQLSource {
                             id = *this_id;
                         }
                     }
+                    count += len;
                     debug!("当前最大id为 {}", id);
                     if len != LOOP_PACE {
                         break;
                     }
                 }
+                sink.lock().await.flush_with_retry(&FlushByOperation::Init).await;
             }
-            info!("MySQL数据源初始化完成");
+            info!("MySQL数据源初始化完成 count: {}", count);
         }
 
         info!("Starting MySQL binlog source");
