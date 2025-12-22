@@ -9,7 +9,7 @@ const BATCH_SIZE: usize = 256;
 
 pub struct MySqlSink {
     pool: Pool<MySql>,
-    table_name: String,
+    table_name_list: Vec<String>,
     pk_column: String,
 
     buffer: Mutex<Vec<DataBuffer>>,
@@ -36,16 +36,69 @@ impl MySqlSink {
             port,
             database.clone(),
         );
-        let pool: Pool<MySql> = MySqlPool::connect(&connection_url).await.unwrap();
+        let pool = match Self::get_pool_auto_create_database(
+            config,
+            &username,
+            &password,
+            &host,
+            &port,
+            database,
+            &connection_url,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(value) => return value,
+        };
 
         MySqlSink {
             pool,
-            table_name,
+            table_name_list: vec![table_name],
             pk_column,
             buffer: Mutex::new(Vec::with_capacity(BATCH_SIZE)),
             initialized: RwLock::new(false),
             columns_cache: Mutex::new(vec![]),
         }
+    }
+
+    async fn get_pool_auto_create_database(
+        config: CdcConfig,
+        username: &String,
+        password: &String,
+        host: &String,
+        port: &String,
+        database: String,
+        connection_url: &String,
+    ) -> Result<Pool<MySql>, MySqlSink> {
+        let pool: Pool<MySql> = match MySqlPool::connect(&connection_url).await {
+            Ok(o) => o,
+            Err(e) => {
+                if config.auto_create_database.unwrap_or_else(|| true) {
+                    let pool_for_auto_create_database = MySqlPool::connect(&format!(
+                        "mysql://{}:{}@{}:{}",
+                        username, password, host, port,
+                    ))
+                    .await
+                    .unwrap();
+                    let sql = format!("CREATE DATABASE IF NOT EXISTS {}", database.clone());
+                    match sqlx::query(&sql)
+                        .execute(&pool_for_auto_create_database)
+                        .await
+                    {
+                        Ok(xx) => xx,
+                        Err(e) => {
+                            error!("Failed to create database: {}", e);
+                            panic!("Failed to create database: {}", e);
+                        }
+                    };
+                    let pool: Pool<MySql> = MySqlPool::connect(&connection_url).await.unwrap();
+                    return Ok(pool);
+                }
+                error!("Failed to connect to MySQL: {}", e);
+                panic!("Failed to connect to MySQL: {}", e);
+            }
+        };
+        Ok(pool)
     }
 }
 
@@ -164,7 +217,7 @@ impl Sink for MySqlSink {
                 "INSERT INTO `{}` ({})
                  VALUES {}
                  ON DUPLICATE KEY UPDATE {}",
-                self.table_name, cols_str, values_sql, updates_sql
+                self.table_name_list[0], cols_str, values_sql, updates_sql
             );
 
             // info!("sql: {}", sql.clone());
@@ -208,7 +261,7 @@ impl Sink for MySqlSink {
 
             let sql = format!(
                 "DELETE FROM `{}` WHERE `{}` IN ({})",
-                self.table_name, self.pk_column, ph
+                self.table_name_list[0], self.pk_column, ph
             );
 
             let mut query = sqlx::query(&sql);

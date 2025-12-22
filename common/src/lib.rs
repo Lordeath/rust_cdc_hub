@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::{DateTime, FixedOffset, Utc};
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::HashMap;
@@ -6,7 +7,6 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
-use chrono::{DateTime, FixedOffset, Utc};
 use tokio::sync::Mutex;
 use tracing::error;
 
@@ -34,7 +34,11 @@ pub trait Sink: Send + Sync {
             if sink_result.is_ok() {
                 break;
             }
-            error!("error occurred {} loop_count: {}", sink_result.err().unwrap().to_string(), loop_count);
+            error!(
+                "error occurred {} loop_count: {}",
+                sink_result.err().unwrap().to_string(),
+                loop_count
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
             loop_count += 1;
             if loop_count >= 30 {
@@ -44,7 +48,10 @@ pub trait Sink: Send + Sync {
     }
 
     /// 刷新缓冲区（可选）
-    async fn flush(&self, _from_timer: &FlushByOperation) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn flush(
+        &self,
+        _from_timer: &FlushByOperation,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok(())
     }
 }
@@ -69,6 +76,9 @@ pub struct CdcConfig {
     pub sink_type: SinkType,
     pub source_config: Vec<HashMap<String, String>>,
     pub sink_config: Vec<HashMap<String, String>>,
+    pub auto_create_database: Option<bool>,
+    pub auto_create_table: Option<bool>,
+    pub auto_add_column: Option<bool>,
 }
 
 impl CdcConfig {
@@ -324,8 +334,6 @@ pub enum Operation {
     MESSAGE,
     OTHER,
 }
-
-
 
 #[cfg(test)]
 mod tests {
