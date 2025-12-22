@@ -61,7 +61,6 @@ impl Plugin for PluginPlus {
                     column.column_name.clone(),
                     data.get(&column.column_name).unwrap().clone(),
                 );
-                break;
             }
         }
         if contains_some_column.is_empty() {
