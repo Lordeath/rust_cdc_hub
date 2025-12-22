@@ -1,5 +1,5 @@
 [workspace]
-members = ["source","source/source_mysql", "sink", "common"]
+members = ["source", "sink", "common", "plugin"]
 
 [package]
 name = "rust_cdc_hub"
@@ -10,6 +10,7 @@ edition = "2024"
 common = { path = "common" }
 source = { path = "source" }
 sink = { path = "sink" }
+plugin = { path = "plugin" }
 tokio = { version = "1", features = ["full"] }
 serde_yaml = "0.9"
 serde_json = "1.0"

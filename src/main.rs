@@ -1,6 +1,6 @@
 extern crate core;
 
-use common::{CdcConfig, FlushByOperation, Sink, Source};
+use common::{CdcConfig, FlushByOperation, Plugin, Sink, Source};
 use sink::SinkFactory;
 use source::SourceFactory;
 use std::error::Error;
@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use chrono::Local;
+use plugin::PluginFactory;
 use std::time::Duration;
 use std::{env, fs, process};
 use tokio::time::sleep;
@@ -41,6 +42,18 @@ async fn main() {
     let config: CdcConfig = load_config(&config_path).expect("Failed to load config");
     info!("Config Loaded");
     let source: Arc<Mutex<dyn Source>> = SourceFactory::create_source(config.clone()).await;
+
+    if config.plugins.is_some() && !config.clone().plugins.unwrap().is_empty() {
+        info!("正在加载插件");
+        let mut plugins: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>> = vec![];
+        for plugin in config.clone().plugins.unwrap().iter() {
+            // info!("正在加载插件 {}", plugin.plugin_type);
+            let plugin = PluginFactory::create_plugin(plugin).await;
+            plugins.push(plugin);
+        }
+        source.lock().await.add_plugins(plugins).await;
+    }
+
     info!("成功创建source");
     let table_info_list = source.lock().await.get_table_info().await;
     let sink = SinkFactory::create_sink(config.clone(), table_info_list).await;
@@ -60,14 +73,22 @@ fn add_flush_timer(config: CdcConfig, sink: &Arc<Mutex<dyn Sink + Send + Sync>>)
         .unwrap_or(15);
     let sink_for_timer = sink.clone();
     tokio::spawn(async move {
-        info!("MeiliSearch Sink Timer started ({}s window).", flush_interval_secs);
+        info!(
+            "MeiliSearch Sink Timer started ({}s window).",
+            flush_interval_secs
+        );
         let timer_interval = Duration::from_secs(flush_interval_secs);
 
         loop {
             // 等待时间窗口到达
             sleep(timer_interval).await;
 
-            if let Err(e) = sink_for_timer.lock().await.flush(&FlushByOperation::Timer).await {
+            if let Err(e) = sink_for_timer
+                .lock()
+                .await
+                .flush(&FlushByOperation::Timer)
+                .await
+            {
                 error!("Automatic flush triggered by timer failed: {}", e)
             }
         }

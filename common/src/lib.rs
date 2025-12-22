@@ -17,6 +17,8 @@ pub trait Source: Send + Sync {
         sink: Arc<Mutex<dyn Sink + Send + Sync>>,
     ) -> Result<(), Box<dyn Error + Send + Sync>>;
 
+    async fn add_plugins(&mut self, plugin: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>);
+
     async fn get_table_info(&mut self) -> Vec<TableInfoVo>;
 }
 
@@ -58,6 +60,11 @@ pub trait Sink: Send + Sync {
     }
 }
 
+#[async_trait]
+pub trait Plugin: Send + Sync {
+    async fn collect(&mut self, data_buffer: DataBuffer) -> Result<DataBuffer, ()>;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SourceType {
     MySQL,
@@ -73,6 +80,12 @@ pub enum SinkType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PluginType {
+    ColumnIn,
+    Plus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CdcConfig {
     pub source_type: SourceType,
     pub sink_type: SinkType,
@@ -80,6 +93,7 @@ pub struct CdcConfig {
     pub sink_config: Vec<HashMap<String, String>>,
     pub auto_create_database: Option<bool>,
     pub auto_create_table: Option<bool>,
+    pub plugins: Option<Vec<PluginConfig>>,
 }
 
 impl CdcConfig {
@@ -110,6 +124,20 @@ impl CdcConfig {
     pub fn first_u32_source(&self, key: &str) -> u32 {
         let value = self.first_source(key);
         value.parse::<u32>().unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginConfig {
+    pub plugin_type: PluginType,
+    pub config: HashMap<String, String>,
+}
+impl PluginConfig {
+    pub fn get_config(&self, key: &str) -> String {
+        match self.config.get(key) {
+            None => "".to_string(),
+            Some(v) => v.clone(),
+        }
     }
 }
 
@@ -326,7 +354,7 @@ impl<'de> Deserialize<'de> for Value {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub enum Operation {
     // READ,
     CREATE,

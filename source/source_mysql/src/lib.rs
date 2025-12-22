@@ -3,7 +3,7 @@ extern crate core;
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use common::{
-    CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, Source, TableInfoVo, Value,
+    CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value,
 };
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
@@ -30,6 +30,8 @@ pub struct MySQLSource {
     streams: Vec<BinlogStream>, // ✅ 多个流
     mysql_source: Vec<MysqlSourceConfigDetail>,
     pools: Vec<Pool<MySql>>,
+    // plugins: Vec<Mutex<dyn Plugin + Send + Sync>>,
+    plugins: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -398,6 +400,7 @@ impl MySQLSource {
             streams,
             mysql_source,
             pools,
+            plugins: vec![],
         }
     }
 
@@ -419,12 +422,30 @@ impl MySQLSource {
     }
 }
 
+async fn detail_with_plugin(
+    plugins: &Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>,
+    data_buffer: DataBuffer,
+) -> Result<DataBuffer, ()> {
+    if plugins.is_empty() {
+        return Ok(data_buffer);
+    }
+    let mut data_buffer = data_buffer;
+    for p in plugins {
+        let after_plugin = p.lock().await.collect(data_buffer.clone()).await;
+        if !after_plugin.is_ok() {
+            return Err(());
+        }
+        data_buffer = after_plugin?;
+    }
+    Ok(data_buffer)
+}
 #[async_trait]
 impl Source for MySQLSource {
     async fn start(
         &mut self,
         mut sink: Arc<Mutex<dyn Sink + Send + Sync>>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let plugins: &Vec<Arc<Mutex<dyn Plugin + Send + Sync>>> = &self.plugins;
         {
             info!("开始MySQL数据源初始化");
             let max = self.pools.len();
@@ -445,7 +466,12 @@ impl Source for MySQLSource {
                             .await;
                         let len = data_buffer_list.len();
                         for data_buffer in data_buffer_list.iter().take(len) {
-                            Self::write_record_with_retry(&mut sink, data_buffer).await;
+                            let plugin_data =
+                                detail_with_plugin(plugins, data_buffer.clone()).await;
+                            if plugin_data.is_ok() {
+                                Self::write_record_with_retry(&mut sink, &plugin_data.unwrap())
+                                    .await;
+                            }
                             let this_id = data_buffer.after.get(&pk_column).unwrap_or_else(|| {
                                 panic!("pk_column not found: {}", pk_column.as_str())
                             });
@@ -514,8 +540,15 @@ impl Source for MySQLSource {
                                             after,
                                             op,
                                         };
-                                        Self::write_record_with_retry(&mut sink, &data_buffer)
+                                        let plugin_data =
+                                            detail_with_plugin(plugins, data_buffer).await;
+                                        if plugin_data.is_ok() {
+                                            Self::write_record_with_retry(
+                                                &mut sink,
+                                                &plugin_data.unwrap(),
+                                            )
                                             .await;
+                                        }
                                     }
                                 }
                             }
@@ -537,8 +570,15 @@ impl Source for MySQLSource {
                                             after,
                                             op,
                                         };
-                                        Self::write_record_with_retry(&mut sink, &data_buffer)
+                                        let plugin_data =
+                                            detail_with_plugin(plugins, data_buffer).await;
+                                        if plugin_data.is_ok() {
+                                            Self::write_record_with_retry(
+                                                &mut sink,
+                                                &plugin_data.unwrap(),
+                                            )
                                             .await;
+                                        }
                                     }
                                 }
                             }
@@ -562,8 +602,15 @@ impl Source for MySQLSource {
                                             after,
                                             op,
                                         };
-                                        Self::write_record_with_retry(&mut sink, &data_buffer)
+                                        let plugin_data =
+                                            detail_with_plugin(plugins, data_buffer).await;
+                                        if plugin_data.is_ok() {
+                                            Self::write_record_with_retry(
+                                                &mut sink,
+                                                &plugin_data.unwrap(),
+                                            )
                                             .await;
+                                        }
                                     }
                                 }
                             }
@@ -579,6 +626,10 @@ impl Source for MySQLSource {
                 }
             }
         }
+    }
+
+    async fn add_plugins(&mut self, plugin: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>) {
+        self.plugins = plugin;
     }
 
     async fn get_table_info(&mut self) -> Vec<TableInfoVo> {

@@ -1,0 +1,10 @@
+[package]
+name = "plugin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common = { path = "../common" }
+plugin_column_plus = { path = "plugin_column_plus" }
+plugin_column_in = { path = "plugin_column_in" }
+tokio = { version = "1", features = ["full"] }
