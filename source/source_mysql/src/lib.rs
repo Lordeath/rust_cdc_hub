@@ -2,7 +2,9 @@ extern crate core;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
-use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, Source, Value};
+use common::{
+    CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, Source, TableInfoVo, Value,
+};
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
@@ -10,6 +12,7 @@ use mysql_binlog_connector_rust::event::event_data::EventData;
 use mysql_binlog_connector_rust::event::row_event::RowEvent;
 use serde::Deserialize;
 use serde::Serialize;
+use sqlx::FromRow;
 use sqlx::mysql::MySqlRow;
 use sqlx::types::BigDecimal;
 use sqlx::{Column, MySqlPool, Row, ValueRef};
@@ -42,19 +45,25 @@ struct MysqlSourceConfigDetail {
     host: String,
     port: String,
     database: String,
-    table_name: String,
-    pk_column: String,
+    // table_name: String,
+    // pk_column: String,
     server_id: u64,
     connection_url: String,
+    table_info_list: Vec<TableInfoVo>,
 }
 
 impl MysqlSourceConfig {
     pub async fn new(config: CdcConfig) -> Self {
         let size = config.source_config.len();
         let mut mysql_source: Vec<MysqlSourceConfigDetail> = vec![];
-        let table_name = config.first_source("table_name");
+        // let table_name = config.first_source("table_name");
         // TODO 后续要支持多张表
-        let table_name_list: Vec<String> = vec![table_name.clone()];
+        // split table_name
+        let table_name_list: Vec<String> = config
+            .first_source("table_name")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect();
 
         for i in 0..size {
             let username = config.source("username", i);
@@ -62,7 +71,7 @@ impl MysqlSourceConfig {
             let host = config.source("host", i);
             let port = config.source("port", i);
             let database = config.source("database", i);
-            let pk_column = config.source("pk_column", i);
+            // let pk_column = config.source("pk_column", i);
             let server_id: u64 = config.source("server_id", i).parse::<u64>().unwrap_or(0);
             let connection_url = format!(
                 "mysql://{}:{}@{}:{}/{}",
@@ -72,6 +81,60 @@ impl MysqlSourceConfig {
                 port,
                 database.clone(),
             );
+            let mut table_info_list: Vec<TableInfoVo> = vec![];
+            let pool = MySqlPool::connect(&connection_url).await.unwrap();
+            for table_name in table_name_list.clone() {
+                // fill table_info
+                let show_create_table_sql = format!("show create table `{}`", table_name);
+                info!("{}", show_create_table_sql);
+                let show_create_table_result = sqlx::query(&show_create_table_sql)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("query failed");
+                // info!("show_create_table_result.columns()[0].name(): {}", show_create_table_result.columns()[0].name());
+                // info!("show_create_table_result.columns()[0].name(): {}", show_create_table_result.column(show_create_table_result.columns()[1].name()).name());
+                info!(
+                    "show_create_table_result.columns()[0].name(): {}",
+                    show_create_table_result.column(1).name()
+                );
+                // info!("show_create_table_result.columns()[0].type_info(): {}", show_create_table_result.columns()[0].type_info());
+                // info!("show_create_table_result.columns()[1].name(): {}", show_create_table_result.columns()[1].name());
+                // info!("show_create_table_result.columns()[1].type_info(): {}", show_create_table_result.columns()[1].type_info());
+                // let create_table_sql = show_create_table_result.get("Create Table");
+                let create_table_sql = show_create_table_result.get(1);
+                let pk_column_sql = format!(
+                    "select COLUMN_NAME as column_name, COLUMN_KEY as column_key, DATA_TYPE as data_type from information_schema.`COLUMNS` where TABLE_SCHEMA = (select database()) AND TABLE_NAME = ?"
+                );
+                let col_list = sqlx::query_as::<_, ColumnInfoFromMysql>(&pk_column_sql)
+                    .bind(table_name.clone())
+                    .fetch_all(&pool)
+                    .await
+                    .expect("query failed");
+
+                // info!("col_list: {:?}", col_list[0]);
+                // info!("col_list: {:?}", col_list[1]);
+
+                let pk_column: Vec<String> = col_list
+                    .iter()
+                    .filter(|c| c.column_key == "PRI")
+                    .filter(|c| c.data_type == "bigint")
+                    .map(|c| c.column_name.clone())
+                    .collect();
+                if pk_column.is_empty() || pk_column.len() > 1 {
+                    error!("pk_column is empty or more than one");
+                    panic!("pk_column is empty or more than one");
+                }
+                let pk_column = pk_column[0].clone();
+                let columns: Vec<String> = col_list.iter().map(|c| c.column_name.clone()).collect();
+
+                table_info_list.push(TableInfoVo {
+                    table_name: table_name.clone(),
+                    pk_column,
+                    create_table_sql,
+                    columns,
+                });
+            }
+            // try to get table info
 
             mysql_source.push(MysqlSourceConfigDetail {
                 username,
@@ -79,10 +142,11 @@ impl MysqlSourceConfig {
                 host,
                 port,
                 database,
-                table_name: table_name.clone(),
-                pk_column: pk_column.clone(),
+                // table_name: table_name.clone(),
+                // pk_column: pk_column.clone(),
                 server_id,
                 connection_url,
+                table_info_list,
             });
         }
         MysqlSourceConfig {
@@ -92,15 +156,25 @@ impl MysqlSourceConfig {
     }
 }
 
+#[derive(Debug, FromRow)]
+pub struct ColumnInfoFromMysql {
+    pub column_name: String,
+    // 或者使用自定义类型转换
+    #[sqlx(try_from = "Vec<u8>")]
+    pub column_key: String,
+    #[sqlx(try_from = "Vec<u8>")]
+    pub data_type: String,
+}
+
 impl MysqlSourceConfigDetail {
     #[inline]
     fn is_target_database_and_table(&self, database_name: &str, table_name: &str) -> bool {
         self.database.eq_ignore_ascii_case(database_name)
-            && self.table_name.eq_ignore_ascii_case(table_name)
+            && table_name.eq_ignore_ascii_case(table_name)
     }
 
     #[inline]
-    async fn fill_table_column(&self, pool: &Pool<MySql>) -> Vec<String> {
+    async fn fill_table_column(&self, table_name: &str, pool: &Pool<MySql>) -> Vec<String> {
         let sql = r#"
             select COLUMN_NAME as column_name from information_schema.`COLUMNS` c
             where 1=1
@@ -113,7 +187,7 @@ impl MysqlSourceConfigDetail {
 
         sqlx::query(sql)
             .bind(self.database.clone())
-            .bind(self.table_name.clone())
+            .bind(table_name)
             .fetch_all(pool)
             .await
             .unwrap_or_else(|e| panic!("Error executing query: {}", e))
@@ -123,7 +197,13 @@ impl MysqlSourceConfigDetail {
     }
 
     #[inline]
-    async fn extract_init_data(&self, table_name: &str, id: i64, pool: &Pool<MySql>) -> Vec<DataBuffer> {
+    async fn extract_init_data(
+        &self,
+        table_name: &str,
+        pk_column: &str,
+        id: i64,
+        pool: &Pool<MySql>,
+    ) -> Vec<DataBuffer> {
         let sql = format!(
             r#"
             select *
@@ -132,12 +212,12 @@ impl MysqlSourceConfigDetail {
             order by {}
             limit {}
         "#,
-            table_name, self.pk_column, id, self.pk_column, LOOP_PACE
+            table_name, pk_column, id, pk_column, LOOP_PACE
         );
 
         debug!(
             "extract_init_data: [{}.{}] {} {}",
-            self.database, self.table_name, self.pk_column, id
+            self.database, table_name, pk_column, id
         );
         // 查询 Row，而不是 HashMap
         let rows: Vec<MySqlRow> = sqlx::query(&sql)
@@ -150,7 +230,12 @@ impl MysqlSourceConfigDetail {
             let before = HashMap::new();
             let after = self.mysql_row_to_hashmap(&row);
             let op = Operation::CREATE;
-            result.push(DataBuffer { before, after, op });
+            result.push(DataBuffer {
+                table_name: table_name.to_string(),
+                before,
+                after,
+                op,
+            });
         }
         result
     }
@@ -332,7 +417,6 @@ impl MySQLSource {
             }
         }
     }
-
 }
 
 #[async_trait]
@@ -348,36 +432,44 @@ impl Source for MySQLSource {
             for i in 0..max {
                 let pool: &mut Pool<MySql> = &mut self.pools[i];
                 let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
-                // 这里进行循环，一批一批进行数据写入
-                let mut id: i64 = i64::MIN;
-                loop {
-                    let table_name = config.table_name.clone();
-                    let data_buffer_list: Vec<DataBuffer> =
-                        config.extract_init_data(&table_name, id, pool).await;
-                    let len = data_buffer_list.len();
-                    for data_buffer in data_buffer_list.iter().take(len) {
-                        Self::write_record_with_retry(&mut sink, data_buffer).await;
-                        let this_id =
-                            data_buffer.after.get(&config.pk_column).unwrap_or_else(|| {
-                                panic!("pk_column not found: {}", config.pk_column.as_str())
+                for table_info_vo in config.table_info_list.clone() {
+                    let table_name = table_info_vo.table_name.clone();
+                    let pk_column = table_info_vo.pk_column.clone();
+
+                    // 这里进行循环，一批一批进行数据写入
+                    let mut id: i64 = i64::MIN;
+                    loop {
+                        // let table_name = config.table_name.clone();
+                        let data_buffer_list: Vec<DataBuffer> = config
+                            .extract_init_data(&table_name, &pk_column, id, pool)
+                            .await;
+                        let len = data_buffer_list.len();
+                        for data_buffer in data_buffer_list.iter().take(len) {
+                            Self::write_record_with_retry(&mut sink, data_buffer).await;
+                            let this_id = data_buffer.after.get(&pk_column).unwrap_or_else(|| {
+                                panic!("pk_column not found: {}", pk_column.as_str())
                             });
-                        let this_id = match this_id {
-                            Value::Int64(x) => x,
-                            _ => {
-                                panic!("pk_column not found");
+                            let this_id = match this_id {
+                                Value::Int64(x) => x,
+                                _ => {
+                                    panic!("pk_column not found");
+                                }
+                            };
+                            if this_id > &id {
+                                id = *this_id;
                             }
-                        };
-                        if this_id > &id {
-                            id = *this_id;
+                        }
+                        count += len;
+                        debug!("当前最大id为 {}", id);
+                        if len != LOOP_PACE {
+                            break;
                         }
                     }
-                    count += len;
-                    debug!("当前最大id为 {}", id);
-                    if len != LOOP_PACE {
-                        break;
-                    }
+                    sink.lock()
+                        .await
+                        .flush_with_retry(&FlushByOperation::Init)
+                        .await;
                 }
-                sink.lock().await.flush_with_retry(&FlushByOperation::Init).await;
             }
             info!("MySQL数据源初始化完成 count: {}", count);
         }
@@ -413,9 +505,15 @@ impl Source for MySQLSource {
                                     for row in event.rows {
                                         let before: HashMap<String, Value> = HashMap::new();
                                         let after: HashMap<String, Value> =
-                                            parse_row(row, &mut columns, config, pool).await;
+                                            parse_row(row, &table_name, &mut columns, config, pool)
+                                                .await;
                                         let op = Operation::CREATE;
-                                        let data_buffer = DataBuffer { before, after, op };
+                                        let data_buffer = DataBuffer {
+                                            table_name: table_name.to_string(),
+                                            before,
+                                            after,
+                                            op,
+                                        };
                                         Self::write_record_with_retry(&mut sink, &data_buffer)
                                             .await;
                                     }
@@ -429,10 +527,16 @@ impl Source for MySQLSource {
                                     trace!("DeleteRows: {}.{}", database_name, table_name);
                                     for row in event.rows {
                                         let before: HashMap<String, Value> =
-                                            parse_row(row, &mut columns, config, pool).await;
+                                            parse_row(row, &table_name, &mut columns, config, pool)
+                                                .await;
                                         let after: HashMap<String, Value> = HashMap::new();
                                         let op = Operation::DELETE;
-                                        let data_buffer = DataBuffer { before, after, op };
+                                        let data_buffer = DataBuffer {
+                                            table_name: table_name.to_string(),
+                                            before,
+                                            after,
+                                            op,
+                                        };
                                         Self::write_record_with_retry(&mut sink, &data_buffer)
                                             .await;
                                     }
@@ -446,11 +550,18 @@ impl Source for MySQLSource {
                                     trace!("UpdateRows: {}.{}", database_name, table_name);
                                     for (b, a) in event.rows {
                                         let before: HashMap<String, Value> =
-                                            parse_row(b, &mut columns, config, pool).await;
+                                            parse_row(b, &table_name, &mut columns, config, pool)
+                                                .await;
                                         let after: HashMap<String, Value> =
-                                            parse_row(a, &mut columns, config, pool).await;
+                                            parse_row(a, &table_name, &mut columns, config, pool)
+                                                .await;
                                         let op = Operation::UPDATE;
-                                        let data_buffer = DataBuffer { before, after, op };
+                                        let data_buffer = DataBuffer {
+                                            table_name: table_name.to_string(),
+                                            before,
+                                            after,
+                                            op,
+                                        };
                                         Self::write_record_with_retry(&mut sink, &data_buffer)
                                             .await;
                                     }
@@ -469,10 +580,15 @@ impl Source for MySQLSource {
             }
         }
     }
+
+    async fn get_table_info(&mut self) -> Vec<TableInfoVo> {
+        self.mysql_source[0].table_info_list.clone()
+    }
 }
 
 async fn parse_row(
     row: RowEvent,
+    table_name: &str,
     columns: &mut Mutex<Vec<String>>,
     config: &MysqlSourceConfigDetail,
     pool: &mut Pool<MySql>,
@@ -480,7 +596,7 @@ async fn parse_row(
     let mut data: HashMap<String, Value> = HashMap::new();
     let mut index = 0;
     if columns.lock().await.len() != row.column_values.len() {
-        let columns_new = config.fill_table_column(pool).await;
+        let columns_new = config.fill_table_column(&table_name, pool).await;
         columns.lock().await.clear();
         columns.lock().await.extend(columns_new);
     }

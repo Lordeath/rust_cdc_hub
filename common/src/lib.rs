@@ -16,6 +16,8 @@ pub trait Source: Send + Sync {
         &mut self,
         sink: Arc<Mutex<dyn Sink + Send + Sync>>,
     ) -> Result<(), Box<dyn Error + Send + Sync>>;
+
+    async fn get_table_info(&mut self) -> Vec<TableInfoVo>;
 }
 
 /// Sink trait: 所有目标端都要实现它
@@ -114,6 +116,7 @@ impl CdcConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataBuffer {
+    pub table_name: String,
     pub before: HashMap<String, Value>,
     pub after: HashMap<String, Value>,
     pub op: Operation,
@@ -333,6 +336,20 @@ pub enum Operation {
     TRUNCATE,
     MESSAGE,
     OTHER,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableInfoVo {
+    pub table_name: String,
+    pub pk_column: String,
+    pub create_table_sql: String,
+    pub columns: Vec<String>,
+    // pub column_info: Vec<ColumnInfoVo>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnInfoVo {
+    pub column_name: String,
+    pub value_for_type: Value,
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ mysql-binlog-connector-rust = "0.3.3"
 tokio = { version = "1", features = ["full"] }
 common = { path = "../../common" }
 async-trait = "0.1.89"
-sqlx = { version = "0.8", default-features = false, features = ["mysql", "tls-rustls", "runtime-tokio", "sqlx-macros", "chrono", "bigdecimal"] }
+sqlx = { version = "0.8", default-features = false, features = ["mysql", "tls-rustls", "runtime-tokio", "sqlx-macros", "chrono", "bigdecimal", "macros"] }
 serde = { version = "1.0.228", features = ["derive"] }
 tracing = "0.1"
 chrono = { version = "0.4", features = ["serde"] }

@@ -42,7 +42,8 @@ async fn main() {
     info!("Config Loaded");
     let source: Arc<Mutex<dyn Source>> = SourceFactory::create_source(config.clone()).await;
     info!("成功创建source");
-    let sink = SinkFactory::create_sink(config.clone()).await;
+    let table_info_list = source.lock().await.get_table_info().await;
+    let sink = SinkFactory::create_sink(config.clone(), table_info_list).await;
     info!("成功创建sink");
     let _ = sink.lock().await.connect().await;
     info!("成功连接到sink");

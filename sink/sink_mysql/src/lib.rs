@@ -1,6 +1,7 @@
-use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink};
+use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value};
 use meilisearch_sdk::macro_helper::async_trait;
 use sqlx::{MySql, MySqlPool, Pool};
+use std::collections::HashMap;
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
@@ -9,20 +10,21 @@ const BATCH_SIZE: usize = 256;
 
 pub struct MySqlSink {
     pool: Pool<MySql>,
-    table_name_list: Vec<String>,
-    pk_column: String,
-
+    // table_name_list: Vec<String>,
+    // pk_column: String,
+    table_info_list: Vec<TableInfoVo>,
     buffer: Mutex<Vec<DataBuffer>>,
     initialized: RwLock<bool>,
 
     // 缓存所有字段名（第一批数据会取一次）
-    columns_cache: Mutex<Vec<String>>,
+    table_info_cache: Mutex<HashMap<String, TableInfoVo>>,
+    columns_cache: Mutex<HashMap<String, Vec<String>>>,
 }
 
 impl MySqlSink {
-    pub async fn new(config: CdcConfig) -> Self {
-        let table_name = config.first_sink("table_name");
-        let pk_column = config.first_sink("pk_column");
+    pub async fn new(config: CdcConfig, table_info_list: Vec<TableInfoVo>) -> Self {
+        // let table_name = config.first_sink("table_name");
+        // let pk_column = config.first_sink("pk_column");
         let username = config.first_sink("username");
         let password = config.first_sink("password");
         let host = config.first_sink("host");
@@ -53,11 +55,13 @@ impl MySqlSink {
 
         MySqlSink {
             pool,
-            table_name_list: vec![table_name],
-            pk_column,
+            table_info_list,
+            // table_name_list: vec![table_name],
+            // pk_column,
             buffer: Mutex::new(Vec::with_capacity(BATCH_SIZE)),
             initialized: RwLock::new(false),
-            columns_cache: Mutex::new(vec![]),
+            table_info_cache: Mutex::new(HashMap::new()),
+            columns_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -156,20 +160,47 @@ impl Sink for MySqlSink {
         let batch = std::mem::take(&mut *buf);
         drop(buf);
 
-        let mut inserts = vec![];
-        let mut deletes: Vec<String> = vec![];
+        // let mut inserts = vec![];
+        // let mut deletes: Vec<String> = vec![];
+        let mut insert_map: HashMap<String, Vec<HashMap<String, Value>>> = HashMap::new();
+        let mut delete_map: HashMap<String, Vec<String>> = HashMap::new();
 
-        let pk_name = self.pk_column.as_str();
+        // let pk_name = self.pk_column.as_str();
 
         let mut cache_for_roll_back: Vec<DataBuffer> = vec![];
         for r in batch {
+            let table_name = r.table_name.clone();
+            // let mut table_info_vo = self.table_info_cache.lock().await
+            //     .get(&table_name);
+            if !self.table_info_cache.lock().await.contains_key(&table_name) {
+                for table_info in &self.table_info_list {
+                    if table_info.table_name == table_name {
+                        // table_info_vo = Some(&table_info);
+                        self.table_info_cache
+                            .lock()
+                            .await
+                            .insert(table_name.clone(), table_info.clone());
+                        break;
+                    }
+                }
+            }
+            // let table_info_vo = self.table_info_cache.lock().await.get(&table_name).unwrap();
+            let pk_name = self.table_info_cache.lock().await.get(&table_name).unwrap().pk_column.to_string();
+            let table_name = self.table_info_cache.lock().await.get(&table_name).unwrap().table_name.clone();
             cache_for_roll_back.push(r.clone());
             match r.op {
-                Operation::CREATE | Operation::UPDATE => inserts.push(r.after),
+                Operation::CREATE | Operation::UPDATE => insert_map
+                    .entry(table_name)
+                    .or_insert_with(Vec::new)
+                    .push(r.after),
                 Operation::DELETE => {
-                    let pk = r.get_pk(pk_name);
+                    let pk = r.get_pk(pk_name.as_str());
                     if !pk.is_none() {
-                        deletes.push(pk.resolve_string());
+                        // deletes.push(pk.resolve_string());
+                        delete_map
+                            .entry(table_name)
+                            .or_insert_with(Vec::new)
+                            .push(pk.resolve_string());
                     }
                 }
                 _ => {
@@ -180,103 +211,123 @@ impl Sink for MySqlSink {
 
         // 初始化字段名（只做一次）
         if !*self.initialized.read().await {
-            if let Some(first) = inserts.first() {
-                let mut cols = self.columns_cache.lock().await;
-                *cols = first.keys().cloned().collect::<Vec<_>>();
-                *self.initialized.write().await = true;
+            // if let Some(first) = inserts.first() {
+            //     let mut cols = self.columns_cache.lock().await;
+            //     *cols = first.keys().cloned().collect::<Vec<_>>();
+            //     *self.initialized.write().await = true;
+            // }
+            let mut col_info: HashMap<String, Vec<String>> = HashMap::new();
+            for table_info in &self.table_info_list {
+                let table_name = table_info.table_name.clone();
+                col_info
+                    .entry(table_name)
+                    .or_insert_with(|| vec![])
+                    .extend(table_info.columns.clone());
             }
+            let mut cols = self.columns_cache.lock().await;
+            *cols = col_info;
+            *self.initialized.write().await = true;
         }
 
-        let columns = { self.columns_cache.lock().await.clone() };
+        let column_map = { self.columns_cache.lock().await.clone() };
 
         // ======================================
         //       批量 UPSERT（INSERT ... ON DUP）
         // ======================================
-        if !inserts.is_empty() {
-            let cols_str = columns
-                .iter()
-                .map(|c| format!("`{}`", c))
-                .collect::<Vec<_>>()
-                .join(",");
+        if !insert_map.is_empty() {
+            for (table_name, inserts) in insert_map {
+                let columns = column_map.get(&table_name).unwrap();
+                // let table_info_vo = self.table_info_cache.lock().await.get(&table_name).unwrap();
+                let pk_name = self.table_info_cache.lock().await.get(&table_name).unwrap().pk_column.to_string();
+                let cols_str = columns
+                    .iter()
+                    .map(|c| format!("`{}`", c))
+                    .collect::<Vec<_>>()
+                    .join(",");
 
-            let placeholders_row = format!("({})", vec!["?"; columns.len()].join(","));
+                let placeholders_row = format!("({})", vec!["?"; columns.len()].join(","));
 
-            let values_sql = (0..inserts.len())
-                .map(|_| placeholders_row.clone())
-                .collect::<Vec<_>>()
-                .join(",");
+                let values_sql = (0..inserts.len())
+                    .map(|_| placeholders_row.clone())
+                    .collect::<Vec<_>>()
+                    .join(",");
 
-            let updates_sql = columns
-                .iter()
-                .map(|c| format!("`{}` = VALUES(`{}`)", c, c))
-                .filter(|c| c != pk_name)
-                .collect::<Vec<_>>()
-                .join(",");
+                let updates_sql = columns
+                    .iter()
+                    .map(|c| format!("`{}` = VALUES(`{}`)", c, c))
+                    .filter(|c| c != pk_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
 
-            let sql = format!(
-                "INSERT INTO `{}` ({})
+                let sql = format!(
+                    "INSERT INTO `{}` ({})
                  VALUES {}
                  ON DUPLICATE KEY UPDATE {}",
-                self.table_name_list[0], cols_str, values_sql, updates_sql
-            );
+                    table_name, cols_str, values_sql, updates_sql
+                );
 
-            // info!("sql: {}", sql.clone());
+                // info!("sql: {}", sql.clone());
 
-            let mut query = sqlx::query(&sql);
+                let mut query = sqlx::query(&sql);
 
-            for row in &inserts {
-                for col in &columns {
-                    // let value = row.get(col);
-                    let v = row
-                        .get(col)
-                        .map(|v| v.resolve_string())
-                        .unwrap_or_else(|| "null".to_string());
-                    if v == "null" {
-                        query = query.bind(None::<String>);
-                    } else {
-                        query = query.bind(v);
+                for row in &inserts {
+                    for col in columns {
+                        // let value = row.get(col);
+                        let v = row
+                            .get(col)
+                            .map(|v| v.resolve_string())
+                            .unwrap_or_else(|| "null".to_string());
+                        if v == "null" {
+                            query = query.bind(None::<String>);
+                        } else {
+                            query = query.bind(v);
+                        }
                     }
                 }
-            }
 
-            if let Err(e) = query.execute(&self.pool).await {
-                error!("MySQL batch UPSERT error: {:?}", e);
-                error!("need do it again: {}", cache_for_roll_back.len());
-                let mut buf = self.buffer.lock().await;
-                for cached_data_buffer in cache_for_roll_back {
-                    buf.push(cached_data_buffer);
+                if let Err(e) = query.execute(&self.pool).await {
+                    error!("MySQL batch UPSERT error: {:?}", e);
+                    error!("need do it again: {}", cache_for_roll_back.len());
+                    let mut buf = self.buffer.lock().await;
+                    for cached_data_buffer in cache_for_roll_back {
+                        buf.push(cached_data_buffer);
+                    }
+                    return Err(Box::new(e));
                 }
-                return Err(Box::new(e));
             }
         }
 
         // ======================================
         //             批量 DELETE
         // ======================================
-        if !deletes.is_empty() {
-            let ph = (0..deletes.len())
-                .map(|_| "?")
-                .collect::<Vec<_>>()
-                .join(",");
+        for (table_name, deletes) in delete_map {
+            if !deletes.is_empty() {
+                // let table_info_vo = self.table_info_cache.lock().await.get(&table_name).unwrap();
+                let pk_name = self.table_info_cache.lock().await.get(&table_name).unwrap().pk_column.to_string();
+                let ph = (0..deletes.len())
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(",");
 
-            let sql = format!(
-                "DELETE FROM `{}` WHERE `{}` IN ({})",
-                self.table_name_list[0], self.pk_column, ph
-            );
+                let sql = format!(
+                    "DELETE FROM `{}` WHERE `{}` IN ({})",
+                    table_name, pk_name, ph
+                );
 
-            let mut query = sqlx::query(&sql);
-            for pk in deletes {
-                query = query.bind(pk);
-            }
-
-            if let Err(e) = query.execute(&self.pool).await {
-                error!("MySQL batch delete error: {:?}", e);
-                error!("need do it again: {}", cache_for_roll_back.len());
-                let mut buf = self.buffer.lock().await;
-                for cached_data_buffer in cache_for_roll_back {
-                    buf.push(cached_data_buffer);
+                let mut query = sqlx::query(&sql);
+                for pk in deletes {
+                    query = query.bind(pk);
                 }
-                return Err(Box::new(e));
+
+                if let Err(e) = query.execute(&self.pool).await {
+                    error!("MySQL batch delete error: {:?}", e);
+                    error!("need do it again: {}", cache_for_roll_back.len());
+                    let mut buf = self.buffer.lock().await;
+                    for cached_data_buffer in cache_for_roll_back {
+                        buf.push(cached_data_buffer);
+                    }
+                    return Err(Box::new(e));
+                }
             }
         }
 
