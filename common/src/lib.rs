@@ -80,7 +80,6 @@ pub struct CdcConfig {
     pub sink_config: Vec<HashMap<String, String>>,
     pub auto_create_database: Option<bool>,
     pub auto_create_table: Option<bool>,
-    // pub auto_add_column: Option<bool>,
 }
 
 impl CdcConfig {
