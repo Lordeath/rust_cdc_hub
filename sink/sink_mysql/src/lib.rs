@@ -39,7 +39,7 @@ impl MySqlSink {
             database.clone(),
         );
         let pool = match Self::get_pool_auto_create_database(
-            config,
+            &config,
             &username,
             &password,
             &host,
@@ -52,6 +52,23 @@ impl MySqlSink {
             Ok(value) => value,
             Err(value) => return value,
         };
+
+        // judge is need to create table
+        if config.auto_create_table.unwrap_or_else(|| true) {
+            let sql = "select * from information_schema.`COLUMNS` where TABLE_SCHEMA = (select database()) AND TABLE_NAME = ?";
+            for table_info in &table_info_list {
+                let table_name = table_info.table_name.clone();
+                let is_empty = sqlx::query(sql)
+                    .bind(&table_name)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap().is_empty();
+                if is_empty {
+                    let create_table_sql = table_info.create_table_sql.clone();
+                    sqlx::query(&create_table_sql).execute(&pool).await.expect("Failed to create table");
+                }
+            }
+        }
 
         MySqlSink {
             pool,
@@ -66,7 +83,7 @@ impl MySqlSink {
     }
 
     async fn get_pool_auto_create_database(
-        config: CdcConfig,
+        config: &CdcConfig,
         username: &String,
         password: &String,
         host: &String,
