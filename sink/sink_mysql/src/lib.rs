@@ -154,7 +154,9 @@ impl Sink for MySqlSink {
 
         match flush_by_operation {
             FlushByOperation::Timer => {
-                info!("Flushing Mysql Sink by timer... {}", buf.len());
+                if !buf.is_empty() {
+                    info!("Flushing Mysql Sink by timer... {}", buf.len());
+                }
             }
             FlushByOperation::Init => {
                 if !buf.is_empty() {
