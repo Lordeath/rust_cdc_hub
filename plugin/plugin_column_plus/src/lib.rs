@@ -56,11 +56,14 @@ impl Plugin for PluginPlus {
             {
                 continue;
             }
-            if data.contains_key(&column.column_name) && !data.get(&column.column_name).unwrap().is_none() {
-                contains_some_column.insert(
-                    column.column_name.clone(),
-                    data.get(&column.column_name).unwrap().clone(),
-                );
+            for (k, v) in &data {
+                if k.eq_ignore_ascii_case(&column.column_name) && !v.is_none() {
+                    contains_some_column.insert(
+                        column.column_name.clone(),
+                        v.clone(),
+                    );
+                    break;
+                }
             }
         }
         if contains_some_column.is_empty() {
