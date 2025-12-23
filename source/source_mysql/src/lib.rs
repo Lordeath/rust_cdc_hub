@@ -55,7 +55,7 @@ struct MysqlSourceConfigDetail {
 }
 
 impl MysqlSourceConfig {
-    pub async fn new(config: CdcConfig) -> Self {
+    pub async fn new(config: &CdcConfig) -> Self {
         let size = config.source_config.len();
         let mut mysql_source: Vec<MysqlSourceConfigDetail> = vec![];
         // let table_name = config.first_source("table_name");
@@ -371,7 +371,7 @@ impl MysqlSourceConfigDetail {
 }
 
 impl MySQLSource {
-    pub async fn new(config: CdcConfig) -> Self {
+    pub async fn new(config: &CdcConfig) -> Self {
         let mut streams: Vec<BinlogStream> = vec![];
         let mut mysql_source: Vec<MysqlSourceConfigDetail> = vec![];
         let mut pools: Vec<Pool<MySql>> = vec![];

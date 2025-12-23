@@ -22,7 +22,7 @@ pub struct MySqlSink {
 }
 
 impl MySqlSink {
-    pub async fn new(config: CdcConfig, table_info_list: Vec<TableInfoVo>) -> Self {
+    pub async fn new(config: &CdcConfig, table_info_list: Vec<TableInfoVo>) -> Self {
         let username = config.first_sink("username");
         let password = config.first_sink("password");
         let host = config.first_sink("host");

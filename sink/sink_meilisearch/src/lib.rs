@@ -19,7 +19,7 @@ pub struct MeiliSearchSink {
 }
 
 impl MeiliSearchSink {
-    pub fn new(config: CdcConfig, _table_info_list: Vec<TableInfoVo>) -> Self {
+    pub fn new(config: &CdcConfig, _table_info_list: Vec<TableInfoVo>) -> Self {
         let meili_url = config.first_sink("meili_url");
         let meili_master_key = config.first_sink("meili_master_key");
         let meili_table_name = config.first_sink("table_name");

@@ -41,15 +41,15 @@ async fn main() {
     let config_path = get_env("CONFIG_PATH");
     let config: CdcConfig = load_config(&config_path).expect("Failed to load config");
     info!("Config Loaded");
-    let source: Arc<Mutex<dyn Source>> = SourceFactory::create_source(config.clone()).await;
+    let source: Arc<Mutex<dyn Source>> = SourceFactory::create_source(&config).await;
     add_plugin(&config, &source).await;
     info!("成功创建source");
     let table_info_list = source.lock().await.get_table_info().await;
-    let sink = SinkFactory::create_sink(config.clone(), table_info_list).await;
+    let sink = SinkFactory::create_sink(&config, table_info_list).await;
     info!("成功创建sink");
     let _ = sink.lock().await.connect().await.expect("Failed to connect to sink");
     info!("成功连接到sink");
-    add_flush_timer(config, &sink);
+    add_flush_timer(&config, &sink);
     info!("成功增加flush timer");
     let _ = source.lock().await.start(sink.clone()).await.expect("Failed to start source");
     info!("程序结束");
@@ -71,7 +71,7 @@ async fn add_plugin(config: &CdcConfig, source: &Arc<Mutex<dyn Source>>) {
     }
 }
 
-fn add_flush_timer(config: CdcConfig, sink: &Arc<Mutex<dyn Sink + Send + Sync>>) {
+fn add_flush_timer(config: &CdcConfig, sink: &Arc<Mutex<dyn Sink + Send + Sync>>) {
     let flush_interval_secs = config
         .first_sink("flush_interval_secs")
         .parse::<u64>()

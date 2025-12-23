@@ -8,8 +8,8 @@ pub struct PrintSink {
 }
 
 impl PrintSink {
-    pub fn new(config: CdcConfig, _table_info_list: Vec<TableInfoVo>) -> Self {
-        PrintSink { config }
+    pub fn new(config: &CdcConfig, _table_info_list: Vec<TableInfoVo>) -> Self {
+        PrintSink { config: config.clone() }
     }
 }
 
