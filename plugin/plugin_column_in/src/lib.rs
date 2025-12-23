@@ -45,6 +45,22 @@ impl Plugin for PluginColumnIn {
                 contains_some_column = data.get(column).unwrap().clone();
                 break;
             }
+            if data.contains_key(column.to_lowercase().as_str()) {
+                contains_some_column = data.get(column.to_lowercase().as_str()).unwrap().clone();
+                break;
+            }
+            let mut key_matches = "";
+            for (key, _value) in data {
+                if key.eq_ignore_ascii_case(column) {
+                    key_matches = key;
+                    break;
+                }
+            }
+            if data.contains_key(key_matches) {
+                contains_some_column = data.get(key_matches).unwrap().clone();
+                break;
+            }
+
         }
         if contains_some_column.is_none() {
             return Ok(data_buffer.clone());

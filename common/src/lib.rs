@@ -153,16 +153,16 @@ pub struct DataBuffer {
 // pub const VALUE_NONE: Value = Value::None;
 
 impl DataBuffer {
-    pub fn get_pk_before(&self, pk_name: &str) -> &Value {
-        self.before.get(pk_name).unwrap_or(&Value::None)
+    pub fn get_column_before(&self, column_name: &str) -> &Value {
+        self.before.get(column_name.to_lowercase().as_str()).unwrap_or(&Value::None)
     }
-    pub fn get_pk_after(&self, pk_name: &str) -> &Value {
-        self.after.get(pk_name).unwrap_or(&Value::None)
+    pub fn get_column_after(&self, column_name: &str) -> &Value {
+        self.after.get(column_name.to_lowercase().as_str()).unwrap_or(&Value::None)
     }
     pub fn get_pk(&self, pk_name: &str) -> &Value {
-        let mut result = self.get_pk_after(pk_name);
+        let mut result = self.get_column_after(pk_name);
         if result.is_none() {
-            result = self.get_pk_before(pk_name);
+            result = self.get_column_before(pk_name);
         }
         result
     }
