@@ -433,11 +433,9 @@ impl Source for MySQLSource {
                     let pk_column = table_info_vo.pk_column.clone();
                     info!("开始初始化数据源: {}.{}", config.connection_url, table_name);
                     let mut count = 0;
-
                     // 这里进行循环，一批一批进行数据写入
                     let mut id: i64 = i64::MIN;
                     loop {
-                        // let table_name = config.table_name.clone();
                         let data_buffer_list: Vec<DataBuffer> = config
                             .extract_init_data(&table_name, &pk_column, id, pool)
                             .await;
@@ -593,8 +591,6 @@ impl Source for MySQLSource {
                             }
                             _ => {}
                         }
-                        // sink.lock().await.flush_with_retry(&FlushByOperation::Cdc).await;
-                        // flush_with_retry(&mut sink).await;
                     }
                     Err(e) => {
                         // 打印错误信息，并且继续监听
