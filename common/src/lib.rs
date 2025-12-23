@@ -189,6 +189,8 @@ pub enum Value {
     Int32(i32),
     // A 64 bit signed integer
     Int64(i64),
+    UnsignedInt32(u32),
+    UnsignedInt64(u64),
     // A 32 bit floating point number
     Float(f32),
     // A 64 bit floating point number
@@ -228,6 +230,8 @@ impl Value {
             Value::Int16(s) => s.to_string(),
             Value::Int32(s) => s.to_string(),
             Value::Int64(s) => s.to_string(),
+            Value::UnsignedInt32(s) => s.to_string(),
+            Value::UnsignedInt64(s) => s.to_string(),
             Value::Float(s) => s.to_string(),
             Value::Double(s) => s.to_string(),
             Value::Decimal(s) => s.to_string(),
@@ -282,6 +286,8 @@ impl Serialize for Value {
             Value::Timestamp(v) => serializer.serialize_i64(*v),
             Value::Year(v) => serializer.serialize_u16(*v),
             Value::Bit(v) => serializer.serialize_u64(*v),
+            Value::UnsignedInt32(v) => serializer.serialize_u32(*v),
+            Value::UnsignedInt64(v) => serializer.serialize_u64(*v),
         }
     }
 }

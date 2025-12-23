@@ -87,13 +87,32 @@ impl MysqlSourceConfig {
             {
                 // get all tables
                 let show_tables_sql = r#"
-                    select TABLE_NAME AS table_name
-                    from information_schema.`COLUMNS`
-                    where TABLE_SCHEMA = (select database())
-                    AND COLUMN_KEY = 'PRI'
-                    AND COLUMN_TYPE = 'bigint'
-                    GROUP BY TABLE_NAME
-                    HAVING COUNT(COLUMN_KEY) = 1
+                    SELECT distinct c.TABLE_NAME AS table_name
+                    FROM information_schema.COLUMNS c
+                    WHERE c.TABLE_SCHEMA = (SELECT DATABASE())
+                      AND c.COLUMN_KEY = 'PRI'
+                      AND c.COLUMN_TYPE = 'bigint'
+                      AND c.TABLE_NAME NOT IN (
+                            SELECT TABLE_NAME
+                            FROM information_schema.KEY_COLUMN_USAGE
+                            WHERE TABLE_SCHEMA = (SELECT DATABASE())
+                              AND REFERENCED_TABLE_NAME IS NOT NULL
+                       )
+                       AND c.TABLE_NAME NOT IN (
+                            SELECT REFERENCED_TABLE_NAME
+                            FROM information_schema.KEY_COLUMN_USAGE
+                            WHERE TABLE_SCHEMA = (SELECT DATABASE())
+                              AND REFERENCED_TABLE_NAME IS NOT NULL
+                       )
+                        AND c.TABLE_NAME NOT IN (
+                                SELECT cc.TABLE_NAME AS table_name
+                                FROM information_schema.COLUMNS cc
+                                WHERE cc.TABLE_SCHEMA = (SELECT DATABASE())
+                                    AND cc.COLUMN_KEY = 'PRI'
+                                    AND cc.COLUMN_TYPE = 'bigint'
+                                GROUP BY cc.TABLE_NAME
+                                HAVING COUNT(*) > 1
+                        )
                 "#;
                 let tables: Vec<String> = sqlx::query(&show_tables_sql)
                     .fetch_all(&pool)
@@ -267,6 +286,22 @@ fn mysql_row_to_hashmap(row: &MySqlRow) -> HashMap<String, Value> {
             match column.type_info().name() {
                 "INT" => match row.try_get::<i32, _>(name.as_str()) {
                     Ok(v) => Value::Int32(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "INT UNSIGNED" => match row.try_get::<u32, _>(name.as_str()) {
+                    Ok(v) => Value::UnsignedInt32(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "BIGINT UNSIGNED" => match row.try_get::<u64, _>(name.as_str()) {
+                    Ok(v) => Value::UnsignedInt64(v),
                     Err(e) => {
                         error!("类型转换失败: {}", column.type_info().name());
                         error!("{}", e);
