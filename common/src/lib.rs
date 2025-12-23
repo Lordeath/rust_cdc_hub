@@ -66,13 +66,13 @@ pub trait Plugin: Send + Sync {
     async fn collect(&mut self, data_buffer: DataBuffer) -> Result<DataBuffer, ()>;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Display)]
 pub enum SourceType {
     MySQL,
     // 未来可扩展：Postgres, Kafka, Mongo, 等
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Display)]
 pub enum SinkType {
     Print,
     MeiliSearch,

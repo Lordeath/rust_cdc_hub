@@ -7,3 +7,4 @@ edition = "2024"
 common = { path = "../common" }
 source_mysql = { path = "source_mysql" }
 tokio = { version = "1", features = ["full"] }
+log = "0.4.29"

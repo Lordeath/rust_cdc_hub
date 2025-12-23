@@ -4,6 +4,7 @@ use sink_mysql::MySqlSink;
 use sink_print::PrintSink;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use log::info;
 
 pub struct SinkFactory;
 
@@ -12,6 +13,7 @@ impl SinkFactory {
         config: &CdcConfig,
         table_info_list: Vec<TableInfoVo>,
     ) -> Arc<Mutex<dyn Sink + Send + Sync>> {
+        info!("create sink: {:?}", config.sink_type);
         match config.sink_type {
             SinkType::Print => Arc::new(Mutex::new(PrintSink::new(config, table_info_list))),
             SinkType::MeiliSearch => {
