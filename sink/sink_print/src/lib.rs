@@ -1,6 +1,6 @@
+use async_trait::async_trait;
 use common::{CdcConfig, DataBuffer, Sink, TableInfoVo};
 use std::error::Error;
-use async_trait::async_trait;
 use tracing::info;
 
 pub struct PrintSink {
@@ -9,7 +9,9 @@ pub struct PrintSink {
 
 impl PrintSink {
     pub fn new(config: &CdcConfig, _table_info_list: Vec<TableInfoVo>) -> Self {
-        PrintSink { config: config.clone() }
+        PrintSink {
+            config: config.clone(),
+        }
     }
 }
 

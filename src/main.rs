@@ -47,11 +47,21 @@ async fn main() {
     let table_info_list = source.lock().await.get_table_info().await;
     let sink = SinkFactory::create_sink(&config, table_info_list).await;
     info!("成功创建sink");
-    let _ = sink.lock().await.connect().await.expect("Failed to connect to sink");
+    let _ = sink
+        .lock()
+        .await
+        .connect()
+        .await
+        .expect("Failed to connect to sink");
     info!("成功连接到sink");
     add_flush_timer(&config, &sink);
     info!("成功增加flush timer");
-    let _ = source.lock().await.start(sink.clone()).await.expect("Failed to start source");
+    let _ = source
+        .lock()
+        .await
+        .start(sink.clone())
+        .await
+        .expect("Failed to start source");
     info!("程序结束");
 }
 

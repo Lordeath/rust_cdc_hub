@@ -1,5 +1,5 @@
 use common::{CdcConfig, Source, SourceType};
-use std::sync::{Arc};
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub struct SourceFactory;

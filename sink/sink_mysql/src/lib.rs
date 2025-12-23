@@ -60,10 +60,14 @@ impl MySqlSink {
                     .bind(&table_name)
                     .fetch_all(&pool)
                     .await
-                    .unwrap().is_empty();
+                    .unwrap()
+                    .is_empty();
                 if is_empty {
                     let create_table_sql = table_info.create_table_sql.clone();
-                    sqlx::query(&create_table_sql).execute(&pool).await.expect("Failed to create table");
+                    sqlx::query(&create_table_sql)
+                        .execute(&pool)
+                        .await
+                        .expect("Failed to create table");
                 }
             }
         }
@@ -200,8 +204,22 @@ impl Sink for MySqlSink {
                 }
             }
             // let table_info_vo = self.table_info_cache.lock().await.get(&table_name).unwrap();
-            let pk_name = self.table_info_cache.lock().await.get(&table_name).unwrap().pk_column.to_string();
-            let table_name = self.table_info_cache.lock().await.get(&table_name).unwrap().table_name.clone();
+            let pk_name = self
+                .table_info_cache
+                .lock()
+                .await
+                .get(&table_name)
+                .unwrap()
+                .pk_column
+                .to_string();
+            let table_name = self
+                .table_info_cache
+                .lock()
+                .await
+                .get(&table_name)
+                .unwrap()
+                .table_name
+                .clone();
             cache_for_roll_back.push(r.clone());
             match r.op {
                 Operation::CREATE | Operation::UPDATE => insert_map
@@ -253,7 +271,14 @@ impl Sink for MySqlSink {
             for (table_name, inserts) in insert_map {
                 let columns = column_map.get(&table_name).unwrap();
                 // let table_info_vo = self.table_info_cache.lock().await.get(&table_name).unwrap();
-                let pk_name = self.table_info_cache.lock().await.get(&table_name).unwrap().pk_column.to_string();
+                let pk_name = self
+                    .table_info_cache
+                    .lock()
+                    .await
+                    .get(&table_name)
+                    .unwrap()
+                    .pk_column
+                    .to_string();
                 let cols_str = columns
                     .iter()
                     .map(|c| format!("`{}`", c))
@@ -318,7 +343,14 @@ impl Sink for MySqlSink {
         for (table_name, deletes) in delete_map {
             if !deletes.is_empty() {
                 // let table_info_vo = self.table_info_cache.lock().await.get(&table_name).unwrap();
-                let pk_name = self.table_info_cache.lock().await.get(&table_name).unwrap().pk_column.to_string();
+                let pk_name = self
+                    .table_info_cache
+                    .lock()
+                    .await
+                    .get(&table_name)
+                    .unwrap()
+                    .pk_column
+                    .to_string();
                 let ph = (0..deletes.len())
                     .map(|_| "?")
                     .collect::<Vec<_>>()
