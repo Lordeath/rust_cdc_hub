@@ -87,19 +87,14 @@ impl MysqlSourceConfig {
             {
                 // get all tables
                 let show_tables_sql = r#"
-                    select distinct TABLE_NAME AS table_name
+                    select TABLE_NAME AS table_name
                     from information_schema.`COLUMNS`
                     where TABLE_SCHEMA = (select database())
                     AND COLUMN_KEY = 'PRI'
                     AND COLUMN_TYPE = 'bigint'
+                    GROUP BY TABLE_NAME
+                    HAVING COUNT(COLUMN_KEY) = 1
                 "#;
-                // let tables: Vec<String> = sqlx::query_as::<_, TableNameFromMysql>(&show_tables_sql)
-                //     .fetch_all(&pool)
-                //     .await
-                //     .expect("query failed")
-                //     .into_iter()
-                //     .map(|row| row.table_name)
-                //     .collect();
                 let tables: Vec<String> = sqlx::query(&show_tables_sql)
                     .fetch_all(&pool)
                     .await
@@ -180,11 +175,6 @@ pub struct ColumnInfoFromMysql {
     pub column_key: String,
     #[sqlx(try_from = "Vec<u8>")]
     pub data_type: String,
-}
-
-#[derive(Debug, FromRow)]
-pub struct TableNameFromMysql {
-    pub table_name: String,
 }
 
 impl MysqlSourceConfigDetail {
