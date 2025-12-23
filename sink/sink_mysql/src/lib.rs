@@ -103,7 +103,7 @@ impl MySqlSink {
                     ))
                     .await
                     .unwrap();
-                    let sql = format!("CREATE DATABASE IF NOT EXISTS {}", database.clone());
+                    let sql = format!("CREATE DATABASE IF NOT EXISTS `{}`", database.clone());
                     match sqlx::query(&sql)
                         .execute(&pool_for_auto_create_database)
                         .await
