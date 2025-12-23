@@ -112,7 +112,8 @@ sink_config:
 - [x] (mysql sink) auto create table
 - [ ] (mysql sink) auto add column
 - [ ] (mysql sink) all table sync
-- [ ] (mysql sink) 忽略这样的字段`fullPath` varchar(120) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci GENERATED ALWAYS AS (concat(`path`,`HouseId`,_utf8mb3'/')) STORED,
+- [X] (mysql sink) 忽略这样的字段`fullPath` varchar(120) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci GENERATED ALWAYS AS (concat(`path`,`HouseId`,_utf8mb3'/')) STORED,
+- [ ] (mysql source) 获取binlog的时候，指定获取的binlog位置，防止同步时间过长导致的数据丢失
 
 
 

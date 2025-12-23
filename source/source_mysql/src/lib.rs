@@ -524,8 +524,9 @@ impl Source for MySQLSource {
                         _ => {}
                     },
                     Err(e) => {
-                        // 打印错误信息，并且继续监听
+                        // 打印错误信息
                         error!("Error: {}", e);
+                        panic!("Error: {}", e);
                     }
                 }
             }
