@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use sqlx::FromRow;
 use sqlx::mysql::MySqlRow;
-use sqlx::types::BigDecimal;
+use sqlx::types::{BigDecimal};
 use sqlx::{Column, MySqlPool, Row, ValueRef};
 use sqlx::{MySql, Pool, TypeInfo};
 use std::collections::HashMap;
@@ -23,6 +23,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace};
+
+use serde_json::Value as JsonValue;
 
 const LOOP_PACE: usize = 8192;
 
@@ -253,7 +255,11 @@ impl MysqlSourceConfigDetail {
         // info!("extract_init_data: {} rows", rows.len());
         info!(
             "extract_init_data: [{}.{}] {} {} {} rows",
-            self.database, table_name, pk_column, id, rows.len()
+            self.database,
+            table_name,
+            pk_column,
+            id,
+            rows.len()
         );
         let mut result: Vec<DataBuffer> = vec![];
         for row in rows {
@@ -269,9 +275,7 @@ impl MysqlSourceConfigDetail {
         }
         result
     }
-
 }
-
 
 #[inline]
 fn mysql_row_to_hashmap(row: &MySqlRow) -> HashMap<String, Value> {
@@ -382,6 +386,14 @@ fn mysql_row_to_hashmap(row: &MySqlRow) -> HashMap<String, Value> {
                 },
                 "VARCHAR" | "TEXT" => match row.try_get::<String, _>(name.as_str()) {
                     Ok(v) => Value::String(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "JSON" => match row.try_get::<JsonValue, &str>(name.as_str()) {
+                    Ok(v) => Value::String(v.to_string()),
                     Err(e) => {
                         error!("类型转换失败: {}", column.type_info().name());
                         error!("{}", e);
@@ -544,7 +556,10 @@ impl Source for MySQLSource {
                         .await;
                     info!(
                         "MySQL数据源初始化完成 {}.{} count: {} cost: {:?}",
-                        config.connection_url, table_name, count, start.elapsed()
+                        config.connection_url,
+                        table_name,
+                        count,
+                        start.elapsed()
                     );
                 }
             }
