@@ -56,9 +56,7 @@ pub trait Sink: Send + Sync {
     async fn flush(
         &self,
         _from_timer: &FlushByOperation,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        Ok(())
-    }
+    ) -> Result<(), Box<dyn Error + Send + Sync>>;
 }
 
 #[async_trait]

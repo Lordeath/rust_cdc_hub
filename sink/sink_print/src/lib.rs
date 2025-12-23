@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use common::{CdcConfig, DataBuffer, Sink, TableInfoVo};
+use common::{CdcConfig, DataBuffer, FlushByOperation, Sink, TableInfoVo};
 use std::error::Error;
 use tracing::info;
 
@@ -26,6 +26,13 @@ impl Sink for PrintSink {
         info!("进入print");
         info!("{:?}", record);
 
+        Ok(())
+    }
+
+    async fn flush(
+        &self,
+        _from_timer: &FlushByOperation,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok(())
     }
 }
