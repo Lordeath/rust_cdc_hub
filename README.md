@@ -108,10 +108,11 @@ sink_config:
 - [ ] starrocks的sink时，自动建表，自动建库，自动加字段
 - [ ] 断点续传，挂掉之后自动重启，然后继续执行之前的作业
 - [x] 重试的时候，不drop掉对象，防止重试的时候对象被drop。等到成功之后再drop对象
-- [x] (mysql sink)   auto create database
-- [x] (mysql sink)   auto create table
-- [ ] (mysql sink)   auto add column
-- [ ] (mysql sink)   all table sync
+- [x] (mysql sink) auto create database
+- [x] (mysql sink) auto create table
+- [ ] (mysql sink) auto add column
+- [ ] (mysql sink) all table sync
+- [ ] (mysql sink) 忽略这样的字段`fullPath` varchar(120) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci GENERATED ALWAYS AS (concat(`path`,`HouseId`,_utf8mb3'/')) STORED,
 
 
 

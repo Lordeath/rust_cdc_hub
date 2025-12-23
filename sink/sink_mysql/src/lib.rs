@@ -1,6 +1,9 @@
 use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value};
 use meilisearch_sdk::macro_helper::async_trait;
-use sqlx::{MySql, MySqlPool, Pool};
+use sqlx::mysql::MySqlRow;
+use sqlx::types::BigDecimal;
+use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use sqlx::{Column, MySql, MySqlPool, Pool, Row, TypeInfo, ValueRef};
 use std::collections::HashMap;
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
@@ -37,7 +40,7 @@ impl MySqlSink {
             database.clone(),
         );
         let pool = match Self::get_pool_auto_create_database(
-            &config,
+            config,
             &username,
             &password,
             &host,
@@ -52,7 +55,7 @@ impl MySqlSink {
         };
 
         // judge is need to create table
-        if config.auto_create_table.unwrap_or_else(|| true) {
+        if config.auto_create_table.unwrap_or(true) {
             let sql = "select * from information_schema.`COLUMNS` where TABLE_SCHEMA = (select database()) AND TABLE_NAME = ?";
             for table_info in &table_info_list {
                 let table_name = table_info.table_name.clone();
@@ -91,12 +94,12 @@ impl MySqlSink {
         host: &String,
         port: &String,
         database: String,
-        connection_url: &String,
+        connection_url: &str,
     ) -> Result<Pool<MySql>, MySqlSink> {
-        let pool: Pool<MySql> = match MySqlPool::connect(&connection_url).await {
+        let pool: Pool<MySql> = match MySqlPool::connect(connection_url).await {
             Ok(o) => o,
             Err(e) => {
-                if config.auto_create_database.unwrap_or_else(|| true) {
+                if config.auto_create_database.unwrap_or(true) {
                     let pool_for_auto_create_database = MySqlPool::connect(&format!(
                         "mysql://{}:{}@{}:{}",
                         username, password, host, port,
@@ -114,7 +117,7 @@ impl MySqlSink {
                             panic!("Failed to create database: {}", e);
                         }
                     };
-                    let pool: Pool<MySql> = MySqlPool::connect(&connection_url).await.unwrap();
+                    let pool: Pool<MySql> = MySqlPool::connect(connection_url).await.unwrap();
                     return Ok(pool);
                 }
                 error!("Failed to connect to MySQL: {}", e);
@@ -222,17 +225,16 @@ impl Sink for MySqlSink {
                 .clone();
             cache_for_roll_back.push(r.clone());
             match r.op {
-                Operation::CREATE | Operation::UPDATE => insert_map
-                    .entry(table_name)
-                    .or_insert_with(Vec::new)
-                    .push(r.after),
+                Operation::CREATE | Operation::UPDATE => {
+                    insert_map.entry(table_name).or_default().push(r.after)
+                }
                 Operation::DELETE => {
                     let pk = r.get_pk(pk_name.as_str());
                     if !pk.is_none() {
                         // deletes.push(pk.resolve_string());
                         delete_map
                             .entry(table_name)
-                            .or_insert_with(Vec::new)
+                            .or_default()
                             .push(pk.resolve_string());
                     }
                 }
@@ -244,20 +246,28 @@ impl Sink for MySqlSink {
 
         // 初始化字段名（只做一次）
         if !*self.initialized.read().await {
-            // if let Some(first) = inserts.first() {
-            //     let mut cols = self.columns_cache.lock().await;
-            //     *cols = first.keys().cloned().collect::<Vec<_>>();
-            //     *self.initialized.write().await = true;
-            // }
             let mut col_info: HashMap<String, Vec<String>> = HashMap::new();
             for table_info in &self.table_info_list {
                 let table_name = table_info.table_name.clone();
-                col_info
-                    .entry(table_name)
-                    .or_insert_with(|| vec![])
-                    .extend(table_info.columns.clone());
+                let mut cols = table_info.columns.clone();
+                // 去掉那些STORED的字段
+                let stored_cols_sql = r#"
+                    select COLUMN_NAME from information_schema.columns where EXTRA = 'STORED GENERATED' AND TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?;
+                "#;
+                let stored_cols: Vec<String> = sqlx::query(stored_cols_sql)
+                    .bind(&table_name)
+                    .fetch_all(&self.pool)
+                    .await?
+                    .iter()
+                    .map(mysql_row_to_hashmap)
+                    .map(|row| row.get("COLUMN_NAME").unwrap().resolve_string())
+                    .collect();
+                cols.retain(|c| !stored_cols.contains(c));
+
+                col_info.entry(table_name).or_default().extend(cols);
             }
             let mut cols = self.columns_cache.lock().await;
+
             *cols = col_info;
             *self.initialized.write().await = true;
         }
@@ -270,7 +280,6 @@ impl Sink for MySqlSink {
         if !insert_map.is_empty() {
             for (table_name, inserts) in insert_map {
                 let columns = column_map.get(&table_name).unwrap();
-                // let table_info_vo = self.table_info_cache.lock().await.get(&table_name).unwrap();
                 let pk_name = self
                     .table_info_cache
                     .lock()
@@ -306,8 +315,6 @@ impl Sink for MySqlSink {
                     table_name, cols_str, values_sql, updates_sql
                 );
 
-                // info!("sql: {}", sql.clone());
-
                 let mut query = sqlx::query(&sql);
 
                 for row in &inserts {
@@ -317,7 +324,7 @@ impl Sink for MySqlSink {
                             .get(col)
                             .map(|v| v.resolve_string())
                             .unwrap_or_else(|| "null".to_string());
-                        if v == "null" {
+                        if v.eq("null") {
                             query = query.bind(None::<String>);
                         } else {
                             query = query.bind(v);
@@ -380,4 +387,147 @@ impl Sink for MySqlSink {
 
         Ok(())
     }
+}
+
+#[inline]
+fn mysql_row_to_hashmap(row: &MySqlRow) -> HashMap<String, Value> {
+    let mut result = HashMap::new();
+    for row_column in row.columns().iter().enumerate() {
+        let column = row_column.1;
+        let name = column.name().to_string();
+        let is_null = row
+            .try_get_raw(name.as_str())
+            .expect("mysql_row_to_hashmap")
+            .is_null();
+
+        let value = if is_null {
+            Value::None
+        } else {
+            match column.type_info().name() {
+                "INT" => match row.try_get::<i32, _>(name.as_str()) {
+                    Ok(v) => Value::Int32(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "INT UNSIGNED" => match row.try_get::<u32, _>(name.as_str()) {
+                    Ok(v) => Value::UnsignedInt32(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "BIGINT UNSIGNED" => match row.try_get::<u64, _>(name.as_str()) {
+                    Ok(v) => Value::UnsignedInt64(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "BIGINT" => match row.try_get::<i64, _>(name.as_str()) {
+                    Ok(v) => Value::Int64(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "BOOLEAN" => match row.try_get::<bool, _>(name.as_str()) {
+                    Ok(v) => {
+                        if v {
+                            Value::Int8(0)
+                        } else {
+                            Value::Int8(1)
+                        }
+                    }
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "TINYINT" => match row.try_get::<i8, _>(name.as_str()) {
+                    Ok(v) => Value::Int8(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "DATE" => match row.try_get::<NaiveDate, _>(name.as_str()) {
+                    Ok(v) => Value::String(v.to_string()),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "DATETIME" => match row.try_get::<NaiveDateTime, _>(name.as_str()) {
+                    Ok(v) => Value::String(v.to_string()),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "TIMESTAMP" => match row.try_get::<DateTime<Utc>, _>(name.as_str()) {
+                    Ok(v) => {
+                        // 推荐：将带时区的 DateTime<Utc> 转换为 Unix 时间戳（i64 秒数）
+                        let ts_ms = v.timestamp_millis();
+                        let secs = ts_ms / 1000;
+                        let nanos = ((ts_ms % 1000) * 1_000_000) as u32;
+
+                        let dt = DateTime::from_timestamp(secs, nanos)
+                            .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap())
+                            .naive_utc();
+
+                        let x = dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+                        // 使用 DateTime
+                        Value::DateTime(x)
+                    }
+                    Err(e) => {
+                        // ... 错误处理保持不变
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "VARCHAR" | "TEXT" => match row.try_get::<String, _>(name.as_str()) {
+                    Ok(v) => Value::String(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "FLOAT" | "DOUBLE" => match row.try_get::<f64, _>(name.as_str()) {
+                    Ok(v) => Value::Double(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "DECIMAL" => match row.try_get::<BigDecimal, _>(name.as_str()) {
+                    Ok(v) => Value::Decimal(v.to_string()), // 假设您有 Value::Decimal 变体
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                _ => {
+                    error!("Unsupported column type: {}", column.type_info().name());
+                    panic!("Unsupported column type: {}", column.type_info().name())
+                }
+            }
+        };
+
+        result.insert(column.name().to_string(), value);
+    }
+    result
 }
