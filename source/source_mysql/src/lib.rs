@@ -57,7 +57,7 @@ impl MysqlSourceConfig {
         let mut mysql_source: Vec<MysqlSourceConfigDetail> = vec![];
         // TODO 后续要支持多张表
         // split table_name
-        let table_name_list: Vec<String> = config
+        let mut table_name_list: Vec<String> = config
             .first_source("table_name")
             .split(',')
             .map(|s| s.trim().to_string())
@@ -80,6 +80,40 @@ impl MysqlSourceConfig {
             );
             let mut table_info_list: Vec<TableInfoVo> = vec![];
             let pool = MySqlPool::connect(&connection_url).await.unwrap();
+            if table_name_list.is_empty()
+                || table_name_list.len() == 1
+                    && (table_name_list[0].eq_ignore_ascii_case("all")
+                        || table_name_list[0].eq_ignore_ascii_case("*"))
+            {
+                // get all tables
+                let show_tables_sql = r#"
+                    select distinct TABLE_NAME AS table_name
+                    from information_schema.`COLUMNS`
+                    where TABLE_SCHEMA = (select database())
+                    AND COLUMN_KEY = 'PRI'
+                    AND COLUMN_TYPE = 'bigint'
+                "#;
+                // let tables: Vec<String> = sqlx::query_as::<_, TableNameFromMysql>(&show_tables_sql)
+                //     .fetch_all(&pool)
+                //     .await
+                //     .expect("query failed")
+                //     .into_iter()
+                //     .map(|row| row.table_name)
+                //     .collect();
+                let tables: Vec<String> = sqlx::query(&show_tables_sql)
+                    .fetch_all(&pool)
+                    .await
+                    .expect("query failed")
+                    .into_iter()
+                    .map(|row| mysql_row_to_hashmap(&row))
+                    .map(|row| row.get("table_name").unwrap().resolve_string())
+                    // .map(|row| row.table_name)
+                    .collect();
+                info!("get all tables: {:?}", tables);
+                table_name_list.clear();
+                table_name_list.extend(tables);
+            }
+
             for table_name in table_name_list.clone() {
                 // fill table_info
                 let show_create_table_sql = format!("show create table `{}`", table_name);
@@ -148,6 +182,11 @@ pub struct ColumnInfoFromMysql {
     pub data_type: String,
 }
 
+#[derive(Debug, FromRow)]
+pub struct TableNameFromMysql {
+    pub table_name: String,
+}
+
 impl MysqlSourceConfigDetail {
     #[inline]
     fn is_target_database_and_table(&self, database_name: &str, table_name: &str) -> bool {
@@ -206,7 +245,7 @@ impl MysqlSourceConfigDetail {
         let mut result: Vec<DataBuffer> = vec![];
         for row in rows {
             let before = HashMap::new();
-            let after = self.mysql_row_to_hashmap(&row);
+            let after = mysql_row_to_hashmap(&row);
             let op = Operation::CREATE;
             result.push(DataBuffer {
                 table_name: table_name.to_string(),
@@ -218,132 +257,134 @@ impl MysqlSourceConfigDetail {
         result
     }
 
-    #[inline]
-    fn mysql_row_to_hashmap(&self, row: &MySqlRow) -> HashMap<String, Value> {
-        let mut result = HashMap::new();
-        for row_column in row.columns().iter().enumerate() {
-            let column = row_column.1;
-            let name = column.name().to_string();
-            let is_null = row
-                .try_get_raw(name.as_str())
-                .expect("mysql_row_to_hashmap")
-                .is_null();
+}
 
-            let value = if is_null {
-                Value::None
-            } else {
-                match column.type_info().name() {
-                    "INT" => match row.try_get::<i32, _>(name.as_str()) {
-                        Ok(v) => Value::Int32(v),
-                        Err(e) => {
-                            error!("类型转换失败: {}", column.type_info().name());
-                            error!("{}", e);
-                            panic!("类型转换失败: {}", column.type_info().name());
-                        }
-                    },
-                    "BIGINT" => match row.try_get::<i64, _>(name.as_str()) {
-                        Ok(v) => Value::Int64(v),
-                        Err(e) => {
-                            error!("类型转换失败: {}", column.type_info().name());
-                            error!("{}", e);
-                            panic!("类型转换失败: {}", column.type_info().name());
-                        }
-                    },
-                    "BOOLEAN" => match row.try_get::<bool, _>(name.as_str()) {
-                        Ok(v) => {
-                            if v {
-                                Value::Int8(0)
-                            } else {
-                                Value::Int8(1)
-                            }
-                        }
-                        Err(e) => {
-                            error!("类型转换失败: {}", column.type_info().name());
-                            error!("{}", e);
-                            panic!("类型转换失败: {}", column.type_info().name());
-                        }
-                    },
-                    "TINYINT" => match row.try_get::<i8, _>(name.as_str()) {
-                        Ok(v) => Value::Int8(v),
-                        Err(e) => {
-                            error!("类型转换失败: {}", column.type_info().name());
-                            error!("{}", e);
-                            panic!("类型转换失败: {}", column.type_info().name());
-                        }
-                    },
-                    "DATE" => match row.try_get::<NaiveDate, _>(name.as_str()) {
-                        Ok(v) => Value::String(v.to_string()),
-                        Err(e) => {
-                            error!("类型转换失败: {}", column.type_info().name());
-                            error!("{}", e);
-                            panic!("类型转换失败: {}", column.type_info().name());
-                        }
-                    },
-                    "DATETIME" => match row.try_get::<NaiveDateTime, _>(name.as_str()) {
-                        Ok(v) => Value::String(v.to_string()),
-                        Err(e) => {
-                            error!("类型转换失败: {}", column.type_info().name());
-                            error!("{}", e);
-                            panic!("类型转换失败: {}", column.type_info().name());
-                        }
-                    },
-                    "TIMESTAMP" => match row.try_get::<DateTime<Utc>, _>(name.as_str()) {
-                        Ok(v) => {
-                            // 推荐：将带时区的 DateTime<Utc> 转换为 Unix 时间戳（i64 秒数）
-                            let ts_ms = v.timestamp_millis();
-                            let secs = ts_ms / 1000;
-                            let nanos = ((ts_ms % 1000) * 1_000_000) as u32;
 
-                            let dt = DateTime::from_timestamp(secs, nanos)
-                                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap())
-                                .naive_utc();
+#[inline]
+fn mysql_row_to_hashmap(row: &MySqlRow) -> HashMap<String, Value> {
+    let mut result = HashMap::new();
+    for row_column in row.columns().iter().enumerate() {
+        let column = row_column.1;
+        let name = column.name().to_string();
+        let is_null = row
+            .try_get_raw(name.as_str())
+            .expect("mysql_row_to_hashmap")
+            .is_null();
 
-                            let x = dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
-                            // 使用 DateTime
-                            Value::DateTime(x)
-                        }
-                        Err(e) => {
-                            // ... 错误处理保持不变
-                            error!("类型转换失败: {}", column.type_info().name());
-                            error!("{}", e);
-                            panic!("类型转换失败: {}", column.type_info().name());
-                        }
-                    },
-                    "VARCHAR" | "TEXT" => match row.try_get::<String, _>(name.as_str()) {
-                        Ok(v) => Value::String(v),
-                        Err(e) => {
-                            error!("类型转换失败: {}", column.type_info().name());
-                            error!("{}", e);
-                            panic!("类型转换失败: {}", column.type_info().name());
-                        }
-                    },
-                    "FLOAT" | "DOUBLE" => match row.try_get::<f64, _>(name.as_str()) {
-                        Ok(v) => Value::Double(v),
-                        Err(e) => {
-                            error!("类型转换失败: {}", column.type_info().name());
-                            error!("{}", e);
-                            panic!("类型转换失败: {}", column.type_info().name());
-                        }
-                    },
-                    "DECIMAL" => match row.try_get::<BigDecimal, _>(name.as_str()) {
-                        Ok(v) => Value::Decimal(v.to_string()), // 假设您有 Value::Decimal 变体
-                        Err(e) => {
-                            error!("类型转换失败: {}", column.type_info().name());
-                            error!("{}", e);
-                            panic!("类型转换失败: {}", column.type_info().name());
-                        }
-                    },
-                    _ => {
-                        error!("Unsupported column type: {}", column.type_info().name());
-                        panic!("Unsupported column type: {}", column.type_info().name())
+        let value = if is_null {
+            Value::None
+        } else {
+            match column.type_info().name() {
+                "INT" => match row.try_get::<i32, _>(name.as_str()) {
+                    Ok(v) => Value::Int32(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
                     }
-                }
-            };
+                },
+                "BIGINT" => match row.try_get::<i64, _>(name.as_str()) {
+                    Ok(v) => Value::Int64(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "BOOLEAN" => match row.try_get::<bool, _>(name.as_str()) {
+                    Ok(v) => {
+                        if v {
+                            Value::Int8(0)
+                        } else {
+                            Value::Int8(1)
+                        }
+                    }
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "TINYINT" => match row.try_get::<i8, _>(name.as_str()) {
+                    Ok(v) => Value::Int8(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "DATE" => match row.try_get::<NaiveDate, _>(name.as_str()) {
+                    Ok(v) => Value::String(v.to_string()),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "DATETIME" => match row.try_get::<NaiveDateTime, _>(name.as_str()) {
+                    Ok(v) => Value::String(v.to_string()),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "TIMESTAMP" => match row.try_get::<DateTime<Utc>, _>(name.as_str()) {
+                    Ok(v) => {
+                        // 推荐：将带时区的 DateTime<Utc> 转换为 Unix 时间戳（i64 秒数）
+                        let ts_ms = v.timestamp_millis();
+                        let secs = ts_ms / 1000;
+                        let nanos = ((ts_ms % 1000) * 1_000_000) as u32;
 
-            result.insert(column.name().to_string(), value);
-        }
-        result
+                        let dt = DateTime::from_timestamp(secs, nanos)
+                            .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap())
+                            .naive_utc();
+
+                        let x = dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+                        // 使用 DateTime
+                        Value::DateTime(x)
+                    }
+                    Err(e) => {
+                        // ... 错误处理保持不变
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "VARCHAR" | "TEXT" => match row.try_get::<String, _>(name.as_str()) {
+                    Ok(v) => Value::String(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "FLOAT" | "DOUBLE" => match row.try_get::<f64, _>(name.as_str()) {
+                    Ok(v) => Value::Double(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "DECIMAL" => match row.try_get::<BigDecimal, _>(name.as_str()) {
+                    Ok(v) => Value::Decimal(v.to_string()), // 假设您有 Value::Decimal 变体
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                _ => {
+                    error!("Unsupported column type: {}", column.type_info().name());
+                    panic!("Unsupported column type: {}", column.type_info().name())
+                }
+            }
+        };
+
+        result.insert(column.name().to_string(), value);
     }
+    result
 }
 
 impl MySQLSource {
@@ -470,7 +511,10 @@ impl Source for MySQLSource {
                         .await
                         .flush_with_retry(&FlushByOperation::Init)
                         .await;
-                    info!("MySQL数据源初始化完成 {}.{} count: {}", config.connection_url, table_name, count);
+                    info!(
+                        "MySQL数据源初始化完成 {}.{} count: {}",
+                        config.connection_url, table_name, count
+                    );
                 }
             }
         }
@@ -488,110 +532,106 @@ impl Source for MySQLSource {
                 let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
 
                 match stream.read().await {
-                    Ok((_header, data)) => {
-                        match data {
-                            EventData::TableMap(event) => {
-                                let table_name = event.table_name;
-                                let table_id = event.table_id;
-                                let database_name = event.database_name;
-                                table_map.insert(table_id, table_name);
-                                table_database_map.insert(table_id, database_name);
-                            }
-                            EventData::WriteRows(event) => {
-                                let table_name = table_map.get(&event.table_id).unwrap().as_str();
-                                let database_name =
-                                    table_database_map.get(&event.table_id).unwrap().as_str();
-                                if config.is_target_database_and_table(database_name, table_name) {
-                                    trace!("WriteRows: {}.{}", database_name, table_name);
-                                    for row in event.rows {
-                                        let before: HashMap<String, Value> = HashMap::new();
-                                        let after: HashMap<String, Value> =
-                                            parse_row(row, &table_name, &mut columns, config, pool)
-                                                .await;
-                                        let op = Operation::CREATE;
-                                        let data_buffer = DataBuffer {
-                                            table_name: table_name.to_string(),
-                                            before,
-                                            after,
-                                            op,
-                                        };
-                                        let plugin_data =
-                                            detail_with_plugin(plugins, data_buffer).await;
-                                        if plugin_data.is_ok() {
-                                            Self::write_record_with_retry(
-                                                &mut sink,
-                                                &plugin_data.unwrap(),
-                                            )
-                                            .await;
-                                        }
-                                    }
-                                }
-                            }
-                            EventData::DeleteRows(event) => {
-                                let table_name = table_map.get(&event.table_id).unwrap().as_str();
-                                let database_name =
-                                    table_database_map.get(&event.table_id).unwrap().as_str();
-                                if config.is_target_database_and_table(database_name, table_name) {
-                                    trace!("DeleteRows: {}.{}", database_name, table_name);
-                                    for row in event.rows {
-                                        let before: HashMap<String, Value> =
-                                            parse_row(row, &table_name, &mut columns, config, pool)
-                                                .await;
-                                        let after: HashMap<String, Value> = HashMap::new();
-                                        let op = Operation::DELETE;
-                                        let data_buffer = DataBuffer {
-                                            table_name: table_name.to_string(),
-                                            before,
-                                            after,
-                                            op,
-                                        };
-                                        let plugin_data =
-                                            detail_with_plugin(plugins, data_buffer).await;
-                                        if plugin_data.is_ok() {
-                                            Self::write_record_with_retry(
-                                                &mut sink,
-                                                &plugin_data.unwrap(),
-                                            )
-                                            .await;
-                                        }
-                                    }
-                                }
-                            }
-                            EventData::UpdateRows(event) => {
-                                let table_name = table_map.get(&event.table_id).unwrap().as_str();
-                                let database_name =
-                                    table_database_map.get(&event.table_id).unwrap().as_str();
-                                if config.is_target_database_and_table(database_name, table_name) {
-                                    trace!("UpdateRows: {}.{}", database_name, table_name);
-                                    for (b, a) in event.rows {
-                                        let before: HashMap<String, Value> =
-                                            parse_row(b, &table_name, &mut columns, config, pool)
-                                                .await;
-                                        let after: HashMap<String, Value> =
-                                            parse_row(a, &table_name, &mut columns, config, pool)
-                                                .await;
-                                        let op = Operation::UPDATE;
-                                        let data_buffer = DataBuffer {
-                                            table_name: table_name.to_string(),
-                                            before,
-                                            after,
-                                            op,
-                                        };
-                                        let plugin_data =
-                                            detail_with_plugin(plugins, data_buffer).await;
-                                        if plugin_data.is_ok() {
-                                            Self::write_record_with_retry(
-                                                &mut sink,
-                                                &plugin_data.unwrap(),
-                                            )
-                                            .await;
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
+                    Ok((_header, data)) => match data {
+                        EventData::TableMap(event) => {
+                            let table_name = event.table_name;
+                            let table_id = event.table_id;
+                            let database_name = event.database_name;
+                            table_map.insert(table_id, table_name);
+                            table_database_map.insert(table_id, database_name);
                         }
-                    }
+                        EventData::WriteRows(event) => {
+                            let table_name = table_map.get(&event.table_id).unwrap().as_str();
+                            let database_name =
+                                table_database_map.get(&event.table_id).unwrap().as_str();
+                            if config.is_target_database_and_table(database_name, table_name) {
+                                trace!("WriteRows: {}.{}", database_name, table_name);
+                                for row in event.rows {
+                                    let before: HashMap<String, Value> = HashMap::new();
+                                    let after: HashMap<String, Value> =
+                                        parse_row(row, &table_name, &mut columns, config, pool)
+                                            .await;
+                                    let op = Operation::CREATE;
+                                    let data_buffer = DataBuffer {
+                                        table_name: table_name.to_string(),
+                                        before,
+                                        after,
+                                        op,
+                                    };
+                                    let plugin_data =
+                                        detail_with_plugin(plugins, data_buffer).await;
+                                    if plugin_data.is_ok() {
+                                        Self::write_record_with_retry(
+                                            &mut sink,
+                                            &plugin_data.unwrap(),
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                        EventData::DeleteRows(event) => {
+                            let table_name = table_map.get(&event.table_id).unwrap().as_str();
+                            let database_name =
+                                table_database_map.get(&event.table_id).unwrap().as_str();
+                            if config.is_target_database_and_table(database_name, table_name) {
+                                trace!("DeleteRows: {}.{}", database_name, table_name);
+                                for row in event.rows {
+                                    let before: HashMap<String, Value> =
+                                        parse_row(row, &table_name, &mut columns, config, pool)
+                                            .await;
+                                    let after: HashMap<String, Value> = HashMap::new();
+                                    let op = Operation::DELETE;
+                                    let data_buffer = DataBuffer {
+                                        table_name: table_name.to_string(),
+                                        before,
+                                        after,
+                                        op,
+                                    };
+                                    let plugin_data =
+                                        detail_with_plugin(plugins, data_buffer).await;
+                                    if plugin_data.is_ok() {
+                                        Self::write_record_with_retry(
+                                            &mut sink,
+                                            &plugin_data.unwrap(),
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                        EventData::UpdateRows(event) => {
+                            let table_name = table_map.get(&event.table_id).unwrap().as_str();
+                            let database_name =
+                                table_database_map.get(&event.table_id).unwrap().as_str();
+                            if config.is_target_database_and_table(database_name, table_name) {
+                                trace!("UpdateRows: {}.{}", database_name, table_name);
+                                for (b, a) in event.rows {
+                                    let before: HashMap<String, Value> =
+                                        parse_row(b, &table_name, &mut columns, config, pool).await;
+                                    let after: HashMap<String, Value> =
+                                        parse_row(a, &table_name, &mut columns, config, pool).await;
+                                    let op = Operation::UPDATE;
+                                    let data_buffer = DataBuffer {
+                                        table_name: table_name.to_string(),
+                                        before,
+                                        after,
+                                        op,
+                                    };
+                                    let plugin_data =
+                                        detail_with_plugin(plugins, data_buffer).await;
+                                    if plugin_data.is_ok() {
+                                        Self::write_record_with_retry(
+                                            &mut sink,
+                                            &plugin_data.unwrap(),
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
                     Err(e) => {
                         // 打印错误信息，并且继续监听
                         error!("Error: {}", e);

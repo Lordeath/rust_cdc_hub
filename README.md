@@ -111,6 +111,7 @@ sink_config:
 - [x] (mysql sink)   auto create database
 - [x] (mysql sink)   auto create table
 - [ ] (mysql sink)   auto add column
+- [ ] (mysql sink)   all table sync
 
 
 
