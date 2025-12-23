@@ -7,6 +7,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
+use strum_macros::Display;
 use tokio::sync::Mutex;
 use tracing::error;
 
@@ -79,9 +80,11 @@ pub enum SinkType {
     // 未来可扩展：Postgres, Kafka, Mongo, 等
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Display)]
 pub enum PluginType {
+    #[strum(serialize = "column_in")]
     ColumnIn,
+    #[strum(serialize = "plus")]
     Plus,
 }
 

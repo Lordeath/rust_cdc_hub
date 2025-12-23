@@ -70,7 +70,7 @@ async fn add_plugin(config: &CdcConfig, source: &Arc<Mutex<dyn Source>>) {
         info!("正在加载插件");
         let mut plugins: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>> = vec![];
         for plugin in config.clone().plugins.unwrap().iter() {
-            // info!("正在加载插件 {}", plugin.plugin_type);
+            info!("正在加载插件 {}", plugin.plugin_type);
             let plugin = PluginFactory::create_plugin(plugin).await;
             plugins.push(plugin);
         }
