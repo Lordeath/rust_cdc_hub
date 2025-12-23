@@ -42,18 +42,7 @@ async fn main() {
     let config: CdcConfig = load_config(&config_path).expect("Failed to load config");
     info!("Config Loaded");
     let source: Arc<Mutex<dyn Source>> = SourceFactory::create_source(config.clone()).await;
-
-    if config.plugins.is_some() && !config.clone().plugins.unwrap().is_empty() {
-        info!("正在加载插件");
-        let mut plugins: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>> = vec![];
-        for plugin in config.clone().plugins.unwrap().iter() {
-            // info!("正在加载插件 {}", plugin.plugin_type);
-            let plugin = PluginFactory::create_plugin(plugin).await;
-            plugins.push(plugin);
-        }
-        source.lock().await.add_plugins(plugins).await;
-    }
-
+    add_plugin(&config, &source).await;
     info!("成功创建source");
     let table_info_list = source.lock().await.get_table_info().await;
     let sink = SinkFactory::create_sink(config.clone(), table_info_list).await;
@@ -64,6 +53,22 @@ async fn main() {
     info!("成功增加flush timer");
     let _ = source.lock().await.start(sink.clone()).await;
     info!("程序结束");
+}
+
+async fn add_plugin(config: &CdcConfig, source: &Arc<Mutex<dyn Source>>) {
+    if config.plugins.is_some() && !config.clone().plugins.unwrap().is_empty() {
+        info!("正在加载插件");
+        let mut plugins: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>> = vec![];
+        for plugin in config.clone().plugins.unwrap().iter() {
+            // info!("正在加载插件 {}", plugin.plugin_type);
+            let plugin = PluginFactory::create_plugin(plugin).await;
+            plugins.push(plugin);
+        }
+        source.lock().await.add_plugins(plugins).await;
+        info!("成功加载插件");
+    } else {
+        info!("没有插件需要加载");
+    }
 }
 
 fn add_flush_timer(config: CdcConfig, sink: &Arc<Mutex<dyn Sink + Send + Sync>>) {
