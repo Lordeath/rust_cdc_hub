@@ -105,9 +105,9 @@ impl MysqlSourceConfig {
                 // let create_table_sql = show_create_table_result.get("Create Table");
                 let create_table_sql = show_create_table_result.get(1);
                 let pk_column_sql = r#"
-                select COLUMN_NAME as column_name, COLUMN_KEY as column_key, DATA_TYPE as data_type 
-                from information_schema.`COLUMNS` 
-                where TABLE_SCHEMA = (select database()) AND TABLE_NAME = ?
+                    select COLUMN_NAME as column_name, COLUMN_KEY as column_key, DATA_TYPE as data_type
+                    from information_schema.`COLUMNS`
+                    where TABLE_SCHEMA = (select database()) AND TABLE_NAME = ?
                 "#;
                 let col_list = sqlx::query_as::<_, ColumnInfoFromMysql>(&pk_column_sql)
                     .bind(table_name.clone())
@@ -210,12 +210,12 @@ impl MysqlSourceConfigDetail {
     ) -> Vec<DataBuffer> {
         let sql = format!(
             r#"
-            select *
-            FROM {}
-            where {} > {}
-            order by {}
-            limit {}
-        "#,
+                select *
+                FROM {}
+                where {} > {}
+                order by {}
+                limit {}
+            "#,
             table_name, pk_column, id, pk_column, LOOP_PACE
         );
 
@@ -451,13 +451,14 @@ impl Source for MySQLSource {
         {
             info!("开始MySQL数据源初始化");
             let max = self.pools.len();
-            let mut count = 0;
             for i in 0..max {
                 let pool: &mut Pool<MySql> = &mut self.pools[i];
                 let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
                 for table_info_vo in config.table_info_list.clone() {
                     let table_name = table_info_vo.table_name.clone();
                     let pk_column = table_info_vo.pk_column.clone();
+                    info!("开始初始化数据源: {}.{}", config.connection_url, table_name);
+                    let mut count = 0;
 
                     // 这里进行循环，一批一批进行数据写入
                     let mut id: i64 = i64::MIN;
@@ -497,9 +498,9 @@ impl Source for MySQLSource {
                         .await
                         .flush_with_retry(&FlushByOperation::Init)
                         .await;
+                    info!("MySQL数据源初始化完成 {}.{} count: {}", config.connection_url, table_name, count);
                 }
             }
-            info!("MySQL数据源初始化完成 count: {}", count);
         }
 
         info!("Starting MySQL binlog source");
