@@ -30,7 +30,6 @@ pub struct MySQLSource {
     streams: Vec<BinlogStream>, // ✅ 多个流
     mysql_source: Vec<MysqlSourceConfigDetail>,
     pools: Vec<Pool<MySql>>,
-    // plugins: Vec<Mutex<dyn Plugin + Send + Sync>>,
     plugins: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>,
 }
 
@@ -47,8 +46,6 @@ struct MysqlSourceConfigDetail {
     host: String,
     port: String,
     database: String,
-    // table_name: String,
-    // pk_column: String,
     server_id: u64,
     connection_url: String,
     table_info_list: Vec<TableInfoVo>,
@@ -58,7 +55,6 @@ impl MysqlSourceConfig {
     pub async fn new(config: &CdcConfig) -> Self {
         let size = config.source_config.len();
         let mut mysql_source: Vec<MysqlSourceConfigDetail> = vec![];
-        // let table_name = config.first_source("table_name");
         // TODO 后续要支持多张表
         // split table_name
         let table_name_list: Vec<String> = config
@@ -73,7 +69,6 @@ impl MysqlSourceConfig {
             let host = config.source("host", i);
             let port = config.source("port", i);
             let database = config.source("database", i);
-            // let pk_column = config.source("pk_column", i);
             let server_id: u64 = config.source("server_id", i).parse::<u64>().unwrap_or(0);
             let connection_url = format!(
                 "mysql://{}:{}@{}:{}/{}",
@@ -93,16 +88,6 @@ impl MysqlSourceConfig {
                     .fetch_one(&pool)
                     .await
                     .expect("query failed");
-                // info!("show_create_table_result.columns()[0].name(): {}", show_create_table_result.columns()[0].name());
-                // info!("show_create_table_result.columns()[0].name(): {}", show_create_table_result.column(show_create_table_result.columns()[1].name()).name());
-                info!(
-                    "show_create_table_result.columns()[0].name(): {}",
-                    show_create_table_result.column(1).name()
-                );
-                // info!("show_create_table_result.columns()[0].type_info(): {}", show_create_table_result.columns()[0].type_info());
-                // info!("show_create_table_result.columns()[1].name(): {}", show_create_table_result.columns()[1].name());
-                // info!("show_create_table_result.columns()[1].type_info(): {}", show_create_table_result.columns()[1].type_info());
-                // let create_table_sql = show_create_table_result.get("Create Table");
                 let create_table_sql = show_create_table_result.get(1);
                 let pk_column_sql = r#"
                     select COLUMN_NAME as column_name, COLUMN_KEY as column_key, DATA_TYPE as data_type
@@ -114,9 +99,6 @@ impl MysqlSourceConfig {
                     .fetch_all(&pool)
                     .await
                     .expect("query failed");
-
-                // info!("col_list: {:?}", col_list[0]);
-                // info!("col_list: {:?}", col_list[1]);
 
                 let pk_column: Vec<String> = col_list
                     .iter()
@@ -138,16 +120,12 @@ impl MysqlSourceConfig {
                     columns,
                 });
             }
-            // try to get table info
-
             mysql_source.push(MysqlSourceConfigDetail {
                 username,
                 password,
                 host,
                 port,
                 database,
-                // table_name: table_name.clone(),
-                // pk_column: pk_column.clone(),
                 server_id,
                 connection_url,
                 table_info_list,
@@ -186,9 +164,6 @@ impl MysqlSourceConfigDetail {
             and c.TABLE_NAME = ?
             order by c.ORDINAL_POSITION
         "#;
-
-        // let pool: Pool<MySql> = MySqlPool::connect(&self.connection_url).await.unwrap();
-
         sqlx::query(sql)
             .bind(self.database.clone())
             .bind(table_name)
@@ -218,7 +193,6 @@ impl MysqlSourceConfigDetail {
             "#,
             table_name, pk_column, id, pk_column, LOOP_PACE
         );
-
         debug!(
             "extract_init_data: [{}.{}] {} {}",
             self.database, table_name, pk_column, id
