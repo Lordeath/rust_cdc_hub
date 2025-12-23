@@ -3,18 +3,28 @@ sink_type: MySQL
 source_config:
   - host: 127.0.0.1
     port: 3306
-    username: XXXXXXXXXXXXX
-    password: XXXXXXXXXXXXXX
-    database: XXXXXXXXXXXXX
-    table_name: table_name
+    username: XXXX
+    password: XXXXXXXXXXXXXXXXXXXXXX
+    database: XXXXXX
+    table_name: "*"
     server_id: 10000
-    pk_column: pk_column_name
+    pk_column: id
 
 sink_config:
   - host: 127.0.0.1
     port: 3306
-    username: XXXXXXXXX
-    password: XXXXXXXXXXXXXXXXXX
-    database: test
-    table_name: table_name
-    pk_column: pk_column_name
+    username: XXXX
+    password: XXXXXXXXXXXXXXXXXXXXXX
+    database: XXXXXXXXXXXX
+    pk_column: id
+
+plugins:
+  - plugin_type: ColumnIn
+    config:
+      columns: is_deleted,is_delete
+      values: 0,1
+
+  - plugin_type: Plus
+    config:
+      columns: XXXXXX.id,XXXXXXXXXXXX.event_id
+      plus: 10000000000
