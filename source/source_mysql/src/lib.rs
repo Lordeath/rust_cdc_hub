@@ -495,6 +495,7 @@ impl Source for MySQLSource {
         {
             info!("开始MySQL数据源初始化");
             let max = self.pools.len();
+            let start_all = Instant::now();
             for i in 0..max {
                 let pool: &mut Pool<MySql> = &mut self.pools[i];
                 let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
@@ -547,6 +548,7 @@ impl Source for MySQLSource {
                     );
                 }
             }
+            info!("MySQL数据源初始化完成, cost: {:?}", start_all.elapsed());
         }
 
         info!("Starting MySQL binlog source");
