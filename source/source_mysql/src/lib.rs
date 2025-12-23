@@ -104,9 +104,11 @@ impl MysqlSourceConfig {
                 // info!("show_create_table_result.columns()[1].type_info(): {}", show_create_table_result.columns()[1].type_info());
                 // let create_table_sql = show_create_table_result.get("Create Table");
                 let create_table_sql = show_create_table_result.get(1);
-                let pk_column_sql = format!(
-                    "select COLUMN_NAME as column_name, COLUMN_KEY as column_key, DATA_TYPE as data_type from information_schema.`COLUMNS` where TABLE_SCHEMA = (select database()) AND TABLE_NAME = ?"
-                );
+                let pk_column_sql = r#"
+                select COLUMN_NAME as column_name, COLUMN_KEY as column_key, DATA_TYPE as data_type 
+                from information_schema.`COLUMNS` 
+                where TABLE_SCHEMA = (select database()) AND TABLE_NAME = ?
+                "#;
                 let col_list = sqlx::query_as::<_, ColumnInfoFromMysql>(&pk_column_sql)
                     .bind(table_name.clone())
                     .fetch_all(&pool)
