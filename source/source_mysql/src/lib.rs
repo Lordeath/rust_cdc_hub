@@ -20,7 +20,7 @@ use sqlx::{MySql, Pool, TypeInfo};
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace};
 
@@ -502,6 +502,7 @@ impl Source for MySQLSource {
                     let table_name = table_info_vo.table_name.clone();
                     let pk_column = table_info_vo.pk_column.clone();
                     info!("开始初始化数据源: {}.{}", config.connection_url, table_name);
+                    let start = Instant::now();
                     let mut count = 0;
                     // 这里进行循环，一批一批进行数据写入
                     let mut id: i64 = i64::MIN;
@@ -541,8 +542,8 @@ impl Source for MySQLSource {
                         .flush_with_retry(&FlushByOperation::Init)
                         .await;
                     info!(
-                        "MySQL数据源初始化完成 {}.{} count: {}",
-                        config.connection_url, table_name, count
+                        "MySQL数据源初始化完成 {}.{} count: {} cost: {:?}",
+                        config.connection_url, table_name, count, start.elapsed()
                     );
                 }
             }
