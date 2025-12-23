@@ -250,7 +250,11 @@ impl MysqlSourceConfigDetail {
             .fetch_all(pool)
             .await
             .expect("query failed");
-        info!("extract_init_data: {} rows", rows.len());
+        // info!("extract_init_data: {} rows", rows.len());
+        info!(
+            "extract_init_data: [{}.{}] {} {} {} rows",
+            self.database, table_name, pk_column, id, rows.len()
+        );
         let mut result: Vec<DataBuffer> = vec![];
         for row in rows {
             let before = HashMap::new();

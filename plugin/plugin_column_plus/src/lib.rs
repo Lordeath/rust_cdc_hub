@@ -56,7 +56,7 @@ impl Plugin for PluginPlus {
             {
                 continue;
             }
-            if data.contains_key(&column.column_name) {
+            if data.contains_key(&column.column_name) && !data.get(&column.column_name).unwrap().is_none() {
                 contains_some_column.insert(
                     column.column_name.clone(),
                     data.get(&column.column_name).unwrap().clone(),
