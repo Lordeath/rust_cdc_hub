@@ -6,9 +6,8 @@ use meilisearch_sdk::macro_helper::async_trait;
 use sqlx::{MySql, MySqlPool, Pool};
 use std::collections::HashMap;
 use std::error::Error;
-use sqlx::types::Json;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 const BATCH_SIZE: usize = 256;
 
@@ -314,20 +313,26 @@ impl Sink for MySqlSink {
 
                 for row in &inserts {
                     for col in columns {
-                        if let Some(x) = row.get(col)
-                            && !x.is_none()
-                        {
-                            if x.is_json()
-                                && (x.resolve_string().eq("null") || x.resolve_string().is_empty())
-                            {
-                                query = query.bind("null");
-                            } else if x.is_json() {
-                                query = query.bind::<Json<_>>(Json(x.resolve_string()));
+                        if let Some(x) = row.get(col) {
+                            debug!("inserting {:?} into {}.{}", x, table_name, col);
+                            if !x.is_none() {
+                                if x.is_json()
+                                    && let Value::Json(json) = x
+                                    && json.is_empty()
+                                {
+                                    // query = query.bind::<Json<_>>(Json(json));
+                                    query = query.bind("null");
+                                } else if x.is_json()
+                                    && let Value::Json(json) = x
+                                    && json.eq_ignore_ascii_case("null")
+                                {
+                                    query = query.bind("null");
+                                } else {
+                                    query = query.bind(x.resolve_string());
+                                }
                             } else {
-                                query = query.bind(x.resolve_string());
+                                query = query.bind(None::<String>);
                             }
-                        } else {
-                            query = query.bind(None::<String>);
                         }
                     }
                 }

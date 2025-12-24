@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use mysql_binlog_connector_rust::column::json::json_binary::JsonBinary;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace};
 
@@ -637,7 +638,8 @@ async fn parse_row(
             // ColumnValue::Set(v) => { data.insert(column_name, Value::Int8(v))}
             // ColumnValue::Enum(v) => { data.insert(column_name, Value::Int8(v))}
             ColumnValue::Json(v) => {
-                let value: Value = Value::Json(String::from_utf8_lossy(&v).to_string());
+                // let value: Value = Value::Json(String::from_utf8_lossy(&v).to_string());
+                let value: Value = Value::Json(JsonBinary::parse_as_string(&v).unwrap_or_else(|_| "{}".to_string()));
                 data.insert(column_name, value);
             }
             _ => {
