@@ -47,8 +47,7 @@ async fn main() {
     let table_info_list = source.lock().await.get_table_info().await;
     let sink = SinkFactory::create_sink(&config, table_info_list).await;
     info!("成功创建sink");
-    let _ = sink
-        .lock()
+    sink.lock()
         .await
         .connect()
         .await
@@ -56,7 +55,7 @@ async fn main() {
     info!("成功连接到sink");
     add_flush_timer(&config, &sink);
     info!("成功增加flush timer");
-    let _ = source
+    source
         .lock()
         .await
         .start(sink.clone())
@@ -66,10 +65,21 @@ async fn main() {
 }
 
 async fn add_plugin(config: &CdcConfig, source: &Arc<Mutex<dyn Source>>) {
-    if config.plugins.is_some() && !config.clone().plugins.unwrap_or_else(|| panic!("plugins not found")).is_empty() {
+    if config.plugins.is_some()
+        && !config
+            .clone()
+            .plugins
+            .unwrap_or_else(|| panic!("plugins not found"))
+            .is_empty()
+    {
         info!("正在加载插件");
         let mut plugins: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>> = vec![];
-        for plugin in config.clone().plugins.unwrap_or_else(|| panic!("plugins not found")).iter() {
+        for plugin in config
+            .clone()
+            .plugins
+            .unwrap_or_else(|| panic!("plugins not found"))
+            .iter()
+        {
             info!("正在加载插件 {}", plugin.plugin_type);
             let plugin = PluginFactory::create_plugin(plugin).await;
             plugins.push(plugin);

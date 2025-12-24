@@ -475,7 +475,7 @@ impl Source for MySQLSource {
                                 trace!("DeleteRows: {}.{}", database_name, table_name);
                                 for row in event.rows {
                                     let before: HashMap<String, Value> =
-                                        parse_row(row, &table_name, &mut columns, config, pool)
+                                        parse_row(row, table_name, &mut columns, config, pool)
                                             .await;
                                     let after: HashMap<String, Value> = HashMap::new();
                                     let op = Operation::DELETE;
@@ -508,9 +508,9 @@ impl Source for MySQLSource {
                                 trace!("UpdateRows: {}.{}", database_name, table_name);
                                 for (b, a) in event.rows {
                                     let before: HashMap<String, Value> =
-                                        parse_row(b, &table_name, &mut columns, config, pool).await;
+                                        parse_row(b, table_name, &mut columns, config, pool).await;
                                     let after: HashMap<String, Value> =
-                                        parse_row(a, &table_name, &mut columns, config, pool).await;
+                                        parse_row(a, table_name, &mut columns, config, pool).await;
                                     let op = Operation::UPDATE;
                                     let data_buffer = DataBuffer {
                                         table_name: table_name.to_string(),
@@ -520,10 +520,10 @@ impl Source for MySQLSource {
                                     };
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;
-                                    if plugin_data.is_ok() {
+                                    if let Ok(item) = plugin_data {
                                         Self::write_record_with_retry(
                                             &mut sink,
-                                            &plugin_data.unwrap(),
+                                            &item,
                                         )
                                         .await;
                                     }
@@ -561,7 +561,7 @@ async fn parse_row(
     let mut data: HashMap<String, Value> = HashMap::new();
     let mut index = 0;
     if columns.lock().await.len() != row.column_values.len() {
-        let columns_new = config.fill_table_column(&table_name, pool).await;
+        let columns_new = config.fill_table_column(table_name, pool).await;
         columns.lock().await.clear();
         columns.lock().await.extend(columns_new);
     }

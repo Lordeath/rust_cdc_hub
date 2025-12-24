@@ -13,8 +13,6 @@ const BATCH_SIZE: usize = 256;
 
 pub struct MySqlSink {
     pool: Pool<MySql>,
-    // table_name_list: Vec<String>,
-    // pk_column: String,
     table_info_list: Vec<TableInfoVo>,
     buffer: Mutex<Vec<DataBuffer>>,
     initialized: RwLock<bool>,
@@ -78,8 +76,6 @@ impl MySqlSink {
         MySqlSink {
             pool,
             table_info_list,
-            // table_name_list: vec![table_name],
-            // pk_column,
             buffer: Mutex::new(Vec::with_capacity(BATCH_SIZE)),
             initialized: RwLock::new(false),
             table_info_cache: Mutex::new(HashMap::new()),
@@ -127,16 +123,15 @@ impl MySqlSink {
         Ok(pool)
     }
 
-    async fn get_pk_name_from_cache(&self, table_name: &String) -> String {
-        let pk_name = self
+    async fn get_pk_name_from_cache(&self, table_name: &str) -> String {
+        self
             .table_info_cache
             .lock()
             .await
-            .get(&table_name.clone())
+            .get(table_name)
             .unwrap()
             .pk_column
-            .to_string();
-        pk_name
+            .to_string()
     }
 }
 
@@ -196,22 +191,15 @@ impl Sink for MySqlSink {
         let batch = std::mem::take(&mut *buf);
         drop(buf);
 
-        // let mut inserts = vec![];
-        // let mut deletes: Vec<String> = vec![];
         let mut insert_map: HashMap<String, Vec<HashMap<String, Value>>> = HashMap::new();
         let mut delete_map: HashMap<String, Vec<String>> = HashMap::new();
-
-        // let pk_name = self.pk_column.as_str();
 
         let mut cache_for_roll_back: Vec<DataBuffer> = vec![];
         for r in batch {
             let table_name = r.table_name.clone();
-            // let mut table_info_vo = self.table_info_cache.lock().await
-            //     .get(&table_name);
             if !self.table_info_cache.lock().await.contains_key(&table_name) {
                 for table_info in &self.table_info_list {
                     if table_info.table_name == table_name {
-                        // table_info_vo = Some(&table_info);
                         self.table_info_cache
                             .lock()
                             .await
@@ -294,14 +282,6 @@ impl Sink for MySqlSink {
         if !insert_map.is_empty() {
             for (table_name, inserts) in insert_map {
                 let columns = column_map.get(&table_name).unwrap();
-                // let pk_name = self
-                //     .table_info_cache
-                //     .lock()
-                //     .await
-                //     .get(&table_name)
-                //     .unwrap()
-                //     .pk_column
-                //     .to_string();
                 let pk_name = self.get_pk_name_from_cache(&table_name).await;
                 let cols_str = columns
                     .iter()

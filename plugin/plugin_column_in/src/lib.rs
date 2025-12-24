@@ -41,14 +41,6 @@ impl Plugin for PluginColumnIn {
         };
         let mut contains_some_column = Value::None;
         for column in &self.columns {
-            // if data.contains_key(column) {
-            //     contains_some_column = data.get(column).unwrap().clone();
-            //     break;
-            // }
-            // if data.contains_key(column.to_lowercase().as_str()) {
-            //     contains_some_column = data.get(column.to_lowercase().as_str()).unwrap().clone();
-            //     break;
-            // }
             let mut key_matches = "";
             for (key, _value) in data {
                 if key.eq_ignore_ascii_case(column) {
