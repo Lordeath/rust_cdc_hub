@@ -41,14 +41,14 @@ impl Plugin for PluginColumnIn {
         };
         let mut contains_some_column = Value::None;
         for column in &self.columns {
-            if data.contains_key(column) {
-                contains_some_column = data.get(column).unwrap().clone();
-                break;
-            }
-            if data.contains_key(column.to_lowercase().as_str()) {
-                contains_some_column = data.get(column.to_lowercase().as_str()).unwrap().clone();
-                break;
-            }
+            // if data.contains_key(column) {
+            //     contains_some_column = data.get(column).unwrap().clone();
+            //     break;
+            // }
+            // if data.contains_key(column.to_lowercase().as_str()) {
+            //     contains_some_column = data.get(column.to_lowercase().as_str()).unwrap().clone();
+            //     break;
+            // }
             let mut key_matches = "";
             for (key, _value) in data {
                 if key.eq_ignore_ascii_case(column) {
@@ -57,10 +57,12 @@ impl Plugin for PluginColumnIn {
                 }
             }
             if data.contains_key(key_matches) {
-                contains_some_column = data.get(key_matches).unwrap().clone();
+                contains_some_column = match data.get(key_matches) {
+                    None => Value::None,
+                    Some(x) => x.clone(),
+                };
                 break;
             }
-
         }
         if contains_some_column.is_none() {
             return Ok(data_buffer.clone());

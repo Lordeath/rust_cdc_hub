@@ -1,7 +1,7 @@
 extern crate core;
 
 use async_trait::async_trait;
-use common::{mysql_row_to_hashmap, CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value};
+use common::{CdcConfig, DataBuffer, Operation, Plugin, Sink, Source, TableInfoVo, Value, mysql_row_to_hashmap, FlushByOperation};
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
@@ -11,15 +11,14 @@ use serde::Deserialize;
 use serde::Serialize;
 use sqlx::FromRow;
 use sqlx::mysql::MySqlRow;
-use sqlx::{MySqlPool, Row};
 use sqlx::{MySql, Pool};
+use sqlx::{MySqlPool, Row};
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace};
-
 
 const LOOP_PACE: usize = 8192;
 
@@ -117,7 +116,7 @@ impl MysqlSourceConfig {
                     .expect("query failed")
                     .into_iter()
                     .map(|row| mysql_row_to_hashmap(&row))
-                    .map(|row| row.get("table_name").unwrap().resolve_string())
+                    .map(|row| row.get("table_name").unwrap_or_else(|| panic!("table_name not found")).resolve_string())
                     // .map(|row| row.table_name)
                     .collect();
                 info!("get all tables: {:?}", tables);
@@ -139,7 +138,7 @@ impl MysqlSourceConfig {
                     from information_schema.`COLUMNS`
                     where TABLE_SCHEMA = (select database()) AND TABLE_NAME = ?
                 "#;
-                let col_list = sqlx::query_as::<_, ColumnInfoFromMysql>(&pk_column_sql)
+                let col_list = sqlx::query_as::<_, ColumnInfoFromMysql>(pk_column_sql)
                     .bind(table_name.clone())
                     .fetch_all(&pool)
                     .await
@@ -196,8 +195,15 @@ pub struct ColumnInfoFromMysql {
 impl MysqlSourceConfigDetail {
     #[inline]
     fn is_target_database_and_table(&self, database_name: &str, table_name: &str) -> bool {
-        self.database.eq_ignore_ascii_case(database_name)
-            && table_name.eq_ignore_ascii_case(table_name)
+        if !self.database.eq_ignore_ascii_case(database_name) {
+            return false;
+        }
+        for table_info in &self.table_info_list {
+            if table_name.eq_ignore_ascii_case(&table_info.table_name) {
+                return true;
+            }
+        }
+        false
     }
 
     #[inline]
@@ -334,7 +340,7 @@ async fn detail_with_plugin(
     let mut data_buffer = data_buffer;
     for p in plugins {
         let after_plugin = p.lock().await.collect(data_buffer.clone()).await;
-        if !after_plugin.is_ok() {
+        if after_plugin.is_err() {
             return Err(());
         }
         data_buffer = after_plugin?;
@@ -371,8 +377,8 @@ impl Source for MySQLSource {
                         for data_buffer in data_buffer_list.iter().take(len) {
                             let plugin_data =
                                 detail_with_plugin(plugins, data_buffer.clone()).await;
-                            if plugin_data.is_ok() {
-                                Self::write_record_with_retry(&mut sink, &plugin_data.unwrap())
+                            if let Ok(item) = plugin_data {
+                                Self::write_record_with_retry(&mut sink, &item)
                                     .await;
                             }
                             let this_id = data_buffer.after.get(&pk_column).unwrap_or_else(|| {
@@ -432,15 +438,15 @@ impl Source for MySQLSource {
                             table_database_map.insert(table_id, database_name);
                         }
                         EventData::WriteRows(event) => {
-                            let table_name = table_map.get(&event.table_id).unwrap().as_str();
+                            let table_name = table_map.get(&event.table_id).unwrap_or_else(|| panic!("Table id {} not found", event.table_id)).as_str();
                             let database_name =
-                                table_database_map.get(&event.table_id).unwrap().as_str();
+                                table_database_map.get(&event.table_id).unwrap_or_else(|| panic!("Table id {} not found", event.table_id)).as_str();
                             if config.is_target_database_and_table(database_name, table_name) {
                                 trace!("WriteRows: {}.{}", database_name, table_name);
                                 for row in event.rows {
                                     let before: HashMap<String, Value> = HashMap::new();
                                     let after: HashMap<String, Value> =
-                                        parse_row(row, &table_name, &mut columns, config, pool)
+                                        parse_row(row, table_name, &mut columns, config, pool)
                                             .await;
                                     let op = Operation::CREATE;
                                     let data_buffer = DataBuffer {
@@ -451,10 +457,10 @@ impl Source for MySQLSource {
                                     };
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;
-                                    if plugin_data.is_ok() {
+                                    if let Ok(item) = plugin_data {
                                         Self::write_record_with_retry(
                                             &mut sink,
-                                            &plugin_data.unwrap(),
+                                            &item,
                                         )
                                         .await;
                                     }
@@ -462,9 +468,9 @@ impl Source for MySQLSource {
                             }
                         }
                         EventData::DeleteRows(event) => {
-                            let table_name = table_map.get(&event.table_id).unwrap().as_str();
+                            let table_name = table_map.get(&event.table_id).unwrap_or_else(|| panic!("Table id {} not found", event.table_id)).as_str();
                             let database_name =
-                                table_database_map.get(&event.table_id).unwrap().as_str();
+                                table_database_map.get(&event.table_id).unwrap_or_else(|| panic!("Table id {} not found", event.table_id)).as_str();
                             if config.is_target_database_and_table(database_name, table_name) {
                                 trace!("DeleteRows: {}.{}", database_name, table_name);
                                 for row in event.rows {
@@ -481,10 +487,10 @@ impl Source for MySQLSource {
                                     };
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;
-                                    if plugin_data.is_ok() {
+                                    if let Ok(item) = plugin_data {
                                         Self::write_record_with_retry(
                                             &mut sink,
-                                            &plugin_data.unwrap(),
+                                            &item,
                                         )
                                         .await;
                                     }
@@ -492,9 +498,12 @@ impl Source for MySQLSource {
                             }
                         }
                         EventData::UpdateRows(event) => {
-                            let table_name = table_map.get(&event.table_id).unwrap().as_str();
+                            let table_name = table_map
+                                .get(&event.table_id)
+                                .unwrap_or_else(|| panic!("Table id {} not found", event.table_id))
+                                .as_str();
                             let database_name =
-                                table_database_map.get(&event.table_id).unwrap().as_str();
+                                table_database_map.get(&event.table_id).unwrap_or_else(|| panic!("Table id {} not found", event.table_id)).as_str();
                             if config.is_target_database_and_table(database_name, table_name) {
                                 trace!("UpdateRows: {}.{}", database_name, table_name);
                                 for (b, a) in event.rows {

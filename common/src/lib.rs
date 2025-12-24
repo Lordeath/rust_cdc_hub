@@ -11,10 +11,10 @@ use strum_macros::Display;
 use tokio::sync::Mutex;
 use tracing::error;
 
+use sqlx::TypeInfo;
 use sqlx::mysql::MySqlRow;
-use sqlx::types::{BigDecimal};
+use sqlx::types::BigDecimal;
 use sqlx::{Column, Row, ValueRef};
-use sqlx::{TypeInfo};
 
 use serde_json::Value as JsonValue;
 
@@ -48,7 +48,7 @@ pub trait Sink: Send + Sync {
             }
             error!(
                 "error occurred {} loop_count: {}",
-                sink_result.err().unwrap().to_string(),
+                sink_result.expect_err("error not found").to_string(),
                 loop_count
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -161,10 +161,14 @@ pub struct DataBuffer {
 
 impl DataBuffer {
     pub fn get_column_before(&self, column_name: &str) -> &Value {
-        self.before.get(column_name.to_lowercase().as_str()).unwrap_or(&Value::None)
+        self.before
+            .get(column_name.to_lowercase().as_str())
+            .unwrap_or(&Value::None)
     }
     pub fn get_column_after(&self, column_name: &str) -> &Value {
-        self.after.get(column_name.to_lowercase().as_str()).unwrap_or(&Value::None)
+        self.after
+            .get(column_name.to_lowercase().as_str())
+            .unwrap_or(&Value::None)
     }
     pub fn get_pk(&self, pk_name: &str) -> &Value {
         let mut result = self.get_column_after(pk_name);
@@ -256,7 +260,8 @@ impl Value {
                     .expect("invalid timestamp");
 
                 // 转成东八区
-                let offset = FixedOffset::east_opt(8 * 3600).unwrap();
+                let offset =
+                    FixedOffset::east_opt(8 * 3600).unwrap_or_else(|| panic!("invalid offset"));
                 let dt_utc8 = utc_dt.with_timezone(&offset);
 
                 dt_utc8.format("%Y-%m-%d %H:%M:%S").to_string()
@@ -497,7 +502,10 @@ pub fn mysql_row_to_hashmap(row: &MySqlRow) -> HashMap<String, Value> {
                         let nanos = ((ts_ms % 1000) * 1_000_000) as u32;
 
                         let dt = DateTime::from_timestamp(secs, nanos)
-                            .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap())
+                            .unwrap_or_else(|| {
+                                DateTime::from_timestamp(0, 0)
+                                    .unwrap_or_else(|| panic!("无法创建 DateTime"))
+                            })
                             .naive_utc();
 
                         let x = dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
@@ -555,7 +563,6 @@ pub fn mysql_row_to_hashmap(row: &MySqlRow) -> HashMap<String, Value> {
     result
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,5 +594,3 @@ mod tests {
         assert_eq!(v.resolve_string(), "null");
     }
 }
-
-

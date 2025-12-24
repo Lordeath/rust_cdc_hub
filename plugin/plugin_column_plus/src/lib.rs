@@ -23,8 +23,14 @@ impl PluginPlus {
             .map(|s| {
                 let mut split = s.split(".");
                 ColumnInfoDetail {
-                    table_name: split.next().unwrap().to_string(),
-                    column_name: split.next().unwrap().to_string(),
+                    table_name: split
+                        .next()
+                        .unwrap_or_else(|| panic!("table_name must be set"))
+                        .to_string(),
+                    column_name: split
+                        .next()
+                        .unwrap_or_else(|| panic!("column_name must be set"))
+                        .to_string(),
                 }
             })
             .collect();
@@ -58,10 +64,7 @@ impl Plugin for PluginPlus {
             }
             for (k, v) in &data {
                 if k.eq_ignore_ascii_case(&column.column_name) && !v.is_none() {
-                    contains_some_column.insert(
-                        column.column_name.clone(),
-                        v.clone(),
-                    );
+                    contains_some_column.insert(column.column_name.clone(), v.clone());
                     break;
                 }
             }

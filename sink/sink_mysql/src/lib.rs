@@ -1,4 +1,7 @@
-use common::{mysql_row_to_hashmap, CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value};
+use common::{
+    CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value,
+    mysql_row_to_hashmap,
+};
 use meilisearch_sdk::macro_helper::async_trait;
 use sqlx::{MySql, MySqlPool, Pool};
 use std::collections::HashMap;
@@ -122,6 +125,18 @@ impl MySqlSink {
             }
         };
         Ok(pool)
+    }
+
+    async fn get_pk_name_from_cache(&self, table_name: &String) -> String {
+        let pk_name = self
+            .table_info_cache
+            .lock()
+            .await
+            .get(&table_name.clone())
+            .unwrap()
+            .pk_column
+            .to_string();
+        pk_name
     }
 }
 
@@ -271,7 +286,7 @@ impl Sink for MySqlSink {
             *self.initialized.write().await = true;
         }
 
-        let column_map = { self.columns_cache.lock().await.clone() };
+        let column_map = self.columns_cache.lock().await;
 
         // ======================================
         //       批量 UPSERT（INSERT ... ON DUP）
@@ -279,14 +294,15 @@ impl Sink for MySqlSink {
         if !insert_map.is_empty() {
             for (table_name, inserts) in insert_map {
                 let columns = column_map.get(&table_name).unwrap();
-                let pk_name = self
-                    .table_info_cache
-                    .lock()
-                    .await
-                    .get(&table_name)
-                    .unwrap()
-                    .pk_column
-                    .to_string();
+                // let pk_name = self
+                //     .table_info_cache
+                //     .lock()
+                //     .await
+                //     .get(&table_name)
+                //     .unwrap()
+                //     .pk_column
+                //     .to_string();
+                let pk_name = self.get_pk_name_from_cache(&table_name).await;
                 let cols_str = columns
                     .iter()
                     .map(|c| format!("`{}`", c))
@@ -349,14 +365,7 @@ impl Sink for MySqlSink {
         for (table_name, deletes) in delete_map {
             if !deletes.is_empty() {
                 // let table_info_vo = self.table_info_cache.lock().await.get(&table_name).unwrap();
-                let pk_name = self
-                    .table_info_cache
-                    .lock()
-                    .await
-                    .get(&table_name)
-                    .unwrap()
-                    .pk_column
-                    .to_string();
+                let pk_name = self.get_pk_name_from_cache(&table_name).await;
                 let ph = (0..deletes.len())
                     .map(|_| "?")
                     .collect::<Vec<_>>()
