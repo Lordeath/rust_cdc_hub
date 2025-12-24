@@ -124,8 +124,7 @@ impl MySqlSink {
     }
 
     async fn get_pk_name_from_cache(&self, table_name: &str) -> String {
-        self
-            .table_info_cache
+        self.table_info_cache
             .lock()
             .await
             .get(table_name)
@@ -314,15 +313,23 @@ impl Sink for MySqlSink {
 
                 for row in &inserts {
                     for col in columns {
-                        // let value = row.get(col);
-                        let v = row
-                            .get(col)
-                            .map(|v| v.resolve_string())
-                            .unwrap_or_else(|| "null".to_string());
-                        if v.eq("null") {
-                            query = query.bind(None::<String>);
+                        if let Some(x) = row.get(col)
+                            && !x.is_none()
+                        {
+                            if x.is_json()
+                                && (x.resolve_string().eq("null") || x.resolve_string().is_empty())
+                            {
+                                query = query.bind("null");
+                            } else {
+                                query = query.bind(x.resolve_string());
+                            }
+                            // if "noReminderInfoJson".eq_ignore_ascii_case(col) {
+                            //     info!("noReminderInfoJson {}", x.resolve_string());
+                            //     info!("is_json {}", x.is_json());
+                            //     info!("x {}", x);
+                            // }
                         } else {
-                            query = query.bind(v);
+                            query = query.bind(None::<String>);
                         }
                     }
                 }

@@ -95,27 +95,26 @@ fn add_flush_timer(config: &CdcConfig, sink: &Arc<Mutex<dyn Sink + Send + Sync>>
     let flush_interval_secs = config
         .first_sink("flush_interval_secs")
         .parse::<u64>()
-        .unwrap_or(15);
+        .unwrap_or(1);
     let sink_for_timer = sink.clone();
     tokio::spawn(async move {
-        info!(
-            "MeiliSearch Sink Timer started ({}s window).",
-            flush_interval_secs
-        );
+        info!("Sink Timer started ({}s window).", flush_interval_secs);
         let timer_interval = Duration::from_secs(flush_interval_secs);
 
         loop {
             // 等待时间窗口到达
             sleep(timer_interval).await;
 
-            if let Err(e) = sink_for_timer
+            // if let Err(e) =
+            sink_for_timer
                 .lock()
                 .await
-                .flush(&FlushByOperation::Timer)
-                .await
-            {
-                error!("Automatic flush triggered by timer failed: {}", e)
-            }
+                .flush_with_retry(&FlushByOperation::Timer)
+                .await;
+            // {
+            //     error!("Automatic flush triggered by timer failed: {}", e);
+            //     panic!("{}", e)
+            // }
         }
     });
 }

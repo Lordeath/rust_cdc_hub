@@ -186,7 +186,7 @@ pub enum FlushByOperation {
     Cdc,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Display)]
 pub enum Value {
     // Str(String),
     // Num(i64),
@@ -230,6 +230,7 @@ pub enum Value {
     String(String),
     // A datatype containing binary large objects
     Blob(String),
+    Json(String),
     // A datatype containing a set of bit
     Bit(u64),
 }
@@ -268,6 +269,7 @@ impl Value {
             }
             Value::Year(s) => s.to_string(),
             Value::Blob(s) => s.to_string(),
+            Value::Json(s) => s.to_string(),
             Value::Bit(s) => s.to_string(),
             Value::None => "null".to_string(),
         }
@@ -275,6 +277,9 @@ impl Value {
 
     pub fn is_none(&self) -> bool {
         matches!(self, Value::None)
+    }
+    pub fn is_json(&self) -> bool {
+        matches!(self, Value::Json(_))
     }
 }
 
@@ -290,6 +295,7 @@ impl Serialize for Value {
             | Value::Time(s)
             | Value::Date(s)
             | Value::DateTime(s)
+            | Value::Json(s)
             | Value::Blob(s) => serializer.serialize_str(s.as_str()),
             Value::Int8(v) => serializer.serialize_i8(*v),
             Value::Int16(v) => serializer.serialize_i16(*v),
@@ -528,7 +534,7 @@ pub fn mysql_row_to_hashmap(row: &MySqlRow) -> HashMap<String, Value> {
                     }
                 },
                 "JSON" => match row.try_get::<JsonValue, &str>(name.as_str()) {
-                    Ok(v) => Value::String(v.to_string()),
+                    Ok(v) => Value::Json(v.to_string()),
                     Err(e) => {
                         error!("类型转换失败: {}", column.type_info().name());
                         error!("{}", e);
