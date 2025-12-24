@@ -571,9 +571,6 @@ async fn parse_row(
 
     for column_value in row.column_values {
         let column_name = columns.lock().await[index].clone();
-        if column_name.eq_ignore_ascii_case("noReminderInfoJson") {
-            info!("noReminderInfoJson:");
-        }
         match column_value {
             ColumnValue::None => {
                 data.insert(column_name, Value::None);

@@ -6,6 +6,7 @@ use meilisearch_sdk::macro_helper::async_trait;
 use sqlx::{MySql, MySqlPool, Pool};
 use std::collections::HashMap;
 use std::error::Error;
+use sqlx::types::Json;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
 
@@ -321,13 +322,12 @@ impl Sink for MySqlSink {
                             {
                                 query = query.bind("null");
                             } else {
-                                query = query.bind(x.resolve_string());
+                                if x.is_json() {
+                                    query = query.bind::<Json<_>>(Json(x.resolve_string()));
+                                } else {
+                                    query = query.bind(x.resolve_string());
+                                }
                             }
-                            // if "noReminderInfoJson".eq_ignore_ascii_case(col) {
-                            //     info!("noReminderInfoJson {}", x.resolve_string());
-                            //     info!("is_json {}", x.is_json());
-                            //     info!("x {}", x);
-                            // }
                         } else {
                             query = query.bind(None::<String>);
                         }
