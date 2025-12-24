@@ -104,17 +104,11 @@ fn add_flush_timer(config: &CdcConfig, sink: &Arc<Mutex<dyn Sink + Send + Sync>>
         loop {
             // 等待时间窗口到达
             sleep(timer_interval).await;
-
-            // if let Err(e) =
             sink_for_timer
                 .lock()
                 .await
                 .flush_with_retry(&FlushByOperation::Timer)
                 .await;
-            // {
-            //     error!("Automatic flush triggered by timer failed: {}", e);
-            //     panic!("{}", e)
-            // }
         }
     });
 }
