@@ -1,10 +1,14 @@
 extern crate core;
 
 use async_trait::async_trait;
-use common::{CdcConfig, DataBuffer, Operation, Plugin, Sink, Source, TableInfoVo, Value, mysql_row_to_hashmap, FlushByOperation};
+use common::{
+    CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value,
+    mysql_row_to_hashmap,
+};
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
+use mysql_binlog_connector_rust::column::json::json_binary::JsonBinary;
 use mysql_binlog_connector_rust::event::event_data::EventData;
 use mysql_binlog_connector_rust::event::row_event::RowEvent;
 use serde::Deserialize;
@@ -17,7 +21,6 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use mysql_binlog_connector_rust::column::json::json_binary::JsonBinary;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace};
 
@@ -117,7 +120,11 @@ impl MysqlSourceConfig {
                     .expect("query failed")
                     .into_iter()
                     .map(|row| mysql_row_to_hashmap(&row))
-                    .map(|row| row.get("table_name").unwrap_or_else(|| panic!("table_name not found")).resolve_string())
+                    .map(|row| {
+                        row.get("table_name")
+                            .unwrap_or_else(|| panic!("table_name not found"))
+                            .resolve_string()
+                    })
                     // .map(|row| row.table_name)
                     .collect();
                 info!("get all tables: {:?}", tables);
@@ -379,8 +386,7 @@ impl Source for MySQLSource {
                             let plugin_data =
                                 detail_with_plugin(plugins, data_buffer.clone()).await;
                             if let Ok(item) = plugin_data {
-                                Self::write_record_with_retry(&mut sink, &item)
-                                    .await;
+                                Self::write_record_with_retry(&mut sink, &item).await;
                             }
                             let this_id = data_buffer.after.get(&pk_column).unwrap_or_else(|| {
                                 panic!("pk_column not found: {}", pk_column.as_str())
@@ -439,9 +445,14 @@ impl Source for MySQLSource {
                             table_database_map.insert(table_id, database_name);
                         }
                         EventData::WriteRows(event) => {
-                            let table_name = table_map.get(&event.table_id).unwrap_or_else(|| panic!("Table id {} not found", event.table_id)).as_str();
-                            let database_name =
-                                table_database_map.get(&event.table_id).unwrap_or_else(|| panic!("Table id {} not found", event.table_id)).as_str();
+                            let table_name = table_map
+                                .get(&event.table_id)
+                                .unwrap_or_else(|| panic!("Table id {} not found", event.table_id))
+                                .as_str();
+                            let database_name = table_database_map
+                                .get(&event.table_id)
+                                .unwrap_or_else(|| panic!("Table id {} not found", event.table_id))
+                                .as_str();
                             if config.is_target_database_and_table(database_name, table_name) {
                                 trace!("WriteRows: {}.{}", database_name, table_name);
                                 for row in event.rows {
@@ -459,19 +470,20 @@ impl Source for MySQLSource {
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;
                                     if let Ok(item) = plugin_data {
-                                        Self::write_record_with_retry(
-                                            &mut sink,
-                                            &item,
-                                        )
-                                        .await;
+                                        Self::write_record_with_retry(&mut sink, &item).await;
                                     }
                                 }
                             }
                         }
                         EventData::DeleteRows(event) => {
-                            let table_name = table_map.get(&event.table_id).unwrap_or_else(|| panic!("Table id {} not found", event.table_id)).as_str();
-                            let database_name =
-                                table_database_map.get(&event.table_id).unwrap_or_else(|| panic!("Table id {} not found", event.table_id)).as_str();
+                            let table_name = table_map
+                                .get(&event.table_id)
+                                .unwrap_or_else(|| panic!("Table id {} not found", event.table_id))
+                                .as_str();
+                            let database_name = table_database_map
+                                .get(&event.table_id)
+                                .unwrap_or_else(|| panic!("Table id {} not found", event.table_id))
+                                .as_str();
                             if config.is_target_database_and_table(database_name, table_name) {
                                 trace!("DeleteRows: {}.{}", database_name, table_name);
                                 for row in event.rows {
@@ -489,11 +501,7 @@ impl Source for MySQLSource {
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;
                                     if let Ok(item) = plugin_data {
-                                        Self::write_record_with_retry(
-                                            &mut sink,
-                                            &item,
-                                        )
-                                        .await;
+                                        Self::write_record_with_retry(&mut sink, &item).await;
                                     }
                                 }
                             }
@@ -503,8 +511,10 @@ impl Source for MySQLSource {
                                 .get(&event.table_id)
                                 .unwrap_or_else(|| panic!("Table id {} not found", event.table_id))
                                 .as_str();
-                            let database_name =
-                                table_database_map.get(&event.table_id).unwrap_or_else(|| panic!("Table id {} not found", event.table_id)).as_str();
+                            let database_name = table_database_map
+                                .get(&event.table_id)
+                                .unwrap_or_else(|| panic!("Table id {} not found", event.table_id))
+                                .as_str();
                             if config.is_target_database_and_table(database_name, table_name) {
                                 trace!("UpdateRows: {}.{}", database_name, table_name);
                                 for (b, a) in event.rows {
@@ -522,11 +532,7 @@ impl Source for MySQLSource {
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;
                                     if let Ok(item) = plugin_data {
-                                        Self::write_record_with_retry(
-                                            &mut sink,
-                                            &item,
-                                        )
-                                        .await;
+                                        Self::write_record_with_retry(&mut sink, &item).await;
                                     }
                                 }
                             }
@@ -638,8 +644,13 @@ async fn parse_row(
             // ColumnValue::Set(v) => { data.insert(column_name, Value::Int8(v))}
             // ColumnValue::Enum(v) => { data.insert(column_name, Value::Int8(v))}
             ColumnValue::Json(v) => {
-                // let value: Value = Value::Json(String::from_utf8_lossy(&v).to_string());
-                let value: Value = Value::Json(JsonBinary::parse_as_string(&v).unwrap_or_else(|_| "{}".to_string()));
+                let value: Value = if v.is_empty() {
+                    Value::Json("".to_string())
+                } else {
+                    Value::Json(
+                        JsonBinary::parse_as_string(&v).unwrap_or_else(|_| "{}".to_string()),
+                    )
+                };
                 data.insert(column_name, value);
             }
             _ => {
