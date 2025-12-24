@@ -21,6 +21,7 @@ cargo run -r
 使用编译出来的程序运行
 ```sh
 export CONFIG_PATH=/mnt/d/project/meilisearch/config_example_meili.yaml
+chmod +x ./rust_cdc_hub
 ./rust_cdc_hub
 
 ```
