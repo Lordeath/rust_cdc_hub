@@ -321,12 +321,10 @@ impl Sink for MySqlSink {
                                 && (x.resolve_string().eq("null") || x.resolve_string().is_empty())
                             {
                                 query = query.bind("null");
+                            } else if x.is_json() {
+                                query = query.bind::<Json<_>>(Json(x.resolve_string()));
                             } else {
-                                if x.is_json() {
-                                    query = query.bind::<Json<_>>(Json(x.resolve_string()));
-                                } else {
-                                    query = query.bind(x.resolve_string());
-                                }
+                                query = query.bind(x.resolve_string());
                             }
                         } else {
                             query = query.bind(None::<String>);
