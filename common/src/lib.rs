@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, Utc};
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::HashMap;
@@ -262,7 +262,7 @@ impl Value {
 
                 // 转成东八区
                 let offset =
-                    FixedOffset::east_opt(8 * 3600).unwrap_or_else(|| panic!("invalid offset"));
+                    FixedOffset::east_opt(Local::now().offset().local_minus_utc()).unwrap_or_else(|| panic!("invalid offset"));
                 let dt_utc8 = utc_dt.with_timezone(&offset);
 
                 dt_utc8.format("%Y-%m-%d %H:%M:%S").to_string()
