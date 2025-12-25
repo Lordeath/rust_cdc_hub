@@ -192,13 +192,9 @@ pub enum Value {
     // Num(i64),
     // Bool(bool),
     None,
-    // A 8 bit signed integer
     Int8(i8),
-    // A 16 bit signed integer
     Int16(i16),
-    // A 32 bit signed integer
     Int32(i32),
-    // A 64 bit signed integer
     Int64(i64),
     UnsignedInt8(u8),
     UnsignedInt32(u32),
