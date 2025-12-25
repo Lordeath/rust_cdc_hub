@@ -1,9 +1,6 @@
-use common::{
-    CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value,
-    mysql_row_to_hashmap,
-};
+use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value, mysql_row_to_hashmap, get_mysql_pool_by_url};
 use meilisearch_sdk::macro_helper::async_trait;
-use sqlx::{MySql, MySqlPool, Pool};
+use sqlx::{MySql, Pool};
 use std::collections::HashMap;
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
@@ -92,15 +89,17 @@ impl MySqlSink {
         database: String,
         connection_url: &str,
     ) -> Result<Pool<MySql>, MySqlSink> {
-        let pool: Pool<MySql> = match MySqlPool::connect(connection_url).await {
+        let pool: Pool<MySql> = match get_mysql_pool_by_url(connection_url).await {
             Ok(o) => o,
             Err(e) => {
                 if config.auto_create_database.unwrap_or(true) {
-                    let pool_for_auto_create_database = MySqlPool::connect(&format!(
-                        "mysql://{}:{}@{}:{}",
-                        username, password, host, port,
-                    ))
-                    .await
+                    let pool_for_auto_create_database = get_mysql_pool_by_url(
+                               &format!(
+                                    "mysql://{}:{}@{}:{}",
+                                    username, password, host, port,
+                                )
+                            )
+                            .await
                     .unwrap();
                     let sql = format!("CREATE DATABASE IF NOT EXISTS `{}`", database.clone());
                     match sqlx::query(&sql)
@@ -113,7 +112,7 @@ impl MySqlSink {
                             panic!("Failed to create database: {}", e);
                         }
                     };
-                    let pool: Pool<MySql> = MySqlPool::connect(connection_url).await.unwrap();
+                    let pool: Pool<MySql> = get_mysql_pool_by_url(connection_url).await.unwrap();
                     return Ok(pool);
                 }
                 error!("Failed to connect to MySQL: {}", e);

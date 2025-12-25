@@ -42,7 +42,7 @@ impl Plugin for PluginColumnIn {
         let mut contains_some_column = Value::None;
         for column in &self.columns {
             let mut key_matches = "";
-            for (key, _value) in data {
+            for key in data.keys() {
                 if key.eq_ignore_ascii_case(column) {
                     key_matches = key;
                     break;

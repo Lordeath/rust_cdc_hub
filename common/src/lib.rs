@@ -11,8 +11,8 @@ use strum_macros::Display;
 use tokio::sync::Mutex;
 use tracing::error;
 
-use sqlx::TypeInfo;
-use sqlx::mysql::MySqlRow;
+use sqlx::{MySql, Pool, TypeInfo};
+use sqlx::mysql::{MySqlPoolOptions, MySqlRow};
 use sqlx::types::BigDecimal;
 use sqlx::{Column, Row, ValueRef};
 
@@ -567,6 +567,21 @@ pub fn mysql_row_to_hashmap(row: &MySqlRow) -> HashMap<String, Value> {
         result.insert(column.name().to_string(), value);
     }
     result
+}
+
+pub async fn get_mysql_pool_by_url(connection_url: &str) -> Result<Pool<MySql>, String> {
+    match MySqlPoolOptions::new()
+        // .max_connections(10)
+        // 连接空闲超过 20 分钟直接丢弃
+        .idle_timeout(Duration::from_secs(20 * 60))
+        // 不管用不用，活超过 2 小时就重建
+        .max_lifetime(Duration::from_secs(2 * 60 * 60))
+        .connect(connection_url)
+        .await
+    {
+        Ok(x) => Ok(x),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[cfg(test)]

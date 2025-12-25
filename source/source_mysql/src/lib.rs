@@ -1,10 +1,7 @@
 extern crate core;
 
 use async_trait::async_trait;
-use common::{
-    CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value,
-    mysql_row_to_hashmap,
-};
+use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value, mysql_row_to_hashmap, get_mysql_pool_by_url};
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
@@ -14,9 +11,9 @@ use mysql_binlog_connector_rust::event::row_event::RowEvent;
 use serde::Deserialize;
 use serde::Serialize;
 use sqlx::FromRow;
-use sqlx::mysql::MySqlRow;
+use sqlx::mysql::{MySqlRow};
 use sqlx::{MySql, Pool};
-use sqlx::{MySqlPool, Row};
+use sqlx::{Row};
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
@@ -79,7 +76,7 @@ impl MysqlSourceConfig {
                 database.clone(),
             );
             let mut table_info_list: Vec<TableInfoVo> = vec![];
-            let pool = MySqlPool::connect(&connection_url).await.unwrap();
+            let pool = get_mysql_pool_by_url(&connection_url).await.unwrap();
             if table_name_list.is_empty()
                 || table_name_list.len() == 1
                     && (table_name_list[0].eq_ignore_ascii_case("all")
@@ -188,6 +185,7 @@ impl MysqlSourceConfig {
             mysql_source,
         }
     }
+
 }
 
 #[derive(Debug, FromRow)]
@@ -308,7 +306,7 @@ impl MySQLSource {
 
             streams.push(client);
             mysql_source.push(cfg.mysql_source[i].clone());
-            let pool: Pool<MySql> = MySqlPool::connect(&connection_url).await.unwrap();
+            let pool: Pool<MySql> = get_mysql_pool_by_url(&connection_url).await.unwrap();
             pools.push(pool);
         }
 
