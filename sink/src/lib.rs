@@ -1,10 +1,10 @@
 use common::{CdcConfig, Sink, SinkType, TableInfoVo};
+use log::info;
 use sink_meilisearch::MeiliSearchSink;
 use sink_mysql::MySqlSink;
 use sink_print::PrintSink;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use log::info;
 
 pub struct SinkFactory;
 

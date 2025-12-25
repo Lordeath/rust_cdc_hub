@@ -11,10 +11,10 @@ use strum_macros::Display;
 use tokio::sync::Mutex;
 use tracing::error;
 
-use sqlx::{MySql, Pool, TypeInfo};
 use sqlx::mysql::{MySqlPoolOptions, MySqlRow};
 use sqlx::types::BigDecimal;
 use sqlx::{Column, Row, ValueRef};
+use sqlx::{MySql, Pool, TypeInfo};
 
 use serde_json::Value as JsonValue;
 
@@ -257,8 +257,8 @@ impl Value {
                     .expect("invalid timestamp");
 
                 // 转成东八区
-                let offset =
-                    FixedOffset::east_opt(Local::now().offset().local_minus_utc()).unwrap_or_else(|| panic!("invalid offset"));
+                let offset = FixedOffset::east_opt(Local::now().offset().local_minus_utc())
+                    .unwrap_or_else(|| panic!("invalid offset"));
                 let dt_utc8 = utc_dt.with_timezone(&offset);
 
                 dt_utc8.format("%Y-%m-%d %H:%M:%S").to_string()

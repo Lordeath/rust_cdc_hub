@@ -1,4 +1,7 @@
-use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value, mysql_row_to_hashmap, get_mysql_pool_by_url};
+use common::{
+    CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value,
+    get_mysql_pool_by_url, mysql_row_to_hashmap,
+};
 use meilisearch_sdk::macro_helper::async_trait;
 use sqlx::{MySql, Pool};
 use std::collections::HashMap;
@@ -93,13 +96,11 @@ impl MySqlSink {
             Ok(o) => o,
             Err(e) => {
                 if config.auto_create_database.unwrap_or(true) {
-                    let pool_for_auto_create_database = get_mysql_pool_by_url(
-                               &format!(
-                                    "mysql://{}:{}@{}:{}",
-                                    username, password, host, port,
-                                )
-                            )
-                            .await
+                    let pool_for_auto_create_database = get_mysql_pool_by_url(&format!(
+                        "mysql://{}:{}@{}:{}",
+                        username, password, host, port,
+                    ))
+                    .await
                     .unwrap();
                     let sql = format!("CREATE DATABASE IF NOT EXISTS `{}`", database.clone());
                     match sqlx::query(&sql)

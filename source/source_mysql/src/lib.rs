@@ -1,7 +1,10 @@
 extern crate core;
 
 use async_trait::async_trait;
-use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value, mysql_row_to_hashmap, get_mysql_pool_by_url};
+use common::{
+    CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value,
+    get_mysql_pool_by_url, mysql_row_to_hashmap,
+};
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
@@ -11,9 +14,9 @@ use mysql_binlog_connector_rust::event::row_event::RowEvent;
 use serde::Deserialize;
 use serde::Serialize;
 use sqlx::FromRow;
-use sqlx::mysql::{MySqlRow};
+use sqlx::Row;
+use sqlx::mysql::MySqlRow;
 use sqlx::{MySql, Pool};
-use sqlx::{Row};
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
@@ -185,7 +188,6 @@ impl MysqlSourceConfig {
             mysql_source,
         }
     }
-
 }
 
 #[derive(Debug, FromRow)]
