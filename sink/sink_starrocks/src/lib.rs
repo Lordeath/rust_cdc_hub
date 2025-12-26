@@ -1,16 +1,15 @@
 mod starrocks_client;
 
 use crate::starrocks_client::StarrocksClient;
-use common::{
-    CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value,
-};
+use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value};
 use meilisearch_sdk::macro_helper::async_trait;
 use std::collections::HashMap;
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::info;
+use tracing::log::trace;
 
-const BATCH_SIZE: usize = 512;
+const BATCH_SIZE: usize = 1024;
 
 pub const OP_UPSERT: u8 = 0;
 pub const OP_DELETE: u8 = 1;
@@ -54,11 +53,6 @@ impl StarrocksSink {
             columns_cache: Mutex::new(HashMap::new()),
             pks_cache: Mutex::new(HashMap::new()),
         }
-    }
-
-    pub async fn cast_to_json(&self, data_buffer: &DataBuffer) -> String {
-        let data = self.cast_to_starrocks_map(data_buffer).await;
-        serde_json::to_string(&data).unwrap()
     }
 
     pub async fn cast_to_starrocks_map(&self, data_buffer: &DataBuffer) -> HashMap<String, Value> {
@@ -170,29 +164,6 @@ impl Sink for StarrocksSink {
         let batch = std::mem::take(&mut *buf);
         drop(buf);
 
-        let mut json_list_map: HashMap<String, Vec<HashMap<String, Value>>> = HashMap::new();
-
-        let mut cache_for_roll_back: Vec<DataBuffer> = vec![];
-        for r in batch {
-            let table_name = r.table_name.clone();
-            if !self.table_info_cache.lock().await.contains_key(&table_name) {
-                for table_info in &self.table_info_list {
-                    if table_info.table_name == table_name {
-                        self.table_info_cache
-                            .lock()
-                            .await
-                            .insert(table_name.clone(), table_info.clone());
-                        break;
-                    }
-                }
-            }
-            cache_for_roll_back.push(r.clone());
-            json_list_map
-                .entry(table_name)
-                .or_default()
-                .push(self.cast_to_starrocks_map(&r).await);
-        }
-
         // 初始化字段名（只做一次）
         if !*self.initialized.read().await {
             let mut col_info: HashMap<String, Vec<String>> = HashMap::new();
@@ -217,8 +188,8 @@ impl Sink for StarrocksSink {
                     if !s.starts_with("{\"data\":[\"") {
                         continue;
                     }
-                    let pk = s[9..s.len() - 2].to_string();
-                    info!("{}", pk);
+                    let pk = s[10..s.len() - 3].to_string();
+                    info!("pk: {}", pk);
                     pks_info.entry(table_name.clone()).or_default().push(pk);
                 }
             }
@@ -227,9 +198,32 @@ impl Sink for StarrocksSink {
             *self.initialized.write().await = true;
         }
 
+        let mut json_list_map: HashMap<String, Vec<HashMap<String, Value>>> = HashMap::new();
+
+        let mut cache_for_roll_back: Vec<DataBuffer> = vec![];
+        for r in batch {
+            let table_name = r.table_name.clone();
+            if !self.table_info_cache.lock().await.contains_key(&table_name) {
+                for table_info in &self.table_info_list {
+                    if table_info.table_name == table_name {
+                        self.table_info_cache
+                            .lock()
+                            .await
+                            .insert(table_name.clone(), table_info.clone());
+                        break;
+                    }
+                }
+            }
+            cache_for_roll_back.push(r.clone());
+            json_list_map
+                .entry(table_name)
+                .or_default()
+                .push(self.cast_to_starrocks_map(&r.clone()).await);
+        }
+
         for (k, v) in json_list_map {
             let body = serde_json::to_string(&v).expect("serialize json failed");
-            info!("数据长度: {}", v.len());
+            trace!("数据长度: {}", v.len());
             let c = &self
                 .table_info_list
                 .iter()

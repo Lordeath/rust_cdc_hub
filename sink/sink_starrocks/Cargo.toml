@@ -8,5 +8,5 @@ common = { path = "../../common" }
 meilisearch-sdk = "0"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
-reqwest = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde_json = "1.0"
