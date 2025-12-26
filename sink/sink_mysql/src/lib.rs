@@ -3,16 +3,17 @@ use common::{
     get_mysql_pool_by_url, mysql_row_to_hashmap,
 };
 use meilisearch_sdk::macro_helper::async_trait;
+use sqlx::mysql::{MySqlArguments, MySqlQueryResult};
+use sqlx::query::Query;
 use sqlx::{MySql, Pool};
 use std::collections::HashMap;
 use std::error::Error;
-use sqlx::mysql::{MySqlArguments, MySqlQueryResult};
-use sqlx::query::Query;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info};
 
 pub struct MySqlSink {
-    pool: Mutex<Pool<MySql>>,
+    pool: RwLock<Pool<MySql>>,
+    connection_url: String,
     table_info_list: Vec<TableInfoVo>,
     buffer: Mutex<Vec<DataBuffer>>,
     initialized: RwLock<bool>,
@@ -75,7 +76,8 @@ impl MySqlSink {
         }
         let sink_batch_size = config.sink_batch_size.unwrap_or(256);
         MySqlSink {
-            pool: Mutex::new(pool),
+            pool: RwLock::new(pool),
+            connection_url,
             table_info_list,
             buffer: Mutex::new(Vec::with_capacity(sink_batch_size)),
             initialized: RwLock::new(false),
@@ -135,13 +137,23 @@ impl MySqlSink {
             .to_string()
     }
 
-    async fn execute_with_retry(&self, query: &mut Query<MySql, MySqlArguments>) -> Result<MySqlQueryResult, String> {
-        let mut x = query.execute(&self.pool.lock().await).await;
-        if x.is_err() {
-            error!("Failed to execute query: {} 进行重试", x.unwrap_err());
-            x = query.execute(&self.pool.lock().await).await;
+    async fn execute_with_retry(
+        &self,
+        query: Query<'_, MySql, MySqlArguments>,
+    ) -> Result<MySqlQueryResult, String> {
+        match query.execute(&*self.pool.write().await).await {
+            Ok(ok) => Ok(ok),
+            Err(err) => {
+                error!("Failed to execute query: {} 进行重试", err);
+                match get_mysql_pool_by_url(&self.connection_url).await {
+                    Ok(new_pool) => {
+                        *self.pool.write().await = new_pool;
+                    }
+                    Err(_) => {}
+                }
+                Err(err.to_string())
+            }
         }
-        Ok(x.unwrap())
     }
 }
 
@@ -149,7 +161,9 @@ impl MySqlSink {
 impl Sink for MySqlSink {
     async fn connect(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         // 测试连接
-        sqlx::query("SELECT 1").execute(&self.pool.lock().await).await?;
+        sqlx::query("SELECT 1")
+            .execute(&*self.pool.write().await)
+            .await?;
         info!("Connected to MySQL via SQLx");
         Ok(())
     }
@@ -166,10 +180,7 @@ impl Sink for MySqlSink {
         Ok(())
     }
 
-    async fn flush(
-        &self,
-        flush_by_operation: &FlushByOperation,
-    ) -> Result<(), String> {
+    async fn flush(&self, flush_by_operation: &FlushByOperation) -> Result<(), String> {
         let mut buf = self.buffer.lock().await;
 
         match flush_by_operation {
@@ -268,7 +279,7 @@ impl Sink for MySqlSink {
                 "#;
                 let stored_cols: Vec<String> = sqlx::query(stored_cols_sql)
                     .bind(&table_name)
-                    .fetch_all(&self.pool.lock().await)
+                    .fetch_all(&*self.pool.write().await)
                     .await
                     .unwrap()
                     .iter()
@@ -349,7 +360,7 @@ impl Sink for MySqlSink {
                     }
                 }
 
-                if let Err(e) = self.execute_with_retry(&mut query).await {
+                if let Err(e) = self.execute_with_retry(query).await {
                     error!("MySQL batch UPSERT error: {:?}", e);
                     error!("need do it again: {}", cache_for_roll_back.len());
                     let mut buf = self.buffer.lock().await;
@@ -383,7 +394,7 @@ impl Sink for MySqlSink {
                     query = query.bind(pk);
                 }
 
-                if let Err(e) = self.execute_with_retry(&mut query).await {
+                if let Err(e) = self.execute_with_retry(query).await {
                     error!("MySQL batch delete error: {:?}", e);
                     error!("need do it again: {}", cache_for_roll_back.len());
                     let mut buf = self.buffer.lock().await;
