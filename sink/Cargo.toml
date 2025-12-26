@@ -8,5 +8,6 @@ common = { path = "../common" }
 sink_print = { path = "sink_print" }
 sink_meilisearch = { path = "sink_meilisearch" }
 sink_mysql = { path = "sink_mysql" }
+sink_starrocks = { path = "sink_starrocks" }
 tokio = { version = "1", features = ["full"] }
 log = "0.4.29"

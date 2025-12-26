@@ -82,6 +82,7 @@ pub enum SinkType {
     Print,
     MeiliSearch,
     MySQL,
+    Starrocks,
     // 未来可扩展：Postgres, Kafka, Mongo, 等
 }
 
@@ -124,6 +125,13 @@ impl CdcConfig {
     }
     pub fn first_sink(&self, key: &str) -> String {
         self.sink(key, 0)
+    }
+    pub fn first_sink_not_blank(&self, key: &str) -> String {
+        let x = self.sink(key, 0);
+        if x.is_empty() {
+            panic!("sink config is blank: {}", key)
+        }
+        x
     }
     pub fn first_u64_source(&self, key: &str) -> u64 {
         let value = self.first_source(key);

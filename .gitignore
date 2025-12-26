@@ -33,3 +33,4 @@ nbdist/
 /mvnw.cmd
 
 config_example_mysql.yaml
+config_example_starrocks.yaml
