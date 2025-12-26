@@ -9,13 +9,12 @@ use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info};
 
-const BATCH_SIZE: usize = 256;
-
 pub struct MySqlSink {
     pool: Pool<MySql>,
     table_info_list: Vec<TableInfoVo>,
     buffer: Mutex<Vec<DataBuffer>>,
     initialized: RwLock<bool>,
+    sink_batch_size: usize,
 
     // 缓存所有字段名（第一批数据会取一次）
     table_info_cache: Mutex<HashMap<String, TableInfoVo>>,
@@ -72,12 +71,13 @@ impl MySqlSink {
                 }
             }
         }
-
+        let sink_batch_size = config.sink_batch_size.unwrap_or(256);
         MySqlSink {
             pool,
             table_info_list,
-            buffer: Mutex::new(Vec::with_capacity(BATCH_SIZE)),
+            buffer: Mutex::new(Vec::with_capacity(sink_batch_size)),
             initialized: RwLock::new(false),
+            sink_batch_size,
             table_info_cache: Mutex::new(HashMap::new()),
             columns_cache: Mutex::new(HashMap::new()),
         }
@@ -147,7 +147,7 @@ impl Sink for MySqlSink {
         let mut buf = self.buffer.lock().await;
         buf.push(record.clone());
 
-        if buf.len() >= BATCH_SIZE {
+        if buf.len() >= self.sink_batch_size {
             drop(buf);
             self.flush_with_retry(&FlushByOperation::Signal).await;
         }

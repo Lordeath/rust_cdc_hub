@@ -9,8 +9,6 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 use tracing::log::trace;
 
-const BATCH_SIZE: usize = 1024;
-
 pub const OP_UPSERT: u8 = 0;
 pub const OP_DELETE: u8 = 1;
 
@@ -19,6 +17,7 @@ pub struct StarrocksSink {
     starrocks_client: StarrocksClient,
     health_url: String,
     database: String,
+    sink_batch_size: usize,
 
     table_info_list: Vec<TableInfoVo>,
     buffer: Mutex<Vec<DataBuffer>>,
@@ -42,12 +41,14 @@ impl StarrocksSink {
         let base_url = format!("http://{}:{}/api/", host, http_port);
         let starrocks_client: StarrocksClient =
             StarrocksClient::new(base_url.as_str(), username.as_str(), password.as_str()).await;
+        let sink_batch_size = config.sink_batch_size.unwrap_or(1024);
         StarrocksSink {
             starrocks_client,
             health_url: format!("http://{}:{}/api/health", host, http_port),
             database,
+            sink_batch_size,
             table_info_list,
-            buffer: Mutex::new(vec![]),
+            buffer: Mutex::new(Vec::with_capacity(sink_batch_size)),
             initialized: RwLock::new(false),
             table_info_cache: Mutex::new(HashMap::new()),
             columns_cache: Mutex::new(HashMap::new()),
@@ -121,7 +122,7 @@ impl Sink for StarrocksSink {
         let mut buf = self.buffer.lock().await;
         buf.push(record.clone());
 
-        if buf.len() >= BATCH_SIZE {
+        if buf.len() >= self.sink_batch_size {
             drop(buf);
             self.flush_with_retry(&FlushByOperation::Signal).await;
         }

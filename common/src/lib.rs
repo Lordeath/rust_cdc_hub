@@ -103,6 +103,8 @@ pub struct CdcConfig {
     pub auto_create_database: Option<bool>,
     pub auto_create_table: Option<bool>,
     pub plugins: Option<Vec<PluginConfig>>,
+    pub source_batch_size: Option<usize>,
+    pub sink_batch_size: Option<usize>,
 }
 
 impl CdcConfig {
