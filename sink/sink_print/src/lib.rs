@@ -32,7 +32,7 @@ impl Sink for PrintSink {
     async fn flush(
         &self,
         _from_timer: &FlushByOperation,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), String> {
         Ok(())
     }
 }

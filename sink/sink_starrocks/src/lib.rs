@@ -133,7 +133,7 @@ impl Sink for StarrocksSink {
     async fn flush(
         &self,
         flush_by_operation: &FlushByOperation,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), String> {
         let mut buf = self.buffer.lock().await;
 
         match flush_by_operation {
@@ -243,7 +243,7 @@ impl Sink for StarrocksSink {
                 for cached_data_buffer in cache_for_roll_back {
                     buf.push(cached_data_buffer);
                 }
-                return Err(result.err().unwrap());
+                return Err(result.err().unwrap().to_string());
             }
         }
 

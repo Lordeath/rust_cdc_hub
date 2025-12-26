@@ -3,6 +3,8 @@ use common::{
     get_mysql_pool_by_url, mysql_row_to_hashmap,
 };
 use meilisearch_sdk::macro_helper::async_trait;
+use sqlx::mysql::{MySqlArguments, MySqlQueryResult};
+use sqlx::query::Query;
 use sqlx::{MySql, Pool};
 use std::collections::HashMap;
 use std::error::Error;
@@ -10,7 +12,8 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info};
 
 pub struct MySqlSink {
-    pool: Pool<MySql>,
+    pool: RwLock<Pool<MySql>>,
+    connection_url: String,
     table_info_list: Vec<TableInfoVo>,
     buffer: Mutex<Vec<DataBuffer>>,
     initialized: RwLock<bool>,
@@ -73,7 +76,8 @@ impl MySqlSink {
         }
         let sink_batch_size = config.sink_batch_size.unwrap_or(256);
         MySqlSink {
-            pool,
+            pool: RwLock::new(pool),
+            connection_url,
             table_info_list,
             buffer: Mutex::new(Vec::with_capacity(sink_batch_size)),
             initialized: RwLock::new(false),
@@ -132,13 +136,34 @@ impl MySqlSink {
             .pk_column
             .to_string()
     }
+
+    async fn execute_with_retry(
+        &self,
+        query: Query<'_, MySql, MySqlArguments>,
+    ) -> Result<MySqlQueryResult, String> {
+        match query.execute(&*self.pool.write().await).await {
+            Ok(ok) => Ok(ok),
+            Err(err) => {
+                error!("Failed to execute query: {} 进行重试", err);
+                match get_mysql_pool_by_url(&self.connection_url).await {
+                    Ok(new_pool) => {
+                        *self.pool.write().await = new_pool;
+                    }
+                    Err(_) => {}
+                }
+                Err(err.to_string())
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl Sink for MySqlSink {
     async fn connect(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         // 测试连接
-        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        sqlx::query("SELECT 1")
+            .execute(&*self.pool.write().await)
+            .await?;
         info!("Connected to MySQL via SQLx");
         Ok(())
     }
@@ -155,10 +180,7 @@ impl Sink for MySqlSink {
         Ok(())
     }
 
-    async fn flush(
-        &self,
-        flush_by_operation: &FlushByOperation,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn flush(&self, flush_by_operation: &FlushByOperation) -> Result<(), String> {
         let mut buf = self.buffer.lock().await;
 
         match flush_by_operation {
@@ -257,8 +279,9 @@ impl Sink for MySqlSink {
                 "#;
                 let stored_cols: Vec<String> = sqlx::query(stored_cols_sql)
                     .bind(&table_name)
-                    .fetch_all(&self.pool)
-                    .await?
+                    .fetch_all(&*self.pool.write().await)
+                    .await
+                    .unwrap()
                     .iter()
                     .map(mysql_row_to_hashmap)
                     .map(|row| row.get("COLUMN_NAME").unwrap().resolve_string())
@@ -337,14 +360,14 @@ impl Sink for MySqlSink {
                     }
                 }
 
-                if let Err(e) = query.execute(&self.pool).await {
+                if let Err(e) = self.execute_with_retry(query).await {
                     error!("MySQL batch UPSERT error: {:?}", e);
                     error!("need do it again: {}", cache_for_roll_back.len());
                     let mut buf = self.buffer.lock().await;
                     for cached_data_buffer in cache_for_roll_back {
                         buf.push(cached_data_buffer);
                     }
-                    return Err(Box::new(e));
+                    return Err(e);
                 }
             }
         }
@@ -371,14 +394,14 @@ impl Sink for MySqlSink {
                     query = query.bind(pk);
                 }
 
-                if let Err(e) = query.execute(&self.pool).await {
+                if let Err(e) = self.execute_with_retry(query).await {
                     error!("MySQL batch delete error: {:?}", e);
                     error!("need do it again: {}", cache_for_roll_back.len());
                     let mut buf = self.buffer.lock().await;
                     for cached_data_buffer in cache_for_roll_back {
                         buf.push(cached_data_buffer);
                     }
-                    return Err(Box::new(e));
+                    return Err(e);
                 }
             }
         }

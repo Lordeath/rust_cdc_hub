@@ -70,7 +70,7 @@ impl Sink for MeiliSearchSink {
     async fn flush(
         &self,
         flush_by_operation: &FlushByOperation,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), String> {
         let mut buf = self.buffer.lock().await;
         match flush_by_operation {
             FlushByOperation::Timer => {
@@ -144,7 +144,7 @@ impl Sink for MeiliSearchSink {
             for cached_data_buffer in cache_for_roll_back {
                 buf.push(cached_data_buffer);
             }
-            return Err(Box::new(e));
+            return Err(e.to_string());
         }
 
         if !deletes.is_empty()
@@ -156,7 +156,7 @@ impl Sink for MeiliSearchSink {
             for cached_data_buffer in cache_for_roll_back {
                 buf.push(cached_data_buffer);
             }
-            return Err(Box::new(e));
+            return Err(e.to_string());
         }
 
         Ok(())
