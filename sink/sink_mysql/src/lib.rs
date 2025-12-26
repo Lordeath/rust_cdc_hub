@@ -6,11 +6,13 @@ use meilisearch_sdk::macro_helper::async_trait;
 use sqlx::{MySql, Pool};
 use std::collections::HashMap;
 use std::error::Error;
+use sqlx::mysql::{MySqlArguments, MySqlQueryResult};
+use sqlx::query::Query;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info};
 
 pub struct MySqlSink {
-    pool: Pool<MySql>,
+    pool: Mutex<Pool<MySql>>,
     table_info_list: Vec<TableInfoVo>,
     buffer: Mutex<Vec<DataBuffer>>,
     initialized: RwLock<bool>,
@@ -73,7 +75,7 @@ impl MySqlSink {
         }
         let sink_batch_size = config.sink_batch_size.unwrap_or(256);
         MySqlSink {
-            pool,
+            pool: Mutex::new(pool),
             table_info_list,
             buffer: Mutex::new(Vec::with_capacity(sink_batch_size)),
             initialized: RwLock::new(false),
@@ -132,13 +134,22 @@ impl MySqlSink {
             .pk_column
             .to_string()
     }
+
+    async fn execute_with_retry(&self, query: &mut Query<MySql, MySqlArguments>) -> Result<MySqlQueryResult, String> {
+        let mut x = query.execute(&self.pool.lock().await).await;
+        if x.is_err() {
+            error!("Failed to execute query: {} 进行重试", x.unwrap_err());
+            x = query.execute(&self.pool.lock().await).await;
+        }
+        Ok(x.unwrap())
+    }
 }
 
 #[async_trait]
 impl Sink for MySqlSink {
     async fn connect(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         // 测试连接
-        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        sqlx::query("SELECT 1").execute(&self.pool.lock().await).await?;
         info!("Connected to MySQL via SQLx");
         Ok(())
     }
@@ -158,7 +169,7 @@ impl Sink for MySqlSink {
     async fn flush(
         &self,
         flush_by_operation: &FlushByOperation,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), String> {
         let mut buf = self.buffer.lock().await;
 
         match flush_by_operation {
@@ -257,8 +268,9 @@ impl Sink for MySqlSink {
                 "#;
                 let stored_cols: Vec<String> = sqlx::query(stored_cols_sql)
                     .bind(&table_name)
-                    .fetch_all(&self.pool)
-                    .await?
+                    .fetch_all(&self.pool.lock().await)
+                    .await
+                    .unwrap()
                     .iter()
                     .map(mysql_row_to_hashmap)
                     .map(|row| row.get("COLUMN_NAME").unwrap().resolve_string())
@@ -337,14 +349,14 @@ impl Sink for MySqlSink {
                     }
                 }
 
-                if let Err(e) = query.execute(&self.pool).await {
+                if let Err(e) = self.execute_with_retry(&mut query).await {
                     error!("MySQL batch UPSERT error: {:?}", e);
                     error!("need do it again: {}", cache_for_roll_back.len());
                     let mut buf = self.buffer.lock().await;
                     for cached_data_buffer in cache_for_roll_back {
                         buf.push(cached_data_buffer);
                     }
-                    return Err(Box::new(e));
+                    return Err(e);
                 }
             }
         }
@@ -371,14 +383,14 @@ impl Sink for MySqlSink {
                     query = query.bind(pk);
                 }
 
-                if let Err(e) = query.execute(&self.pool).await {
+                if let Err(e) = self.execute_with_retry(&mut query).await {
                     error!("MySQL batch delete error: {:?}", e);
                     error!("need do it again: {}", cache_for_roll_back.len());
                     let mut buf = self.buffer.lock().await;
                     for cached_data_buffer in cache_for_roll_back {
                         buf.push(cached_data_buffer);
                     }
-                    return Err(Box::new(e));
+                    return Err(e);
                 }
             }
         }
