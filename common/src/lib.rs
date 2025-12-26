@@ -168,20 +168,57 @@ pub struct DataBuffer {
     pub binlog_filename: String,
     pub timestamp: u32,
     pub next_event_position: u32,
+
+    before_key_to_lower: HashMap<String, String>,
+    after_key_to_lower: HashMap<String, String>,
 }
 
 // pub const VALUE_NONE: Value = Value::None;
 
 impl DataBuffer {
+    pub fn new(
+        table_name: String,
+        before: HashMap<String, Value>,
+        after: HashMap<String, Value>,
+        op: Operation,
+        binlog_filename: String,
+        timestamp: u32,
+        next_event_position: u32,
+    ) -> DataBuffer {
+        let mut before_key_to_lower: HashMap<String, String> = HashMap::new();
+        for key in before.keys() {
+            before_key_to_lower.insert(key.to_lowercase(), key.clone());
+        }
+
+        let mut after_key_to_lower: HashMap<String, String> = HashMap::new();
+        for key in after.keys() {
+            after_key_to_lower.insert(key.to_lowercase(), key.clone());
+        }
+
+        DataBuffer {
+            table_name,
+            before,
+            after,
+            op,
+            binlog_filename,
+            timestamp,
+            next_event_position,
+            before_key_to_lower,
+            after_key_to_lower,
+        }
+    }
+
     pub fn get_column_before(&self, column_name: &str) -> &Value {
-        self.before
-            .get(column_name.to_lowercase().as_str())
-            .unwrap_or(&Value::None)
+        match self.before_key_to_lower.get(&column_name.to_lowercase()) {
+            None => &Value::None,
+            Some(key) => self.before.get(key).unwrap_or(&Value::None),
+        }
     }
     pub fn get_column_after(&self, column_name: &str) -> &Value {
-        self.after
-            .get(column_name.to_lowercase().as_str())
-            .unwrap_or(&Value::None)
+        match self.after_key_to_lower.get(&column_name.to_lowercase()) {
+            None => &Value::None,
+            Some(key) => self.after.get(key).unwrap_or(&Value::None),
+        }
     }
     pub fn get_pk(&self, pk_name: &str) -> &Value {
         let mut result = self.get_column_after(pk_name);
@@ -192,26 +229,26 @@ impl DataBuffer {
     }
 
     pub fn new_before(&self, data: HashMap<String, Value>) -> DataBuffer {
-        DataBuffer {
-            table_name: self.table_name.clone(),
-            before: data,
-            after: self.after.clone(),
-            op: self.op.clone(),
-            binlog_filename: self.binlog_filename.clone(),
-            timestamp: self.timestamp,
-            next_event_position: self.next_event_position,
-        }
+        DataBuffer::new(
+            self.table_name.clone(),
+            data,
+            self.after.clone(),
+            self.op.clone(),
+            self.binlog_filename.clone(),
+            self.timestamp,
+            self.next_event_position,
+        )
     }
     pub fn new_after(&self, data: HashMap<String, Value>) -> DataBuffer {
-        DataBuffer {
-            table_name: self.table_name.clone(),
-            before: self.before.clone(),
-            after: data,
-            op: self.op.clone(),
-            binlog_filename: self.binlog_filename.clone(),
-            timestamp: self.timestamp,
-            next_event_position: self.next_event_position,
-        }
+        DataBuffer::new(
+            self.table_name.clone(),
+            self.before.clone(),
+            data,
+            self.op.clone(),
+            self.binlog_filename.clone(),
+            self.timestamp,
+            self.next_event_position,
+        )
     }
 }
 

@@ -115,7 +115,8 @@ impl Sink for MeiliSearchSink {
                     docs.push(r.after);
                 }
                 Operation::DELETE => {
-                    if let Some(pk) = r.before.get(&self.meili_table_pk) {
+                    let pk = r.get_column_before(&self.meili_table_pk);
+                    if !pk.is_none() {
                         deletes.push(pk.resolve_string());
                     }
                 }

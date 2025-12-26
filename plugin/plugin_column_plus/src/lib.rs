@@ -49,10 +49,11 @@ impl PluginPlus {
 impl Plugin for PluginPlus {
     async fn collect(&mut self, data_buffer: DataBuffer) -> Result<DataBuffer, ()> {
         let data_original = data_buffer.clone();
-        let mut data: HashMap<String, Value> = if data_buffer.op == Operation::DELETE {
-            data_buffer.before
+        let is_delete = matches!(data_buffer.op, Operation::DELETE);
+        let mut data: HashMap<String, Value> = if is_delete {
+            data_buffer.before.clone()
         } else {
-            data_buffer.after
+            data_buffer.after.clone()
         };
         let mut contains_some_column: HashMap<String, Value> = HashMap::new();
         for column in &self.columns {
@@ -62,11 +63,13 @@ impl Plugin for PluginPlus {
             {
                 continue;
             }
-            for (k, v) in &data {
-                if k.eq_ignore_ascii_case(&column.column_name) && !v.is_none() {
-                    contains_some_column.insert(column.column_name.clone(), v.clone());
-                    break;
-                }
+            let v = if is_delete {
+                data_buffer.get_column_before(&column.column_name)
+            } else {
+                data_buffer.get_column_after(&column.column_name)
+            };
+            if !v.is_none() {
+                contains_some_column.insert(column.column_name.clone(), v.clone());
             }
         }
         if contains_some_column.is_empty() {

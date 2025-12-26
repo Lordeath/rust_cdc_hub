@@ -276,15 +276,15 @@ impl MysqlSourceConfigDetail {
             let before = HashMap::new();
             let after = mysql_row_to_hashmap(&row);
             let op = Operation::CREATE;
-            result.push(DataBuffer {
-                table_name: table_name.to_string(),
+            result.push(DataBuffer::new(
+                table_name.to_string(),
                 before,
                 after,
                 op,
-                binlog_filename: "".to_string(),
-                timestamp: 0,
-                next_event_position: 0,
-            });
+                "".to_string(),
+                0,
+                0,
+            ));
         }
         result
     }
@@ -398,9 +398,7 @@ impl Source for MySQLSource {
                             if let Ok(item) = plugin_data {
                                 Self::write_record_with_retry(&mut sink, &item).await;
                             }
-                            let this_id = data_buffer.after.get(&pk_column).unwrap_or_else(|| {
-                                panic!("pk_column not found: {}", pk_column.as_str())
-                            });
+                            let this_id = data_buffer.get_column_after(&pk_column);
                             let this_id = match this_id {
                                 Value::Int64(x) => x,
                                 _ => {
@@ -481,15 +479,15 @@ impl Source for MySQLSource {
                                         parse_row(row, table_name, &mut columns, config, pool)
                                             .await;
                                     let op = Operation::CREATE;
-                                    let data_buffer = DataBuffer {
-                                        table_name: table_name.to_string(),
+                                    let data_buffer = DataBuffer::new(
+                                        table_name.to_string(),
                                         before,
                                         after,
                                         op,
-                                        binlog_filename: binlog_filename.clone(),
-                                        timestamp: timestamp.clone(),
-                                        next_event_position: next_event_position.clone(),
-                                    };
+                                        binlog_filename.clone(),
+                                        timestamp.clone(),
+                                        next_event_position.clone(),
+                                    );
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;
                                     if let Ok(item) = plugin_data {
@@ -521,15 +519,15 @@ impl Source for MySQLSource {
                                             .await;
                                     let after: HashMap<String, Value> = HashMap::new();
                                     let op = Operation::DELETE;
-                                    let data_buffer = DataBuffer {
-                                        table_name: table_name.to_string(),
+                                    let data_buffer = DataBuffer::new(
+                                        table_name.to_string(),
                                         before,
                                         after,
                                         op,
-                                        binlog_filename: binlog_filename.clone(),
-                                        timestamp: timestamp.clone(),
-                                        next_event_position: next_event_position.clone(),
-                                    };
+                                        binlog_filename.clone(),
+                                        timestamp.clone(),
+                                        next_event_position.clone(),
+                                    );
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;
                                     if let Ok(item) = plugin_data {
@@ -561,15 +559,15 @@ impl Source for MySQLSource {
                                     let after: HashMap<String, Value> =
                                         parse_row(a, table_name, &mut columns, config, pool).await;
                                     let op = Operation::UPDATE;
-                                    let data_buffer = DataBuffer {
-                                        table_name: table_name.to_string(),
+                                    let data_buffer = DataBuffer::new(
+                                        table_name.to_string(),
                                         before,
                                         after,
                                         op,
-                                        binlog_filename: binlog_filename.clone(),
-                                        timestamp: timestamp.clone(),
-                                        next_event_position: next_event_position.clone(),
-                                    };
+                                        binlog_filename.clone(),
+                                        timestamp.clone(),
+                                        next_event_position.clone(),
+                                    );
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;
                                     if let Ok(item) = plugin_data {

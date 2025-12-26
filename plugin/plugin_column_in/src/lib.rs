@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use common::{DataBuffer, Operation, Plugin, PluginConfig, Value};
-use std::collections::HashMap;
 
 pub struct PluginColumnIn {
     pub columns: Vec<String>,
@@ -34,27 +33,39 @@ impl PluginColumnIn {
 #[async_trait]
 impl Plugin for PluginColumnIn {
     async fn collect(&mut self, data_buffer: DataBuffer) -> Result<DataBuffer, ()> {
-        let data: &HashMap<String, Value> = if data_buffer.op == Operation::DELETE {
-            &data_buffer.before
-        } else {
-            &data_buffer.after
-        };
+        let is_delete = matches!(data_buffer.op, Operation::DELETE);
+        // let data: &HashMap<String, Value> = if is_delete {
+        //     &data_buffer.before
+        // } else {
+        //     &data_buffer.after
+        // };
         let mut contains_some_column = Value::None;
         for column in &self.columns {
-            let mut key_matches = "";
-            for key in data.keys() {
-                if key.eq_ignore_ascii_case(column) {
-                    key_matches = key;
-                    break;
-                }
-            }
-            if data.contains_key(key_matches) {
-                contains_some_column = match data.get(key_matches) {
-                    None => Value::None,
-                    Some(x) => x.clone(),
-                };
+            // let mut key_matches = "";
+            // for key in data.keys() {
+            //     if key.eq_ignore_ascii_case(column) {
+            //         key_matches = key;
+            //         break;
+            //     }
+            // }
+            // if data.contains_key(key_matches) {
+            //     contains_some_column = match data.get(key_matches) {
+            //         None => Value::None,
+            //         Some(x) => x.clone(),
+            //     };
+            //     break;
+            // }
+
+            let v = if is_delete {
+                data_buffer.get_column_before(column)
+            } else {
+                data_buffer.get_column_after(column)
+            };
+            if !v.is_none() {
+                contains_some_column = v.clone();
                 break;
             }
+
         }
         if contains_some_column.is_none() {
             return Ok(data_buffer.clone());
