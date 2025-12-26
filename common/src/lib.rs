@@ -165,6 +165,9 @@ pub struct DataBuffer {
     pub before: HashMap<String, Value>,
     pub after: HashMap<String, Value>,
     pub op: Operation,
+    pub binlog_filename: String,
+    pub timestamp: u32,
+    pub next_event_position: u32,
 }
 
 // pub const VALUE_NONE: Value = Value::None;
@@ -186,6 +189,29 @@ impl DataBuffer {
             result = self.get_column_before(pk_name);
         }
         result
+    }
+
+    pub fn new_before(&self, data: HashMap<String, Value>) -> DataBuffer {
+        DataBuffer {
+            table_name: self.table_name.clone(),
+            before: data,
+            after: self.after.clone(),
+            op: self.op.clone(),
+            binlog_filename: self.binlog_filename.clone(),
+            timestamp: self.timestamp,
+            next_event_position: self.next_event_position,
+        }
+    }
+    pub fn new_after(&self, data: HashMap<String, Value>) -> DataBuffer {
+        DataBuffer {
+            table_name: self.table_name.clone(),
+            before: self.before.clone(),
+            after: data,
+            op: self.op.clone(),
+            binlog_filename: self.binlog_filename.clone(),
+            timestamp: self.timestamp,
+            next_event_position: self.next_event_position,
+        }
     }
 }
 

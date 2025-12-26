@@ -77,19 +77,9 @@ impl Plugin for PluginPlus {
             data.insert(column_name, Value::Int64(int_64 + self.plus));
         }
         if data_buffer.op == Operation::DELETE {
-            return Ok(DataBuffer {
-                op: Operation::DELETE,
-                table_name: data_buffer.table_name,
-                before: data,
-                after: HashMap::new(),
-            });
+            return Ok(data_original.new_before(data));
         }
 
-        Ok(DataBuffer {
-            op: data_original.op,
-            table_name: data_original.table_name,
-            before: data_original.before,
-            after: data,
-        })
+        Ok(data_original.new_after(data))
     }
 }

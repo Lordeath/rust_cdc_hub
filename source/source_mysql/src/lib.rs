@@ -31,6 +31,7 @@ pub struct MySQLSource {
     mysql_source: Vec<MysqlSourceConfigDetail>,
     pools: Vec<Pool<MySql>>,
     plugins: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>,
+    binlog_filename_list: Mutex<Vec<Mutex<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,6 +281,9 @@ impl MysqlSourceConfigDetail {
                 before,
                 after,
                 op,
+                binlog_filename: "".to_string(),
+                timestamp: 0,
+                next_event_position: 0,
             });
         }
         result
@@ -294,6 +298,7 @@ impl MySQLSource {
         // 这里支持多个数据源配置
         let cfg: MysqlSourceConfig = MysqlSourceConfig::new(config).await;
         let size = cfg.mysql_source.len();
+        let binlog_filename_list: Mutex<Vec<Mutex<String>>> = Mutex::new(Vec::new());
         for i in 0..size {
             let server_id: u64 = cfg.mysql_source[i].server_id;
             let connection_url = cfg.mysql_source[i].connection_url.clone();
@@ -310,6 +315,10 @@ impl MySQLSource {
             mysql_source.push(cfg.mysql_source[i].clone());
             let pool: Pool<MySql> = get_mysql_pool_by_url(&connection_url).await.unwrap();
             pools.push(pool);
+            binlog_filename_list
+                .lock()
+                .await
+                .push(Mutex::new("".to_string()));
         }
 
         Self {
@@ -317,6 +326,7 @@ impl MySQLSource {
             mysql_source,
             pools,
             plugins: vec![],
+            binlog_filename_list,
         }
     }
 
@@ -436,7 +446,11 @@ impl Source for MySQLSource {
                 let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
 
                 match stream.read().await {
-                    Ok((_header, data)) => match data {
+                    Ok((header, data)) => match data {
+                        EventData::Rotate(event) => {
+                            *self.binlog_filename_list.lock().await[i].lock().await =
+                                event.binlog_filename.clone();
+                        }
                         EventData::TableMap(event) => {
                             let table_name = event.table_name;
                             let table_id = event.table_id;
@@ -455,6 +469,12 @@ impl Source for MySQLSource {
                                 .as_str();
                             if config.is_target_database_and_table(database_name, table_name) {
                                 trace!("WriteRows: {}.{}", database_name, table_name);
+                                let binlog_filename = self.binlog_filename_list.lock().await[i]
+                                    .lock()
+                                    .await
+                                    .clone();
+                                let timestamp = header.timestamp;
+                                let next_event_position = header.next_event_position;
                                 for row in event.rows {
                                     let before: HashMap<String, Value> = HashMap::new();
                                     let after: HashMap<String, Value> =
@@ -466,6 +486,9 @@ impl Source for MySQLSource {
                                         before,
                                         after,
                                         op,
+                                        binlog_filename: binlog_filename.clone(),
+                                        timestamp: timestamp.clone(),
+                                        next_event_position: next_event_position.clone(),
                                     };
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;
@@ -486,6 +509,12 @@ impl Source for MySQLSource {
                                 .as_str();
                             if config.is_target_database_and_table(database_name, table_name) {
                                 trace!("DeleteRows: {}.{}", database_name, table_name);
+                                let binlog_filename = self.binlog_filename_list.lock().await[i]
+                                    .lock()
+                                    .await
+                                    .clone();
+                                let timestamp = header.timestamp;
+                                let next_event_position = header.next_event_position;
                                 for row in event.rows {
                                     let before: HashMap<String, Value> =
                                         parse_row(row, table_name, &mut columns, config, pool)
@@ -497,6 +526,9 @@ impl Source for MySQLSource {
                                         before,
                                         after,
                                         op,
+                                        binlog_filename: binlog_filename.clone(),
+                                        timestamp: timestamp.clone(),
+                                        next_event_position: next_event_position.clone(),
                                     };
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;
@@ -517,6 +549,12 @@ impl Source for MySQLSource {
                                 .as_str();
                             if config.is_target_database_and_table(database_name, table_name) {
                                 trace!("UpdateRows: {}.{}", database_name, table_name);
+                                let binlog_filename = self.binlog_filename_list.lock().await[i]
+                                    .lock()
+                                    .await
+                                    .clone();
+                                let timestamp = header.timestamp;
+                                let next_event_position = header.next_event_position;
                                 for (b, a) in event.rows {
                                     let before: HashMap<String, Value> =
                                         parse_row(b, table_name, &mut columns, config, pool).await;
@@ -528,6 +566,9 @@ impl Source for MySQLSource {
                                         before,
                                         after,
                                         op,
+                                        binlog_filename: binlog_filename.clone(),
+                                        timestamp: timestamp.clone(),
+                                        next_event_position: next_event_position.clone(),
                                     };
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;
