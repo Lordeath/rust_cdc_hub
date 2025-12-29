@@ -1,3 +1,5 @@
+pub mod mysql_checkpoint;
+
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, Utc};
 use serde::de::Visitor;
@@ -60,10 +62,7 @@ pub trait Sink: Send + Sync {
     }
 
     /// 刷新缓冲区（可选）
-    async fn flush(
-        &self,
-        _from_timer: &FlushByOperation,
-    ) -> Result<(), String>;
+    async fn flush(&self, _from_timer: &FlushByOperation) -> Result<(), String>;
 }
 
 #[async_trait]
@@ -105,6 +104,7 @@ pub struct CdcConfig {
     pub plugins: Option<Vec<PluginConfig>>,
     pub source_batch_size: Option<usize>,
     pub sink_batch_size: Option<usize>,
+    pub checkpoint_file_path: Option<String>,
 }
 
 impl CdcConfig {
@@ -476,6 +476,31 @@ pub struct ColumnInfoVo {
     pub value_for_type: Value,
 }
 
+pub struct CaseInsensitiveHashMap {
+    map: HashMap<String, Value>,
+    key_map_to_lowercase: HashMap<String, String>,
+}
+
+impl CaseInsensitiveHashMap {
+    pub fn new(map: HashMap<String, Value>) -> Self {
+        let mut key_map_to_lowercase: HashMap<String, String> = HashMap::new();
+        for key in map.keys() {
+            key_map_to_lowercase.insert(key.to_lowercase(), key.to_string());
+        }
+        CaseInsensitiveHashMap {
+            map,
+            key_map_to_lowercase,
+        }
+    }
+
+    pub fn get(&self, key: &str) -> &Value {
+        match self.key_map_to_lowercase.get(key) {
+            None => &Value::None,
+            Some(real_key) => self.map.get(real_key).unwrap_or_else(|| &Value::None),
+        }
+    }
+}
+
 #[inline]
 pub fn mysql_row_to_hashmap(row: &MySqlRow) -> HashMap<String, Value> {
     let mut result = HashMap::new();
@@ -652,6 +677,15 @@ pub async fn get_mysql_pool_by_url(connection_url: &str) -> Result<Pool<MySql>, 
         Err(e) => Err(e.to_string()),
     }
 }
+
+// // #[derive(Debug, Clone, Serialize, Deserialize)]
+// pub struct CheckPointEntity {
+//     pub checkpoint_detail: Box<dyn CheckPointDetail>,
+// }
+//
+// pub trait CheckPointDetail {
+//     fn get_now_checkpoint_position(&mut self) -> i64;
+// }
 
 #[cfg(test)]
 mod tests {

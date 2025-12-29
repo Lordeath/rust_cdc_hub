@@ -1,6 +1,7 @@
 extern crate core;
 
 use async_trait::async_trait;
+use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value,
     get_mysql_pool_by_url, mysql_row_to_hashmap,
@@ -24,20 +25,24 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace};
 
-const LOOP_PACE: usize = 8192;
+// const LOOP_PACE: usize = 8192;
 
 pub struct MySQLSource {
     streams: Vec<BinlogStream>, // ✅ 多个流
     mysql_source: Vec<MysqlSourceConfigDetail>,
     pools: Vec<Pool<MySql>>,
+    // checkpoint_entities: Vec<CheckPointEntity>,
+    checkpoint_entities: Mutex<Vec<Mutex<MysqlCheckPointDetailEntity>>>,
     plugins: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>,
     binlog_filename_list: Mutex<Vec<Mutex<String>>>,
+    // binlog_position_list: Mutex<Vec<Mutex<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MysqlSourceConfig {
     table_name_list: Vec<String>,
     mysql_source: Vec<MysqlSourceConfigDetail>,
+    // batchsize: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +55,7 @@ struct MysqlSourceConfigDetail {
     server_id: u64,
     connection_url: String,
     table_info_list: Vec<TableInfoVo>,
+    batchsize: usize,
 }
 
 impl MysqlSourceConfig {
@@ -161,7 +167,8 @@ impl MysqlSourceConfig {
                     .collect();
                 if pk_column.is_empty() || pk_column.len() > 1 {
                     error!("pk_column is empty or more than one");
-                    panic!("pk_column is empty or more than one");
+                    // panic!("pk_column is empty or more than one");
+                    continue;
                 }
                 let pk_column = pk_column[0].clone();
                 let columns: Vec<String> = col_list.iter().map(|c| c.column_name.clone()).collect();
@@ -182,11 +189,13 @@ impl MysqlSourceConfig {
                 server_id,
                 connection_url,
                 table_info_list,
+                batchsize: config.source_batch_size.unwrap_or(8192),
             });
         }
         MysqlSourceConfig {
             table_name_list,
             mysql_source,
+            // batchsize: config.source_batch_size.unwrap_or(8192),
         }
     }
 }
@@ -251,7 +260,7 @@ impl MysqlSourceConfigDetail {
                 order by {}
                 limit {}
             "#,
-            table_name, pk_column, id, pk_column, LOOP_PACE
+            table_name, pk_column, id, pk_column, self.batchsize
         );
         debug!(
             "extract_init_data: [{}.{}] {} {}",
@@ -299,11 +308,34 @@ impl MySQLSource {
         let cfg: MysqlSourceConfig = MysqlSourceConfig::new(config).await;
         let size = cfg.mysql_source.len();
         let binlog_filename_list: Mutex<Vec<Mutex<String>>> = Mutex::new(Vec::new());
+        // let binlog_position_list: Mutex<Vec<Mutex<String>>> = Mutex::new(Vec::new());
+        // let mut checkpoint_entities: Vec<MysqlCheckPointDetailEntity> = vec![];
+        let mut checkpoint_entities: Vec<Mutex<MysqlCheckPointDetailEntity>> = vec![];
         for i in 0..size {
             let server_id: u64 = cfg.mysql_source[i].server_id;
             let connection_url = cfg.mysql_source[i].connection_url.clone();
+            let mysql_checkpoint_detail_entity = MysqlCheckPointDetailEntity::from_config(
+                config
+                    .clone()
+                    .checkpoint_file_path
+                    .unwrap_or("/checkpoint".to_string()),
+                &connection_url,
+            )
+            .await;
+            checkpoint_entities.push(Mutex::new(mysql_checkpoint_detail_entity.clone()));
+
+            let start_position = StartPosition::BinlogPosition(
+                mysql_checkpoint_detail_entity.clone().last_binlog_filename,
+                mysql_checkpoint_detail_entity.clone().last_binlog_position,
+            );
+            info!(
+                "binlog读取开始: filename: {}, position: {:?}",
+                mysql_checkpoint_detail_entity.clone().last_binlog_filename,
+                mysql_checkpoint_detail_entity.clone().last_binlog_position
+            );
+
             let client: BinlogStream =
-                BinlogClient::new(&connection_url, server_id, StartPosition::Latest)
+                BinlogClient::new(&connection_url, server_id, start_position)
                     .with_master_heartbeat(Duration::from_secs(5))
                     .with_read_timeout(Duration::from_secs(60))
                     .with_keepalive(Duration::from_secs(60), Duration::from_secs(10))
@@ -319,14 +351,20 @@ impl MySQLSource {
                 .lock()
                 .await
                 .push(Mutex::new("".to_string()));
+            // binlog_position_list
+            //     .lock()
+            //     .await
+            //     .push(Mutex::new("".to_string()));
         }
 
         Self {
             streams,
             mysql_source,
             pools,
+            checkpoint_entities: Mutex::new(checkpoint_entities),
             plugins: vec![],
             binlog_filename_list,
+            // binlog_position_list,
         }
     }
 
@@ -411,7 +449,7 @@ impl Source for MySQLSource {
                         }
                         count += len;
                         debug!("当前最大id为 {}", id);
-                        if len != LOOP_PACE {
+                        if len != config.batchsize {
                             break;
                         }
                     }
@@ -441,6 +479,12 @@ impl Source for MySQLSource {
             for i in 0..max {
                 let stream: &mut BinlogStream = &mut self.streams[i];
                 let pool: &mut Pool<MySql> = &mut self.pools[i];
+                let checkpoint_entity: &mut MysqlCheckPointDetailEntity =
+                    &mut self.checkpoint_entities.lock().await[i]
+                        .lock()
+                        .await
+                        .clone();
+                let mut checkpoint_entity = checkpoint_entity.clone();
                 let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
 
                 match stream.read().await {
@@ -494,6 +538,10 @@ impl Source for MySQLSource {
                                         Self::write_record_with_retry(&mut sink, &item).await;
                                     }
                                 }
+                                if !binlog_filename.is_empty() {
+                                    checkpoint_entity =
+                                        checkpoint_entity.update(binlog_filename, next_event_position);
+                                }
                             }
                         }
                         EventData::DeleteRows(event) => {
@@ -533,6 +581,10 @@ impl Source for MySQLSource {
                                     if let Ok(item) = plugin_data {
                                         Self::write_record_with_retry(&mut sink, &item).await;
                                     }
+                                }
+                                if !binlog_filename.is_empty() {
+                                    checkpoint_entity =
+                                        checkpoint_entity.update(binlog_filename, next_event_position);
                                 }
                             }
                         }
@@ -574,6 +626,11 @@ impl Source for MySQLSource {
                                         Self::write_record_with_retry(&mut sink, &item).await;
                                     }
                                 }
+
+                                if !binlog_filename.is_empty() {
+                                    checkpoint_entity =
+                                        checkpoint_entity.update(binlog_filename, next_event_position);
+                                }
                             }
                         }
                         _ => {}
@@ -584,6 +641,14 @@ impl Source for MySQLSource {
                         panic!("Error: {}", e);
                     }
                 }
+                match checkpoint_entity.save() {
+                    Ok(_) => {
+                        *self.checkpoint_entities.lock().await[i].lock().await = checkpoint_entity;
+                    }
+                    Err(_) => {
+                        error!("持久化失败");
+                    }
+                };
             }
         }
     }
