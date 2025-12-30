@@ -12,6 +12,7 @@ pub struct MysqlCheckPointDetailEntity {
     pub last_binlog_filename: String,
     pub last_binlog_position: u32,
     pub retry_times: u32,
+    pub is_new: bool,
 
     checkpoint_filepath: String,
 }
@@ -49,6 +50,7 @@ impl MysqlCheckPointDetailEntity {
                 last_binlog_filename,
                 last_binlog_position,
                 retry_times: 0,
+                is_new: true,
                 checkpoint_filepath: checkpoint_filepath.to_string(),
             };
             let json = serde_json::to_string(&entity).expect("json转换失败");
@@ -69,6 +71,7 @@ impl MysqlCheckPointDetailEntity {
                 );
                 entity.last_binlog_position = last_binlog_position;
             }
+            entity.is_new = false;
             entity
         }
     }

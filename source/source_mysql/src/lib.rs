@@ -400,6 +400,16 @@ impl Source for MySQLSource {
             for i in 0..max {
                 let pool: &mut Pool<MySql> = &mut self.pools[i];
                 let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
+                let checkpoint_entity: &mut MysqlCheckPointDetailEntity =
+                    &mut self.checkpoint_entities.lock().await[i]
+                        .lock()
+                        .await
+                        .clone();
+                let checkpoint_entity = checkpoint_entity.clone();
+                if !checkpoint_entity.is_new {
+                    info!("跳过初始化数据源: {}", config.connection_url);
+                    continue;
+                }
                 for table_info_vo in config.table_info_list.clone() {
                     let table_name = table_info_vo.table_name.clone();
                     let pk_column = table_info_vo.pk_column.clone();
