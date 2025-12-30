@@ -1,7 +1,7 @@
 mod starrocks_client;
 
 use crate::starrocks_client::StarrocksClient;
-use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value};
+use common::{CaseInsensitiveHashMap, CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value};
 use meilisearch_sdk::macro_helper::async_trait;
 use std::collections::HashMap;
 use std::error::Error;
@@ -34,7 +34,6 @@ impl StarrocksSink {
         let username = config.first_sink_not_blank("username");
         let password = config.first_sink_not_blank("password");
         let host = config.first_sink_not_blank("host");
-        // let port = config.first_sink_not_blank("port");
         let http_port = config.first_sink_not_blank("http_port");
         let database = config.first_sink_not_blank("database");
 
@@ -60,19 +59,17 @@ impl StarrocksSink {
         let pks_info: &HashMap<String, Vec<String>> = &*self.pks_cache.lock().await;
         let col_info: &HashMap<String, Vec<String>> = &*self.columns_cache.lock().await;
         // 把数据转换成json
-        let data: HashMap<String, Value> = match data_buffer.op {
+        let data: CaseInsensitiveHashMap = match data_buffer.op {
             Operation::DELETE => {
-                let mut obj = HashMap::new();
+                let mut obj = CaseInsensitiveHashMap::new_with_no_arg();
                 for (table_name, pks) in pks_info {
                     if !table_name.eq_ignore_ascii_case(&data_buffer.table_name) {
                         continue;
                     }
                     for pk in pks {
-                        for (k, v) in &data_buffer.before {
-                            if k.eq_ignore_ascii_case(pk) {
-                                obj.insert(pk.clone(), v.clone());
-                                break;
-                            }
+                        let v = data_buffer.before.get(pk);
+                        if !v.is_none() {
+                            obj.insert(pk.clone(), v.clone());
                         }
                     }
                     obj.insert("__op".to_string(), Value::UnsignedInt8(OP_DELETE));
@@ -81,17 +78,15 @@ impl StarrocksSink {
                 obj
             }
             _ => {
-                let mut obj = HashMap::new();
+                let mut obj = CaseInsensitiveHashMap::new_with_no_arg();
                 for (table_name, cols) in col_info {
                     if !table_name.eq_ignore_ascii_case(&data_buffer.table_name) {
                         continue;
                     }
                     for col in cols {
-                        for (k, v) in &data_buffer.after {
-                            if k.eq_ignore_ascii_case(col) {
-                                obj.insert(col.clone(), v.clone());
-                                break;
-                            }
+                        let v = data_buffer.after.get(col);
+                        if !v.is_none() {
+                            obj.insert(col.clone(), v.clone());
                         }
                     }
                     obj.insert("__op".to_string(), Value::UnsignedInt8(OP_UPSERT));
@@ -100,7 +95,7 @@ impl StarrocksSink {
                 obj
             }
         };
-        data
+        data.get_raw_map()
     }
 }
 

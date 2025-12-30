@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use common::{DataBuffer, Operation, Plugin, PluginConfig, Value};
+use common::{CaseInsensitiveHashMap, DataBuffer, Operation, Plugin, PluginConfig, Value};
 use std::collections::HashMap;
 
 pub struct PluginPlus {
@@ -50,7 +50,7 @@ impl Plugin for PluginPlus {
     async fn collect(&mut self, data_buffer: DataBuffer) -> Result<DataBuffer, ()> {
         let data_original = data_buffer.clone();
         let is_delete = matches!(data_buffer.op, Operation::DELETE);
-        let mut data: HashMap<String, Value> = if is_delete {
+        let mut data: CaseInsensitiveHashMap = if is_delete {
             data_buffer.before.clone()
         } else {
             data_buffer.after.clone()
@@ -64,9 +64,9 @@ impl Plugin for PluginPlus {
                 continue;
             }
             let v = if is_delete {
-                data_buffer.get_column_before(&column.column_name)
+                data_buffer.before.get(&column.column_name)
             } else {
-                data_buffer.get_column_after(&column.column_name)
+                data_buffer.after.get(&column.column_name)
             };
             if !v.is_none() {
                 contains_some_column.insert(column.column_name.clone(), v.clone());

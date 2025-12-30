@@ -1,7 +1,4 @@
-use common::{
-    CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value,
-    get_mysql_pool_by_url, mysql_row_to_hashmap,
-};
+use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value, get_mysql_pool_by_url, mysql_row_to_hashmap, CaseInsensitiveHashMap};
 use meilisearch_sdk::macro_helper::async_trait;
 use sqlx::mysql::{MySqlArguments, MySqlQueryResult};
 use sqlx::query::Query;
@@ -212,7 +209,7 @@ impl Sink for MySqlSink {
         let batch = std::mem::take(&mut *buf);
         drop(buf);
 
-        let mut insert_map: HashMap<String, Vec<HashMap<String, Value>>> = HashMap::new();
+        let mut insert_map: HashMap<String, Vec<CaseInsensitiveHashMap>> = HashMap::new();
         let mut delete_map: HashMap<String, Vec<String>> = HashMap::new();
 
         let mut cache_for_roll_back: Vec<DataBuffer> = vec![];
@@ -284,7 +281,7 @@ impl Sink for MySqlSink {
                     .unwrap()
                     .iter()
                     .map(mysql_row_to_hashmap)
-                    .map(|row| row.get("COLUMN_NAME").unwrap().resolve_string())
+                    .map(|row| row.get("COLUMN_NAME").resolve_string())
                     .collect();
                 cols.retain(|c| !stored_cols.contains(c));
 
@@ -336,7 +333,8 @@ impl Sink for MySqlSink {
 
                 for row in &inserts {
                     for col in columns {
-                        if let Some(x) = row.get(col) {
+                        let x = row.get(col);
+                        if !x.is_none() {
                             debug!("inserting {:?} into {}.{}", x, table_name, col);
                             if !x.is_none() {
                                 if x.is_json()
@@ -377,7 +375,6 @@ impl Sink for MySqlSink {
         // ======================================
         for (table_name, deletes) in delete_map {
             if !deletes.is_empty() {
-                // let table_info_vo = self.table_info_cache.lock().await.get(&table_name).unwrap();
                 let pk_name = self.get_pk_name_from_cache(&table_name).await;
                 let ph = (0..deletes.len())
                     .map(|_| "?")

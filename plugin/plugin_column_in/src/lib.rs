@@ -34,38 +34,17 @@ impl PluginColumnIn {
 impl Plugin for PluginColumnIn {
     async fn collect(&mut self, data_buffer: DataBuffer) -> Result<DataBuffer, ()> {
         let is_delete = matches!(data_buffer.op, Operation::DELETE);
-        // let data: &HashMap<String, Value> = if is_delete {
-        //     &data_buffer.before
-        // } else {
-        //     &data_buffer.after
-        // };
         let mut contains_some_column = Value::None;
         for column in &self.columns {
-            // let mut key_matches = "";
-            // for key in data.keys() {
-            //     if key.eq_ignore_ascii_case(column) {
-            //         key_matches = key;
-            //         break;
-            //     }
-            // }
-            // if data.contains_key(key_matches) {
-            //     contains_some_column = match data.get(key_matches) {
-            //         None => Value::None,
-            //         Some(x) => x.clone(),
-            //     };
-            //     break;
-            // }
-
             let v = if is_delete {
-                data_buffer.get_column_before(column)
+                data_buffer.before.get(column)
             } else {
-                data_buffer.get_column_after(column)
+                data_buffer.after.get(column)
             };
             if !v.is_none() {
                 contains_some_column = v.clone();
                 break;
             }
-
         }
         if contains_some_column.is_none() {
             return Ok(data_buffer.clone());

@@ -96,7 +96,6 @@ impl Sink for MeiliSearchSink {
         if buf.is_empty() {
             return Ok(()); // 没数据不写
         }
-        // info!("Flushing MeiliSearch Sink... {}", buf.len());
 
         // 交换出 buffer（避免长时间锁住）
         let batch = std::mem::take(&mut *buf);
@@ -115,7 +114,7 @@ impl Sink for MeiliSearchSink {
                     docs.push(r.after);
                 }
                 Operation::DELETE => {
-                    let pk = r.get_column_before(&self.meili_table_pk);
+                    let pk = r.before.get(&self.meili_table_pk);
                     if !pk.is_none() {
                         deletes.push(pk.resolve_string());
                     }

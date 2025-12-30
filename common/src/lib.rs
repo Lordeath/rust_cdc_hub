@@ -1,5 +1,6 @@
 pub mod mysql_checkpoint;
 
+use std::collections::hash_map::Keys;
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, Utc};
 use serde::de::Visitor;
@@ -162,15 +163,13 @@ impl PluginConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataBuffer {
     pub table_name: String,
-    pub before: HashMap<String, Value>,
-    pub after: HashMap<String, Value>,
+    pub before: CaseInsensitiveHashMap,
+    pub after: CaseInsensitiveHashMap,
     pub op: Operation,
     pub binlog_filename: String,
     pub timestamp: u32,
     pub next_event_position: u32,
 
-    before_key_to_lower: HashMap<String, String>,
-    after_key_to_lower: HashMap<String, String>,
 }
 
 // pub const VALUE_NONE: Value = Value::None;
@@ -178,8 +177,8 @@ pub struct DataBuffer {
 impl DataBuffer {
     pub fn new(
         table_name: String,
-        before: HashMap<String, Value>,
-        after: HashMap<String, Value>,
+        before: CaseInsensitiveHashMap,
+        after: CaseInsensitiveHashMap,
         op: Operation,
         binlog_filename: String,
         timestamp: u32,
@@ -203,32 +202,18 @@ impl DataBuffer {
             binlog_filename,
             timestamp,
             next_event_position,
-            before_key_to_lower,
-            after_key_to_lower,
         }
     }
 
-    pub fn get_column_before(&self, column_name: &str) -> &Value {
-        match self.before_key_to_lower.get(&column_name.to_lowercase()) {
-            None => &Value::None,
-            Some(key) => self.before.get(key).unwrap_or(&Value::None),
-        }
-    }
-    pub fn get_column_after(&self, column_name: &str) -> &Value {
-        match self.after_key_to_lower.get(&column_name.to_lowercase()) {
-            None => &Value::None,
-            Some(key) => self.after.get(key).unwrap_or(&Value::None),
-        }
-    }
     pub fn get_pk(&self, pk_name: &str) -> &Value {
-        let mut result = self.get_column_after(pk_name);
+        let mut result = self.after.get(&pk_name);
         if result.is_none() {
-            result = self.get_column_before(pk_name);
+            result = self.before.get(&pk_name);
         }
         result
     }
 
-    pub fn new_before(&self, data: HashMap<String, Value>) -> DataBuffer {
+    pub fn new_before(&self, data: CaseInsensitiveHashMap) -> DataBuffer {
         DataBuffer::new(
             self.table_name.clone(),
             data,
@@ -239,7 +224,7 @@ impl DataBuffer {
             self.next_event_position,
         )
     }
-    pub fn new_after(&self, data: HashMap<String, Value>) -> DataBuffer {
+    pub fn new_after(&self, data: CaseInsensitiveHashMap) -> DataBuffer {
         DataBuffer::new(
             self.table_name.clone(),
             self.before.clone(),
@@ -468,7 +453,6 @@ pub struct TableInfoVo {
     pub pk_column: String,
     pub create_table_sql: String,
     pub columns: Vec<String>,
-    // pub column_info: Vec<ColumnInfoVo>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnInfoVo {
@@ -476,12 +460,16 @@ pub struct ColumnInfoVo {
     pub value_for_type: Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaseInsensitiveHashMap {
     map: HashMap<String, Value>,
     key_map_to_lowercase: HashMap<String, String>,
 }
 
 impl CaseInsensitiveHashMap {
+    pub fn new_with_no_arg() -> Self {
+        CaseInsensitiveHashMap::new(HashMap::new())
+    }
     pub fn new(map: HashMap<String, Value>) -> Self {
         let mut key_map_to_lowercase: HashMap<String, String> = HashMap::new();
         for key in map.keys() {
@@ -499,10 +487,23 @@ impl CaseInsensitiveHashMap {
             Some(real_key) => self.map.get(real_key).unwrap_or_else(|| &Value::None),
         }
     }
+
+    pub fn keys(&self) -> Keys<'_, String, Value> {
+        self.map.keys()
+    }
+    
+    pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
+        self.key_map_to_lowercase.insert(k.to_lowercase(), k.clone());
+        self.map.insert(k, v)
+    }
+    
+    pub fn get_raw_map(&self) -> HashMap<String, Value> {
+        self.map.clone()
+    }
 }
 
 #[inline]
-pub fn mysql_row_to_hashmap(row: &MySqlRow) -> HashMap<String, Value> {
+pub fn mysql_row_to_hashmap(row: &MySqlRow) -> CaseInsensitiveHashMap {
     let mut result = HashMap::new();
     for row_column in row.columns().iter().enumerate() {
         let column = row_column.1;
@@ -660,7 +661,7 @@ pub fn mysql_row_to_hashmap(row: &MySqlRow) -> HashMap<String, Value> {
 
         result.insert(column.name().to_string(), value);
     }
-    result
+    CaseInsensitiveHashMap::new(result)
 }
 
 pub async fn get_mysql_pool_by_url(connection_url: &str) -> Result<Pool<MySql>, String> {
@@ -677,15 +678,6 @@ pub async fn get_mysql_pool_by_url(connection_url: &str) -> Result<Pool<MySql>, 
         Err(e) => Err(e.to_string()),
     }
 }
-
-// // #[derive(Debug, Clone, Serialize, Deserialize)]
-// pub struct CheckPointEntity {
-//     pub checkpoint_detail: Box<dyn CheckPointDetail>,
-// }
-//
-// pub trait CheckPointDetail {
-//     fn get_now_checkpoint_position(&mut self) -> i64;
-// }
 
 #[cfg(test)]
 mod tests {

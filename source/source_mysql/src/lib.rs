@@ -2,10 +2,7 @@ extern crate core;
 
 use async_trait::async_trait;
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
-use common::{
-    CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value,
-    get_mysql_pool_by_url, mysql_row_to_hashmap,
-};
+use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value, get_mysql_pool_by_url, mysql_row_to_hashmap, CaseInsensitiveHashMap};
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
@@ -25,24 +22,19 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace};
 
-// const LOOP_PACE: usize = 8192;
-
 pub struct MySQLSource {
     streams: Vec<BinlogStream>, // ✅ 多个流
     mysql_source: Vec<MysqlSourceConfigDetail>,
     pools: Vec<Pool<MySql>>,
-    // checkpoint_entities: Vec<CheckPointEntity>,
     checkpoint_entities: Mutex<Vec<Mutex<MysqlCheckPointDetailEntity>>>,
     plugins: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>,
     binlog_filename_list: Mutex<Vec<Mutex<String>>>,
-    // binlog_position_list: Mutex<Vec<Mutex<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MysqlSourceConfig {
     table_name_list: Vec<String>,
     mysql_source: Vec<MysqlSourceConfigDetail>,
-    // batchsize: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,7 +121,7 @@ impl MysqlSourceConfig {
                     .map(|row| mysql_row_to_hashmap(&row))
                     .map(|row| {
                         row.get("table_name")
-                            .unwrap_or_else(|| panic!("table_name not found"))
+                            // .unwrap_or_else(|| panic!("table_name not found"))
                             .resolve_string()
                     })
                     // .map(|row| row.table_name)
@@ -195,7 +187,6 @@ impl MysqlSourceConfig {
         MysqlSourceConfig {
             table_name_list,
             mysql_source,
-            // batchsize: config.source_batch_size.unwrap_or(8192),
         }
     }
 }
@@ -271,7 +262,6 @@ impl MysqlSourceConfigDetail {
             .fetch_all(pool)
             .await
             .expect("query failed");
-        // info!("extract_init_data: {} rows", rows.len());
         info!(
             "extract_init_data: [{}.{}] {} {} {} rows",
             self.database,
@@ -282,7 +272,7 @@ impl MysqlSourceConfigDetail {
         );
         let mut result: Vec<DataBuffer> = vec![];
         for row in rows {
-            let before = HashMap::new();
+            let before = CaseInsensitiveHashMap::new(HashMap::new());
             let after = mysql_row_to_hashmap(&row);
             let op = Operation::CREATE;
             result.push(DataBuffer::new(
@@ -308,8 +298,6 @@ impl MySQLSource {
         let cfg: MysqlSourceConfig = MysqlSourceConfig::new(config).await;
         let size = cfg.mysql_source.len();
         let binlog_filename_list: Mutex<Vec<Mutex<String>>> = Mutex::new(Vec::new());
-        // let binlog_position_list: Mutex<Vec<Mutex<String>>> = Mutex::new(Vec::new());
-        // let mut checkpoint_entities: Vec<MysqlCheckPointDetailEntity> = vec![];
         let mut checkpoint_entities: Vec<Mutex<MysqlCheckPointDetailEntity>> = vec![];
         for i in 0..size {
             let server_id: u64 = cfg.mysql_source[i].server_id;
@@ -351,10 +339,6 @@ impl MySQLSource {
                 .lock()
                 .await
                 .push(Mutex::new("".to_string()));
-            // binlog_position_list
-            //     .lock()
-            //     .await
-            //     .push(Mutex::new("".to_string()));
         }
 
         Self {
@@ -364,7 +348,6 @@ impl MySQLSource {
             checkpoint_entities: Mutex::new(checkpoint_entities),
             plugins: vec![],
             binlog_filename_list,
-            // binlog_position_list,
         }
     }
 
@@ -436,7 +419,7 @@ impl Source for MySQLSource {
                             if let Ok(item) = plugin_data {
                                 Self::write_record_with_retry(&mut sink, &item).await;
                             }
-                            let this_id = data_buffer.get_column_after(&pk_column);
+                            let this_id = data_buffer.after.get(&pk_column);
                             let this_id = match this_id {
                                 Value::Int64(x) => x,
                                 _ => {
@@ -518,8 +501,8 @@ impl Source for MySQLSource {
                                 let timestamp = header.timestamp;
                                 let next_event_position = header.next_event_position;
                                 for row in event.rows {
-                                    let before: HashMap<String, Value> = HashMap::new();
-                                    let after: HashMap<String, Value> =
+                                    let before: CaseInsensitiveHashMap = CaseInsensitiveHashMap::new_with_no_arg();
+                                    let after: CaseInsensitiveHashMap =
                                         parse_row(row, table_name, &mut columns, config, pool)
                                             .await;
                                     let op = Operation::CREATE;
@@ -562,10 +545,10 @@ impl Source for MySQLSource {
                                 let timestamp = header.timestamp;
                                 let next_event_position = header.next_event_position;
                                 for row in event.rows {
-                                    let before: HashMap<String, Value> =
+                                    let before: CaseInsensitiveHashMap =
                                         parse_row(row, table_name, &mut columns, config, pool)
                                             .await;
-                                    let after: HashMap<String, Value> = HashMap::new();
+                                    let after: CaseInsensitiveHashMap = CaseInsensitiveHashMap::new_with_no_arg();
                                     let op = Operation::DELETE;
                                     let data_buffer = DataBuffer::new(
                                         table_name.to_string(),
@@ -606,9 +589,9 @@ impl Source for MySQLSource {
                                 let timestamp = header.timestamp;
                                 let next_event_position = header.next_event_position;
                                 for (b, a) in event.rows {
-                                    let before: HashMap<String, Value> =
+                                    let before: CaseInsensitiveHashMap =
                                         parse_row(b, table_name, &mut columns, config, pool).await;
-                                    let after: HashMap<String, Value> =
+                                    let after: CaseInsensitiveHashMap =
                                         parse_row(a, table_name, &mut columns, config, pool).await;
                                     let op = Operation::UPDATE;
                                     let data_buffer = DataBuffer::new(
@@ -668,7 +651,7 @@ async fn parse_row(
     columns: &mut Mutex<Vec<String>>,
     config: &MysqlSourceConfigDetail,
     pool: &mut Pool<MySql>,
-) -> HashMap<String, Value> {
+) -> CaseInsensitiveHashMap {
     let mut data: HashMap<String, Value> = HashMap::new();
     let mut index = 0;
     if columns.lock().await.len() != row.column_values.len() {
@@ -771,5 +754,5 @@ async fn parse_row(
 
         index += 1;
     }
-    data
+    CaseInsensitiveHashMap::new(data)
 }
