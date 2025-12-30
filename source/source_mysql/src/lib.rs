@@ -2,7 +2,10 @@ extern crate core;
 
 use async_trait::async_trait;
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
-use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value, get_mysql_pool_by_url, mysql_row_to_hashmap, CaseInsensitiveHashMap};
+use common::{
+    CaseInsensitiveHashMap, CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink,
+    Source, TableInfoVo, Value, get_mysql_pool_by_url, mysql_row_to_hashmap,
+};
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
@@ -354,10 +357,11 @@ impl MySQLSource {
     async fn write_record_with_retry(
         sink: &mut Arc<Mutex<dyn Sink + Send + Sync>>,
         data_buffer: &DataBuffer,
+        mysql_check_point_detail_entity: Option<MysqlCheckPointDetailEntity>,
     ) {
         let mut loop_count = 0;
         loop {
-            let sink_result = sink.lock().await.write_record(data_buffer).await;
+            let sink_result = sink.lock().await.write_record(data_buffer, &mysql_check_point_detail_entity).await;
             if sink_result.is_ok() {
                 break;
             }
@@ -427,7 +431,7 @@ impl Source for MySQLSource {
                             let plugin_data =
                                 detail_with_plugin(plugins, data_buffer.clone()).await;
                             if let Ok(item) = plugin_data {
-                                Self::write_record_with_retry(&mut sink, &item).await;
+                                Self::write_record_with_retry(&mut sink, &item, None).await;
                             }
                             let this_id = data_buffer.after.get(&pk_column);
                             let this_id = match this_id {
@@ -511,7 +515,8 @@ impl Source for MySQLSource {
                                 let timestamp = header.timestamp;
                                 let next_event_position = header.next_event_position;
                                 for row in event.rows {
-                                    let before: CaseInsensitiveHashMap = CaseInsensitiveHashMap::new_with_no_arg();
+                                    let before: CaseInsensitiveHashMap =
+                                        CaseInsensitiveHashMap::new_with_no_arg();
                                     let after: CaseInsensitiveHashMap =
                                         parse_row(row, table_name, &mut columns, config, pool)
                                             .await;
@@ -528,12 +533,12 @@ impl Source for MySQLSource {
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;
                                     if let Ok(item) = plugin_data {
-                                        Self::write_record_with_retry(&mut sink, &item).await;
+                                        Self::write_record_with_retry(&mut sink, &item, Some(checkpoint_entity.clone())).await;
                                     }
                                 }
                                 if !binlog_filename.is_empty() {
-                                    checkpoint_entity =
-                                        checkpoint_entity.update(binlog_filename, next_event_position);
+                                    checkpoint_entity = checkpoint_entity
+                                        .update(binlog_filename, next_event_position);
                                 }
                             }
                         }
@@ -558,7 +563,8 @@ impl Source for MySQLSource {
                                     let before: CaseInsensitiveHashMap =
                                         parse_row(row, table_name, &mut columns, config, pool)
                                             .await;
-                                    let after: CaseInsensitiveHashMap = CaseInsensitiveHashMap::new_with_no_arg();
+                                    let after: CaseInsensitiveHashMap =
+                                        CaseInsensitiveHashMap::new_with_no_arg();
                                     let op = Operation::DELETE;
                                     let data_buffer = DataBuffer::new(
                                         table_name.to_string(),
@@ -572,12 +578,12 @@ impl Source for MySQLSource {
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;
                                     if let Ok(item) = plugin_data {
-                                        Self::write_record_with_retry(&mut sink, &item).await;
+                                        Self::write_record_with_retry(&mut sink, &item, Some(checkpoint_entity.clone())).await;
                                     }
                                 }
                                 if !binlog_filename.is_empty() {
-                                    checkpoint_entity =
-                                        checkpoint_entity.update(binlog_filename, next_event_position);
+                                    checkpoint_entity = checkpoint_entity
+                                        .update(binlog_filename, next_event_position);
                                 }
                             }
                         }
@@ -616,13 +622,13 @@ impl Source for MySQLSource {
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;
                                     if let Ok(item) = plugin_data {
-                                        Self::write_record_with_retry(&mut sink, &item).await;
+                                        Self::write_record_with_retry(&mut sink, &item, Some(checkpoint_entity.clone())).await;
                                     }
                                 }
 
                                 if !binlog_filename.is_empty() {
-                                    checkpoint_entity =
-                                        checkpoint_entity.update(binlog_filename, next_event_position);
+                                    checkpoint_entity = checkpoint_entity
+                                        .update(binlog_filename, next_event_position);
                                 }
                             }
                         }
@@ -634,14 +640,7 @@ impl Source for MySQLSource {
                         panic!("Error: {}", e);
                     }
                 }
-                match checkpoint_entity.save() {
-                    Ok(_) => {
-                        *self.checkpoint_entities.lock().await[i].lock().await = checkpoint_entity;
-                    }
-                    Err(message) => {
-                        error!("持久化失败: {}", message);
-                    }
-                };
+                *self.checkpoint_entities.lock().await[i].lock().await = checkpoint_entity;
             }
         }
     }
@@ -653,6 +652,27 @@ impl Source for MySQLSource {
     async fn get_table_info(&mut self) -> Vec<TableInfoVo> {
         self.mysql_source[0].table_info_list.clone()
     }
+
+    // async fn alter_flush(&mut self) -> Result<(), String> {
+    //     let max = self.streams.len();
+    //     for i in 0..max {
+    //         let checkpoint_entity: &mut MysqlCheckPointDetailEntity =
+    //             &mut self.checkpoint_entities.lock().await[i]
+    //                 .lock()
+    //                 .await
+    //                 .clone();
+    //         let mut checkpoint_entity = checkpoint_entity.clone();
+    //         match checkpoint_entity.save() {
+    //             Ok(_) => {
+    //                 *self.checkpoint_entities.lock().await[i].lock().await = checkpoint_entity;
+    //             }
+    //             Err(message) => {
+    //                 error!("持久化失败: {}", message);
+    //             }
+    //         };
+    //     }
+    //     Ok(())
+    // }
 }
 
 async fn parse_row(

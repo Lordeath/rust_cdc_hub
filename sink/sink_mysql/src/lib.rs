@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info};
+use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 
 pub struct MySqlSink {
     pool: RwLock<Pool<MySql>>,
@@ -19,6 +20,7 @@ pub struct MySqlSink {
     // 缓存所有字段名（第一批数据会取一次）
     table_info_cache: Mutex<HashMap<String, TableInfoVo>>,
     columns_cache: Mutex<HashMap<String, Vec<String>>>,
+    checkpoint: Mutex<HashMap<String, MysqlCheckPointDetailEntity>>,
 }
 
 impl MySqlSink {
@@ -81,6 +83,7 @@ impl MySqlSink {
             sink_batch_size,
             table_info_cache: Mutex::new(HashMap::new()),
             columns_cache: Mutex::new(HashMap::new()),
+            checkpoint: Mutex::new(HashMap::new()),
         }
     }
 
@@ -165,10 +168,15 @@ impl Sink for MySqlSink {
         Ok(())
     }
 
-    async fn write_record(&self, record: &DataBuffer) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn write_record(&mut self, record: &DataBuffer, mysql_check_point_detail_entity: &Option<MysqlCheckPointDetailEntity>) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut buf = self.buffer.lock().await;
         buf.push(record.clone());
-
+        if let Some(s) = mysql_check_point_detail_entity {
+            self.checkpoint
+                .lock()
+                .await
+                .insert(s.checkpoint_filepath.to_string(), s.clone());
+        }
         if buf.len() >= self.sink_batch_size {
             drop(buf);
             self.flush_with_retry(&FlushByOperation::Signal).await;
@@ -403,6 +411,30 @@ impl Sink for MySqlSink {
             }
         }
 
+        Ok(())
+    }
+
+    async fn alter_flush(&mut self) -> Result<(), String> {
+        let err_messages: Vec<String> = self
+            .checkpoint
+            .lock()
+            .await
+            .iter()
+            .map(|(_, s)| {
+                match s.save() {
+                    Ok(_) => "".to_string(),
+                    Err(msg) => {
+                        error!("{}", msg);
+                        // Err(msg);
+                        msg
+                    }
+                }
+            })
+            .find(|x| !x.is_empty())
+            .into_iter().collect();
+        if !err_messages.is_empty() {
+            return Err(err_messages.join("\n").to_string())
+        }
         Ok(())
     }
 }

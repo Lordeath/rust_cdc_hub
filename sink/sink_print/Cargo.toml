@@ -7,3 +7,4 @@ edition = "2024"
 common = { path = "../../common" }
 async-trait = "0.1.89"
 tracing = "0.1"
+tokio = { version = "1", features = ["full"] }

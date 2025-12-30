@@ -1,11 +1,11 @@
 pub mod mysql_checkpoint;
 
-use std::collections::hash_map::Keys;
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, Utc};
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::HashMap;
+use std::collections::hash_map::Keys;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -20,6 +20,7 @@ use sqlx::{Column, Row, ValueRef};
 use sqlx::{MySql, Pool, TypeInfo};
 
 use serde_json::Value as JsonValue;
+use crate::mysql_checkpoint::MysqlCheckPointDetailEntity;
 
 #[async_trait]
 pub trait Source: Send + Sync {
@@ -31,6 +32,7 @@ pub trait Source: Send + Sync {
     async fn add_plugins(&mut self, plugin: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>);
 
     async fn get_table_info(&mut self) -> Vec<TableInfoVo>;
+
 }
 
 /// Sink trait: 所有目标端都要实现它
@@ -40,9 +42,9 @@ pub trait Sink: Send + Sync {
     async fn connect(&self) -> Result<(), Box<dyn Error + Send + Sync>>;
 
     /// 写入一条数据（可以是 json 或结构化 map）
-    async fn write_record(&self, record: &DataBuffer) -> Result<(), Box<dyn Error + Send + Sync>>;
+    async fn write_record(&mut self, record: &DataBuffer, mysql_check_point_detail_entity: &Option<MysqlCheckPointDetailEntity>) -> Result<(), Box<dyn Error + Send + Sync>>;
 
-    async fn flush_with_retry(&self, from_timer: &FlushByOperation) {
+    async fn flush_with_retry(&mut self, from_timer: &FlushByOperation) {
         let mut loop_count = 0;
         loop {
             let sink_result = self.flush(from_timer).await;
@@ -60,16 +62,30 @@ pub trait Sink: Send + Sync {
                 panic!("flush error");
             }
         }
+        match self.alter_flush().await {
+            Ok(_) => {}
+            Err(e) => { error!("alter flush error: {}", e.to_string())}
+        }
+        ()
     }
 
     /// 刷新缓冲区（可选）
     async fn flush(&self, _from_timer: &FlushByOperation) -> Result<(), String>;
+
+
+    async fn alter_flush(&mut self) -> Result<(), String>;
 }
 
 #[async_trait]
 pub trait Plugin: Send + Sync {
     async fn collect(&mut self, data_buffer: DataBuffer) -> Result<DataBuffer, ()>;
 }
+
+// pub struct AllInOne {
+//     pub source: Arc<Mutex<dyn Source+ Send + Sync>>,
+//     pub sink: Arc<Mutex<dyn Sink + Send + Sync>>,
+//     // pub plugins: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>,
+// }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Display)]
 pub enum SourceType {
@@ -169,7 +185,6 @@ pub struct DataBuffer {
     pub binlog_filename: String,
     pub timestamp: u32,
     pub next_event_position: u32,
-
 }
 
 // pub const VALUE_NONE: Value = Value::None;
@@ -491,12 +506,13 @@ impl CaseInsensitiveHashMap {
     pub fn keys(&self) -> Keys<'_, String, Value> {
         self.map.keys()
     }
-    
+
     pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
-        self.key_map_to_lowercase.insert(k.to_lowercase(), k.clone());
+        self.key_map_to_lowercase
+            .insert(k.to_lowercase(), k.clone());
         self.map.insert(k, v)
     }
-    
+
     pub fn get_raw_map(&self) -> HashMap<String, Value> {
         self.map.clone()
     }

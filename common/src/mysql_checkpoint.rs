@@ -14,7 +14,7 @@ pub struct MysqlCheckPointDetailEntity {
     pub retry_times: u32,
     pub is_new: bool,
 
-    checkpoint_filepath: String,
+    pub checkpoint_filepath: String,
 }
 
 // 使用sqlite或者redis来做检查点
@@ -88,7 +88,7 @@ impl MysqlCheckPointDetailEntity {
     }
 
     // 保存到文件
-    pub fn save(&mut self) -> Result<(), String> {
+    pub fn save(&self) -> Result<(), String> {
         let json_result = serde_json::to_string(&self);
         if let Err(e) = json_result {
             return Err(e.to_string());
