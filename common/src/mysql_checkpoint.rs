@@ -88,12 +88,23 @@ impl MysqlCheckPointDetailEntity {
     }
 
     // 保存到文件
-    pub fn save(&mut self) -> Result<(), ()> {
-        let json = serde_json::to_string(&self).expect("json转换失败");
+    pub fn save(&mut self) -> Result<(), String> {
+        let json_result = serde_json::to_string(&self);
+        if let Err(e) = json_result {
+            return Err(e.to_string());
+        }
         let checkpoint_file = Path::new(&self.checkpoint_filepath);
-        let mut file = File::create(checkpoint_file).expect("创建文件失败");
-        file.write_all(json.as_bytes()).expect("写入文件失败");
-        Ok(())
+        let file_result = File::create(checkpoint_file);
+        if let Err(e) = file_result {
+            return Err(e.to_string());
+        }
+        match file_result
+            .unwrap()
+            .write_all(json_result.unwrap().as_bytes())
+        {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
     }
 }
 
@@ -124,6 +135,5 @@ mod tests {
             "202cb962ac59075b964b07152d234b70",
             format!("{:x}", md5::compute("123"))
         );
-
     }
 }

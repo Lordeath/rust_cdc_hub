@@ -638,8 +638,8 @@ impl Source for MySQLSource {
                     Ok(_) => {
                         *self.checkpoint_entities.lock().await[i].lock().await = checkpoint_entity;
                     }
-                    Err(_) => {
-                        error!("持久化失败");
+                    Err(message) => {
+                        error!("持久化失败: {}", message);
                     }
                 };
             }
