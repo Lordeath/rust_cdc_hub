@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use strum_macros::Display;
 use tokio::sync::Mutex;
-use tracing::error;
+use tracing::{debug, error, info, trace};
 
 use sqlx::mysql::{MySqlPoolOptions, MySqlRow};
 use sqlx::types::BigDecimal;
@@ -62,11 +62,11 @@ pub trait Sink: Send + Sync {
                 panic!("flush error");
             }
         }
+        trace!("flush success");
         match self.alter_flush().await {
             Ok(_) => {}
             Err(e) => { error!("alter flush error: {}", e.to_string())}
         }
-        ()
     }
 
     /// 刷新缓冲区（可选）
@@ -122,6 +122,7 @@ pub struct CdcConfig {
     pub source_batch_size: Option<usize>,
     pub sink_batch_size: Option<usize>,
     pub checkpoint_file_path: Option<String>,
+    pub log_level: Option<String>,
 }
 
 impl CdcConfig {
@@ -221,9 +222,9 @@ impl DataBuffer {
     }
 
     pub fn get_pk(&self, pk_name: &str) -> &Value {
-        let mut result = self.after.get(&pk_name);
+        let mut result = self.after.get(pk_name);
         if result.is_none() {
-            result = self.before.get(&pk_name);
+            result = self.before.get(pk_name);
         }
         result
     }
@@ -497,9 +498,9 @@ impl CaseInsensitiveHashMap {
     }
 
     pub fn get(&self, key: &str) -> &Value {
-        match self.key_map_to_lowercase.get(key) {
+        match self.key_map_to_lowercase.get(&key.to_lowercase()) {
             None => &Value::None,
-            Some(real_key) => self.map.get(real_key).unwrap_or_else(|| &Value::None),
+            Some(real_key) => self.map.get(real_key).unwrap_or(&Value::None),
         }
     }
 
@@ -680,9 +681,10 @@ pub fn mysql_row_to_hashmap(row: &MySqlRow) -> CaseInsensitiveHashMap {
     CaseInsensitiveHashMap::new(result)
 }
 
-pub async fn get_mysql_pool_by_url(connection_url: &str) -> Result<Pool<MySql>, String> {
+pub async fn get_mysql_pool_by_url(connection_url: &str, from: &str) -> Result<Pool<MySql>, String> {
+    info!("Connecting to MySQL: {} from: {}", connection_url, from);
     match MySqlPoolOptions::new()
-        // .max_connections(10)
+        .max_connections(10)
         // 连接空闲超过 20 分钟直接丢弃
         .idle_timeout(Duration::from_secs(20 * 60))
         // 不管用不用，活超过 2 小时就重建
@@ -690,8 +692,14 @@ pub async fn get_mysql_pool_by_url(connection_url: &str) -> Result<Pool<MySql>, 
         .connect(connection_url)
         .await
     {
-        Ok(x) => Ok(x),
-        Err(e) => Err(e.to_string()),
+        Ok(x) => {
+            info!("Connected to MySQL.");
+            Ok(x)
+        },
+        Err(e) => {
+            error!("Failed to connect to MySQL: {}", e);
+            Err(e.to_string())
+        },
     }
 }
 

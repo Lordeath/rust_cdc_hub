@@ -20,9 +20,14 @@ use tracing_subscriber::fmt::time::FormatTime;
 
 #[tokio::main]
 async fn main() {
+
+    let config_path = get_env("CONFIG_PATH");
+    let config: CdcConfig = load_config(&config_path).expect("Failed to load config");
+    let log_level = config.log_level.clone().unwrap_or("info".to_string());
+
     // 设置 tracing 日志格式，自动输出文件名、行号和函数名
     let subscriber = FmtSubscriber::builder()
-        .with_env_filter("info")
+        .with_env_filter(log_level)
         .with_file(true)
         .with_line_number(true)
         .with_target(true)
@@ -38,8 +43,6 @@ async fn main() {
     warn!("App 启动");
     error!("App 启动");
 
-    let config_path = get_env("CONFIG_PATH");
-    let config: CdcConfig = load_config(&config_path).expect("Failed to load config");
     info!("Config Loaded");
     let source: Arc<Mutex<dyn Source>> = SourceFactory::create_source(&config).await;
     add_plugin(&config, &source).await;

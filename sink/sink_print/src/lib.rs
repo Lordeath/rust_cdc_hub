@@ -50,9 +50,7 @@ impl Sink for PrintSink {
         let err_messages: Vec<String> = self
             .checkpoint
             .lock()
-            .await
-            .iter()
-            .map(|(_, s)| {
+            .await.values().map(|s| {
                 match s.save() {
                     Ok(_) => "".to_string(),
                     Err(msg) => {

@@ -1,4 +1,8 @@
-use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value, get_mysql_pool_by_url, mysql_row_to_hashmap, CaseInsensitiveHashMap};
+use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
+use common::{
+    CaseInsensitiveHashMap, CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo,
+    Value, get_mysql_pool_by_url, mysql_row_to_hashmap,
+};
 use meilisearch_sdk::macro_helper::async_trait;
 use sqlx::mysql::{MySqlArguments, MySqlQueryResult};
 use sqlx::query::Query;
@@ -7,10 +11,10 @@ use std::collections::HashMap;
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info};
-use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
+use tracing::log::trace;
 
 pub struct MySqlSink {
-    pool: RwLock<Pool<MySql>>,
+    pool: Mutex<Pool<MySql>>,
     connection_url: String,
     table_info_list: Vec<TableInfoVo>,
     buffer: Mutex<Vec<DataBuffer>>,
@@ -75,7 +79,7 @@ impl MySqlSink {
         }
         let sink_batch_size = config.sink_batch_size.unwrap_or(256);
         MySqlSink {
-            pool: RwLock::new(pool),
+            pool: Mutex::new(pool),
             connection_url,
             table_info_list,
             buffer: Mutex::new(Vec::with_capacity(sink_batch_size)),
@@ -96,34 +100,39 @@ impl MySqlSink {
         database: String,
         connection_url: &str,
     ) -> Result<Pool<MySql>, MySqlSink> {
-        let pool: Pool<MySql> = match get_mysql_pool_by_url(connection_url).await {
-            Ok(o) => o,
-            Err(e) => {
-                if config.auto_create_database.unwrap_or(true) {
-                    let pool_for_auto_create_database = get_mysql_pool_by_url(&format!(
-                        "mysql://{}:{}@{}:{}",
-                        username, password, host, port,
-                    ))
-                    .await
-                    .unwrap();
-                    let sql = format!("CREATE DATABASE IF NOT EXISTS `{}`", database.clone());
-                    match sqlx::query(&sql)
-                        .execute(&pool_for_auto_create_database)
+        let pool: Pool<MySql> =
+            match get_mysql_pool_by_url(connection_url, "mysql sink 自动创建数据库-探测").await
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    if config.auto_create_database.unwrap_or(true) {
+                        let pool_for_auto_create_database = get_mysql_pool_by_url(
+                            &format!("mysql://{}:{}@{}:{}", username, password, host, port,),
+                            "mysql sink 自动创建数据库-创建",
+                        )
                         .await
-                    {
-                        Ok(xx) => xx,
-                        Err(e) => {
-                            error!("Failed to create database: {}", e);
-                            panic!("Failed to create database: {}", e);
-                        }
-                    };
-                    let pool: Pool<MySql> = get_mysql_pool_by_url(connection_url).await.unwrap();
-                    return Ok(pool);
+                        .unwrap();
+                        let sql = format!("CREATE DATABASE IF NOT EXISTS `{}`", database.clone());
+                        match sqlx::query(&sql)
+                            .execute(&pool_for_auto_create_database)
+                            .await
+                        {
+                            Ok(xx) => xx,
+                            Err(e) => {
+                                error!("Failed to create database: {}", e);
+                                panic!("Failed to create database: {}", e);
+                            }
+                        };
+                        let pool: Pool<MySql> =
+                            get_mysql_pool_by_url(connection_url, "mysql sink 自动创建数据库-获取")
+                                .await
+                                .unwrap();
+                        return Ok(pool);
+                    }
+                    error!("Failed to connect to MySQL: {}", e);
+                    panic!("Failed to connect to MySQL: {}", e);
                 }
-                error!("Failed to connect to MySQL: {}", e);
-                panic!("Failed to connect to MySQL: {}", e);
-            }
-        };
+            };
         Ok(pool)
     }
 
@@ -141,20 +150,42 @@ impl MySqlSink {
         &self,
         query: Query<'_, MySql, MySqlArguments>,
     ) -> Result<MySqlQueryResult, String> {
-        match query.execute(&*self.pool.write().await).await {
-            Ok(ok) => Ok(ok),
-            Err(err) => {
-                error!("Failed to execute query: {} 进行重试", err);
-                match get_mysql_pool_by_url(&self.connection_url).await {
-                    Ok(new_pool) => {
-                        *self.pool.write().await = new_pool;
-                    }
-                    Err(_) => {}
+        // let q2 = query.cloned();
+        let result: Result<(Option<MySqlQueryResult>, Option<Pool<MySql>>), String> =
+            match query.execute(&*self.pool.lock().await).await {
+                Ok(ok) => Ok((Some(ok), None)),
+                Err(err) => {
+                    error!("Failed to execute query: {} 进行重试", err);
+                    // tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let temp = match get_mysql_pool_by_url(
+                        &self.connection_url,
+                        "sql执行遇到报错，尝试重新获取连接",
+                    )
+                    .await
+                    {
+                        Ok(new_pool) => Ok((None, Some(new_pool))),
+                        Err(e) => {
+                            info!("重连失败");
+                            Err(e.to_string())
+                        }
+                    };
+                    temp
                 }
-                Err(err.to_string())
+            };
+        if result.is_ok() {
+            let (query_result, new_pool) = result?;
+            if let Some(query_result) = query_result {
+                return Ok(query_result);
+            }
+            if let Some(new_pool) = new_pool {
+                info!("重连成功，正在进行赋值");
+                *self.pool.lock().await = new_pool;
+                info!("赋值成功");
             }
         }
+        Err("sql执行失败".to_string())
     }
+
 }
 
 #[async_trait]
@@ -162,13 +193,17 @@ impl Sink for MySqlSink {
     async fn connect(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         // 测试连接
         sqlx::query("SELECT 1")
-            .execute(&*self.pool.write().await)
+            .execute(&*self.pool.lock().await)
             .await?;
         info!("Connected to MySQL via SQLx");
         Ok(())
     }
 
-    async fn write_record(&mut self, record: &DataBuffer, mysql_check_point_detail_entity: &Option<MysqlCheckPointDetailEntity>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn write_record(
+        &mut self,
+        record: &DataBuffer,
+        mysql_check_point_detail_entity: &Option<MysqlCheckPointDetailEntity>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut buf = self.buffer.lock().await;
         buf.push(record.clone());
         if let Some(s) = mysql_check_point_detail_entity {
@@ -284,7 +319,7 @@ impl Sink for MySqlSink {
                 "#;
                 let stored_cols: Vec<String> = sqlx::query(stored_cols_sql)
                     .bind(&table_name)
-                    .fetch_all(&*self.pool.write().await)
+                    .fetch_all(&*self.pool.lock().await)
                     .await
                     .unwrap()
                     .iter()
@@ -325,8 +360,8 @@ impl Sink for MySqlSink {
 
                 let updates_sql = columns
                     .iter()
+                    .filter(|c| !c.eq_ignore_ascii_case(pk_name.as_str()))
                     .map(|c| format!("`{}` = VALUES(`{}`)", c, c))
-                    .filter(|c| c != pk_name.as_str())
                     .collect::<Vec<_>>()
                     .join(",");
 
@@ -342,38 +377,36 @@ impl Sink for MySqlSink {
                 for row in &inserts {
                     for col in columns {
                         let x = row.get(col);
+                        debug!("inserting {:?} into {}.{}", x, table_name, col);
                         if !x.is_none() {
-                            debug!("inserting {:?} into {}.{}", x, table_name, col);
-                            if !x.is_none() {
-                                if x.is_json()
-                                    && let Value::Json(json) = x
-                                    && json.is_empty()
-                                {
-                                    // query = query.bind::<Json<_>>(Json(json));
-                                    query = query.bind("null");
-                                } else if x.is_json()
-                                    && let Value::Json(json) = x
-                                    && json.eq_ignore_ascii_case("null")
-                                {
-                                    query = query.bind("null");
-                                } else {
-                                    query = query.bind(x.resolve_string());
-                                }
+                            if x.is_json()
+                                && let Value::Json(json) = x
+                                && json.is_empty()
+                            {
+                                // query = query.bind::<Json<_>>(Json(json));
+                                query = query.bind("null");
+                            } else if x.is_json()
+                                && let Value::Json(json) = x
+                                && json.eq_ignore_ascii_case("null")
+                            {
+                                query = query.bind("null");
                             } else {
-                                query = query.bind(None::<String>);
+                                query = query.bind(x.resolve_string());
                             }
+                        } else {
+                            query = query.bind(None::<String>);
                         }
                     }
                 }
-
+                debug!("MySQL batch UPSERT: {}", sql);
                 if let Err(e) = self.execute_with_retry(query).await {
                     error!("MySQL batch UPSERT error: {:?}", e);
-                    error!("need do it again: {}", cache_for_roll_back.len());
+                    error!("need to do it again: {}", cache_for_roll_back.len());
                     let mut buf = self.buffer.lock().await;
                     for cached_data_buffer in cache_for_roll_back {
                         buf.push(cached_data_buffer);
                     }
-                    return Err(e);
+                    return Err("sql执行报错".to_string());
                 }
             }
         }
@@ -401,7 +434,7 @@ impl Sink for MySqlSink {
 
                 if let Err(e) = self.execute_with_retry(query).await {
                     error!("MySQL batch delete error: {:?}", e);
-                    error!("need do it again: {}", cache_for_roll_back.len());
+                    error!("need to do it again: {}", cache_for_roll_back.len());
                     let mut buf = self.buffer.lock().await;
                     for cached_data_buffer in cache_for_roll_back {
                         buf.push(cached_data_buffer);
@@ -419,8 +452,8 @@ impl Sink for MySqlSink {
             .checkpoint
             .lock()
             .await
-            .iter()
-            .map(|(_, s)| {
+            .values()
+            .map(|s| {
                 match s.save() {
                     Ok(_) => "".to_string(),
                     Err(msg) => {
@@ -431,10 +464,12 @@ impl Sink for MySqlSink {
                 }
             })
             .find(|x| !x.is_empty())
-            .into_iter().collect();
+            .into_iter()
+            .collect();
         if !err_messages.is_empty() {
-            return Err(err_messages.join("\n").to_string())
+            return Err(err_messages.join("\n").to_string());
         }
+        trace!("alter flush done");
         Ok(())
     }
 }

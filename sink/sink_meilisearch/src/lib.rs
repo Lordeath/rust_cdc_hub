@@ -147,7 +147,7 @@ impl Sink for MeiliSearchSink {
                 .await
         {
             error!("Batch upsert error: {}", e);
-            error!("need do it again: {}", cache_for_roll_back.len());
+            error!("need to do it again: {}", cache_for_roll_back.len());
             let mut buf = self.buffer.lock().await;
             for cached_data_buffer in cache_for_roll_back {
                 buf.push(cached_data_buffer);
@@ -159,7 +159,7 @@ impl Sink for MeiliSearchSink {
             && let Err(e) = index.delete_documents(&deletes).await
         {
             error!("Batch delete error: {}", e);
-            error!("need do it again: {}", cache_for_roll_back.len());
+            error!("need to do it again: {}", cache_for_roll_back.len());
             let mut buf = self.buffer.lock().await;
             for cached_data_buffer in cache_for_roll_back {
                 buf.push(cached_data_buffer);
@@ -174,9 +174,7 @@ impl Sink for MeiliSearchSink {
         let err_messages: Vec<String> = self
             .checkpoint
             .lock()
-            .await
-            .iter()
-            .map(|(_, s)| {
+            .await.values().map(|s| {
                 match s.save() {
                     Ok(_) => "".to_string(),
                     Err(msg) => {

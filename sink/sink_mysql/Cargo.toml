@@ -8,4 +8,4 @@ common = { path = "../../common" }
 meilisearch-sdk = "0"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
-sqlx = { version = "0.8", default-features = false, features = ["mysql", "tls-rustls", "runtime-tokio", "sqlx-macros", "chrono", "bigdecimal"] }
+sqlx = { version = "0.7.4", default-features = false, features = ["mysql", "tls-rustls", "runtime-tokio", "sqlx-macros", "chrono", "bigdecimal"] }
