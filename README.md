@@ -105,7 +105,7 @@ sink_config:
 - [x] mysql数据源
 - [x] meilisearch 的 sink
 - [x] mysql 的 sink
-- [ ] starrocks 的 sink
+- [X] starrocks 的 sink
 - [ ] starrocks的sink时，自动建表，自动建库，自动加字段
 - [ ] 断点续传，挂掉之后自动重启，然后继续执行之前的作业
 - [x] 重试的时候，不drop掉对象，防止重试的时候对象被drop。等到成功之后再drop对象
