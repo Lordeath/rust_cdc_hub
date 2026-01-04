@@ -316,8 +316,8 @@ impl MySQLSource {
             for table in tables {
                 let mysql_checkpoint_detail_entity = MysqlCheckPointDetailEntity::from_config(
                     config
-                        .clone()
                         .checkpoint_file_path
+                        .clone()
                         .unwrap_or("/checkpoint".to_string()),
                     &connection_url,
                     table.clone(),
@@ -328,10 +328,6 @@ impl MySQLSource {
             }
             checkpoint_entities.push(Mutex::new(mysql_checkpoint_detail_entity_map.clone()));
 
-            // let start_position = StartPosition::BinlogPosition(
-            //     mysql_checkpoint_detail_entity.clone().last_binlog_filename,
-            //     mysql_checkpoint_detail_entity.clone().last_binlog_position,
-            // );
             let start_position: StartPosition = if mysql_checkpoint_detail_entity_map
                 .values()
                 .all(|entity| entity.is_new)
@@ -449,7 +445,7 @@ impl Source for MySQLSource {
                         &mut self.checkpoint_entities.lock().await[i];
                     let checkpoint_entity = &mut xxxx.lock().await
                         .get(&table_name.to_lowercase())
-                        .expect(&format!("{} not found", table_name)).clone();
+                        .unwrap_or_else(|| panic!("{} not found", table_name)).clone();
                     // let checkpoint_entity = xxxx.clone();
                     if !checkpoint_entity.is_new {
                         info!("跳过初始化数据源: {}", config.connection_url);
@@ -571,8 +567,8 @@ impl Source for MySQLSource {
                                         after,
                                         op,
                                         binlog_filename.clone(),
-                                        timestamp.clone(),
-                                        next_event_position.clone(),
+                                        timestamp,
+                                        next_event_position,
                                     );
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;
@@ -630,8 +626,8 @@ impl Source for MySQLSource {
                                         after,
                                         op,
                                         binlog_filename.clone(),
-                                        timestamp.clone(),
-                                        next_event_position.clone(),
+                                        timestamp,
+                                        next_event_position,
                                     );
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;
@@ -688,8 +684,8 @@ impl Source for MySQLSource {
                                         after,
                                         op,
                                         binlog_filename.clone(),
-                                        timestamp.clone(),
-                                        next_event_position.clone(),
+                                        timestamp,
+                                        next_event_position,
                                     );
                                     let plugin_data =
                                         detail_with_plugin(plugins, data_buffer).await;

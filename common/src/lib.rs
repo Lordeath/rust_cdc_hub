@@ -1,7 +1,7 @@
 pub mod mysql_checkpoint;
 
 use async_trait::async_trait;
-use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::HashMap;
@@ -598,6 +598,14 @@ pub fn mysql_row_to_hashmap(row: &MySqlRow) -> CaseInsensitiveHashMap {
                 },
                 "DATE" => match row.try_get::<NaiveDate, _>(name.as_str()) {
                     Ok(v) => Value::String(v.to_string()),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "TIME" => match row.try_get::<NaiveTime, _>(name.as_str()) {
+                    Ok(v) => Value::String(v.format("%H:%M:%S").to_string()),
                     Err(e) => {
                         error!("类型转换失败: {}", column.type_info().name());
                         error!("{}", e);
