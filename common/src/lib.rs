@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use strum_macros::Display;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, trace};
+use tracing::{error, info, trace};
 
 use sqlx::mysql::{MySqlPoolOptions, MySqlRow};
 use sqlx::types::BigDecimal;
@@ -663,6 +663,14 @@ pub fn mysql_row_to_hashmap(row: &MySqlRow) -> CaseInsensitiveHashMap {
                 },
                 "DECIMAL" => match row.try_get::<BigDecimal, _>(name.as_str()) {
                     Ok(v) => Value::Decimal(v.to_string()), // 假设您有 Value::Decimal 变体
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "BLOB" => match row.try_get::<Vec<u8>, _>(name.as_str()) {
+                    Ok(v) => Value::Blob(String::from_utf8(v).expect("Invalid UTF-8").to_string()),
                     Err(e) => {
                         error!("类型转换失败: {}", column.type_info().name());
                         error!("{}", e);
