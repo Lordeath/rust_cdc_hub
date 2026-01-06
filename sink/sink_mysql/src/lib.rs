@@ -149,13 +149,14 @@ impl MySqlSink {
     async fn execute_with_retry(
         &self,
         query: Query<'_, MySql, MySqlArguments>,
+        sql: String,
     ) -> Result<MySqlQueryResult, String> {
         // let q2 = query.cloned();
         let result: Result<(Option<MySqlQueryResult>, Option<Pool<MySql>>), String> =
             match query.execute(&*self.pool.lock().await).await {
                 Ok(ok) => Ok((Some(ok), None)),
                 Err(err) => {
-                    error!("Failed to execute query: {} 进行重试", err);
+                    error!("Failed to execute query: {} 进行重试, sql: {}", err, sql);
                     // tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     let temp = match get_mysql_pool_by_url(
                         &self.connection_url,
@@ -399,7 +400,7 @@ impl Sink for MySqlSink {
                     }
                 }
                 debug!("MySQL batch UPSERT: {}", sql);
-                if let Err(e) = self.execute_with_retry(query).await {
+                if let Err(e) = self.execute_with_retry(query, sql.clone()).await {
                     error!("MySQL batch UPSERT error: {:?}", e);
                     error!("need to do it again: {}", cache_for_roll_back.len());
                     let mut buf = self.buffer.lock().await;
@@ -432,7 +433,7 @@ impl Sink for MySqlSink {
                     query = query.bind(pk);
                 }
 
-                if let Err(e) = self.execute_with_retry(query).await {
+                if let Err(e) = self.execute_with_retry(query, sql.clone()).await {
                     error!("MySQL batch delete error: {:?}", e);
                     error!("need to do it again: {}", cache_for_roll_back.len());
                     let mut buf = self.buffer.lock().await;
