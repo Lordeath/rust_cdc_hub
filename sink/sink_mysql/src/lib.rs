@@ -10,8 +10,8 @@ use sqlx::{MySql, Pool};
 use std::collections::HashMap;
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, error, info};
 use tracing::log::trace;
+use tracing::{debug, error, info};
 
 pub struct MySqlSink {
     pool: Mutex<Pool<MySql>>,
@@ -186,7 +186,6 @@ impl MySqlSink {
         }
         Err("sql执行失败".to_string())
     }
-
 }
 
 #[async_trait]
@@ -366,12 +365,17 @@ impl Sink for MySqlSink {
                     .collect::<Vec<_>>()
                     .join(",");
 
-                let sql = format!(
-                    "INSERT INTO `{}` ({})
-                 VALUES {}
-                 ON DUPLICATE KEY UPDATE {}",
-                    table_name, cols_str, values_sql, updates_sql
-                );
+                let sql = if columns.len() == 1 {
+                    format!(
+                        "INSERT INTO `{}` ({}) VALUES {}",
+                        table_name, cols_str, values_sql
+                    )
+                } else {
+                    format!(
+                        "INSERT INTO `{}` ({}) VALUES {} ON DUPLICATE KEY UPDATE {}",
+                        table_name, cols_str, values_sql, updates_sql
+                    )
+                };
 
                 let mut query = sqlx::query(&sql);
 
