@@ -344,7 +344,7 @@ impl Sink for MySqlSink {
         if !insert_map.is_empty() {
             for (table_name, inserts) in insert_map {
                 let columns = column_map.get(&table_name).unwrap();
-                let pk_name = self.get_pk_name_from_cache(&table_name).await;
+                // let pk_name = self.get_pk_name_from_cache(&table_name).await;
                 let cols_str = columns
                     .iter()
                     .map(|c| format!("`{}`", c))
@@ -360,22 +360,15 @@ impl Sink for MySqlSink {
 
                 let updates_sql = columns
                     .iter()
-                    .filter(|c| !c.eq_ignore_ascii_case(pk_name.as_str()))
+                    // .filter(|c| !c.eq_ignore_ascii_case(pk_name.as_str()))
                     .map(|c| format!("`{}` = VALUES(`{}`)", c, c))
                     .collect::<Vec<_>>()
                     .join(",");
 
-                let sql = if columns.len() == 1 {
-                    format!(
-                        "INSERT INTO `{}` ({}) VALUES {}",
-                        table_name, cols_str, values_sql
-                    )
-                } else {
-                    format!(
-                        "INSERT INTO `{}` ({}) VALUES {} ON DUPLICATE KEY UPDATE {}",
-                        table_name, cols_str, values_sql, updates_sql
-                    )
-                };
+                let sql = format!(
+                    "INSERT INTO `{}` ({}) VALUES {} ON DUPLICATE KEY UPDATE {}",
+                    table_name, cols_str, values_sql, updates_sql
+                );
 
                 let mut query = sqlx::query(&sql);
 
