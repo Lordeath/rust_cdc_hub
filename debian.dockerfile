@@ -29,7 +29,7 @@ RUN cargo build --release
 # =========================
 # 2. 运行阶段
 # =========================
-FROM debian:bookworm-20251208
+FROM debian:bookworm-20251229
 
 WORKDIR /app
 
@@ -38,10 +38,10 @@ COPY --from=builder /app/target/release/rust_cdc_hub /app/rust_cdc_hub
 
 RUN mkdir -p /checkpoint
 
-# 非 root 运行
-RUN useradd -r -s /sbin/nologin appuser \
-    && chown appuser:appuser /app/rust_cdc_hub
-
-USER appuser
+## 非 root 运行
+#RUN useradd -r -s /sbin/nologin appuser \
+#    && chown appuser:appuser /app/rust_cdc_hub
+#
+#USER appuser
 
 ENTRYPOINT ["/app/rust_cdc_hub"]
