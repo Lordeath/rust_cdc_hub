@@ -455,7 +455,7 @@ impl<'de> Deserialize<'de> for Value {
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub enum Operation {
     // READ,
-    CREATE,
+    CREATE(bool),
     UPDATE,
     DELETE,
     TRUNCATE,

@@ -64,6 +64,11 @@ impl MysqlSourceConfig {
             .split(',')
             .map(|s| s.trim().to_string())
             .collect();
+        let except_table_name_prefix: Vec<String> = config
+            .first_source("except_table_name_prefix")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect();
 
         for i in 0..size {
             let username = config.source("username", i);
@@ -81,7 +86,9 @@ impl MysqlSourceConfig {
                 database.clone(),
             );
             let mut table_info_list: Vec<TableInfoVo> = vec![];
-            let pool = get_mysql_pool_by_url(&connection_url, "mysql source 初始化获取数据结构").await.unwrap();
+            let pool = get_mysql_pool_by_url(&connection_url, "mysql source 初始化获取数据结构")
+                .await
+                .unwrap();
             if table_name_list.is_empty()
                 || table_name_list.len() == 1
                     && (table_name_list[0].eq_ignore_ascii_case("all")
@@ -187,10 +194,34 @@ impl MysqlSourceConfig {
                 batchsize: config.source_batch_size.unwrap_or(8192),
             });
         }
+        table_name_list = table_name_list
+            .iter()
+            .filter(|t| !Self::judge_is_skip(&except_table_name_prefix, t))
+            .map(|t| t.to_string())
+            .collect();
+        if table_name_list.is_empty() {
+            error!("no table found");
+            panic!("no table found");
+        }
         MysqlSourceConfig {
             table_name_list,
             mysql_source,
         }
+    }
+
+    fn judge_is_skip(except_table_name_prefix: &Vec<String>, table_name: &String) -> bool {
+        let mut skip = false;
+        for skip_prefix in except_table_name_prefix {
+            if table_name
+                .to_lowercase()
+                .starts_with(skip_prefix.to_lowercase().as_str())
+            {
+                skip = true;
+                info!("跳过表: {} 使用的表前缀: {}", table_name, skip_prefix);
+                break;
+            }
+        }
+        skip
     }
 }
 
@@ -277,7 +308,7 @@ impl MysqlSourceConfigDetail {
         for row in rows {
             let before = CaseInsensitiveHashMap::new(HashMap::new());
             let after = mysql_row_to_hashmap(&row);
-            let op = Operation::CREATE;
+            let op = Operation::CREATE(true);
             result.push(DataBuffer::new(
                 table_name.to_string(),
                 before,
@@ -347,12 +378,6 @@ impl MySQLSource {
                 StartPosition::BinlogPosition(max.last_binlog_filename, max.last_binlog_position)
             };
 
-            // info!(
-            //     "binlog读取开始: filename: {}, position: {:?}",
-            //     mysql_checkpoint_detail_entity.clone().last_binlog_filename,
-            //     mysql_checkpoint_detail_entity.clone().last_binlog_position
-            // );
-
             let client: BinlogStream =
                 BinlogClient::new(&connection_url, server_id, start_position)
                     .with_master_heartbeat(Duration::from_secs(5))
@@ -364,7 +389,9 @@ impl MySQLSource {
 
             streams.push(client);
             mysql_source.push(cfg.mysql_source[i].clone());
-            let pool: Pool<MySql> = get_mysql_pool_by_url(&connection_url, "mysql source 初始化").await.unwrap();
+            let pool: Pool<MySql> = get_mysql_pool_by_url(&connection_url, "mysql source 初始化")
+                .await
+                .unwrap();
             pools.push(pool);
             binlog_filename_list
                 .lock()
@@ -441,12 +468,15 @@ impl Source for MySQLSource {
 
                 for table_info_vo in config.table_info_list.clone() {
                     let table_name = table_info_vo.table_name.clone();
-                    let xxxx: &mut Mutex<HashMap<String, MysqlCheckPointDetailEntity>> =
-                        &mut self.checkpoint_entities.lock().await[i];
-                    let checkpoint_entity = &mut xxxx.lock().await
+                    let checkpoint_entity: &mut Mutex<
+                        HashMap<String, MysqlCheckPointDetailEntity>,
+                    > = &mut self.checkpoint_entities.lock().await[i];
+                    let checkpoint_entity = &mut checkpoint_entity
+                        .lock()
+                        .await
                         .get(&table_name.to_lowercase())
-                        .unwrap_or_else(|| panic!("{} not found", table_name)).clone();
-                    // let checkpoint_entity = xxxx.clone();
+                        .unwrap_or_else(|| panic!("{} not found", table_name))
+                        .clone();
                     if !checkpoint_entity.is_new {
                         info!("跳过初始化数据源: {}", config.connection_url);
                         continue;
@@ -497,6 +527,14 @@ impl Source for MySQLSource {
                         count,
                         start.elapsed()
                     );
+                    match sink.lock().await.alter_flush().await {
+                        Ok(_) => {
+                            info!("alter_flush success")
+                        }
+                        Err(e) => {
+                            error!("alter_flush error: {}", e)
+                        }
+                    }
                 }
             }
             info!("MySQL数据源初始化完成, cost: {:?}", start_all.elapsed());
@@ -513,7 +551,10 @@ impl Source for MySQLSource {
                 let stream: &mut BinlogStream = &mut self.streams[i];
                 let pool: &mut Pool<MySql> = &mut self.pools[i];
                 let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
-                let mut to_modify = self.checkpoint_entities.lock().await[i].lock().await.clone();
+                let mut to_modify = self.checkpoint_entities.lock().await[i]
+                    .lock()
+                    .await
+                    .clone();
 
                 match stream.read().await {
                     Ok((header, data)) => match data {
@@ -545,7 +586,8 @@ impl Source for MySQLSource {
                                         .lock()
                                         .await
                                         .get(&table_name.to_lowercase())
-                                        .expect("checkpoint_entity not found").clone();
+                                        .expect("checkpoint_entity not found")
+                                        .clone();
                                 let mut checkpoint_entity = checkpoint_entity.clone();
 
                                 let binlog_filename = self.binlog_filename_list.lock().await[i]
@@ -560,7 +602,7 @@ impl Source for MySQLSource {
                                     let after: CaseInsensitiveHashMap =
                                         parse_row(row, table_name, &mut columns, config, pool)
                                             .await;
-                                    let op = Operation::CREATE;
+                                    let op = Operation::CREATE(false);
                                     let data_buffer = DataBuffer::new(
                                         table_name.to_string(),
                                         before,
@@ -584,7 +626,8 @@ impl Source for MySQLSource {
                                 if !binlog_filename.is_empty() {
                                     checkpoint_entity = checkpoint_entity
                                         .update(binlog_filename, next_event_position);
-                                    to_modify.insert(checkpoint_entity.table.clone(), checkpoint_entity);
+                                    to_modify
+                                        .insert(checkpoint_entity.table.clone(), checkpoint_entity);
                                 }
                             }
                         }
@@ -604,7 +647,8 @@ impl Source for MySQLSource {
                                         .lock()
                                         .await
                                         .get(&table_name.to_lowercase())
-                                        .expect("checkpoint_entity not found").clone();
+                                        .expect("checkpoint_entity not found")
+                                        .clone();
                                 let mut checkpoint_entity = checkpoint_entity.clone();
 
                                 let binlog_filename = self.binlog_filename_list.lock().await[i]
@@ -643,7 +687,8 @@ impl Source for MySQLSource {
                                 if !binlog_filename.is_empty() {
                                     checkpoint_entity = checkpoint_entity
                                         .update(binlog_filename, next_event_position);
-                                    to_modify.insert(checkpoint_entity.table.clone(), checkpoint_entity);
+                                    to_modify
+                                        .insert(checkpoint_entity.table.clone(), checkpoint_entity);
                                 }
                             }
                         }
@@ -663,7 +708,8 @@ impl Source for MySQLSource {
                                         .lock()
                                         .await
                                         .get(&table_name.to_lowercase())
-                                        .expect("checkpoint_entity not found").clone();
+                                        .expect("checkpoint_entity not found")
+                                        .clone();
                                 let mut checkpoint_entity = checkpoint_entity.clone();
 
                                 let binlog_filename = self.binlog_filename_list.lock().await[i]
@@ -702,7 +748,8 @@ impl Source for MySQLSource {
                                 if !binlog_filename.is_empty() {
                                     checkpoint_entity = checkpoint_entity
                                         .update(binlog_filename, next_event_position);
-                                    to_modify.insert(checkpoint_entity.table.clone(), checkpoint_entity);
+                                    to_modify
+                                        .insert(checkpoint_entity.table.clone(), checkpoint_entity);
                                 }
                             }
                         }

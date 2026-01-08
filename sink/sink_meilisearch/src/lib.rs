@@ -119,7 +119,7 @@ impl Sink for MeiliSearchSink {
         for r in batch {
             cache_for_roll_back.push(r.clone());
             match r.op {
-                Operation::CREATE | Operation::UPDATE => {
+                Operation::CREATE(_) | Operation::UPDATE => {
                     docs.push(r.after);
                 }
                 Operation::DELETE => {

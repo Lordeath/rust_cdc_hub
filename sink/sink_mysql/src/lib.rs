@@ -288,7 +288,7 @@ impl Sink for MySqlSink {
                 .clone();
             cache_for_roll_back.push(r.clone());
             match r.op {
-                Operation::CREATE | Operation::UPDATE => {
+                Operation::CREATE(_) | Operation::UPDATE => {
                     insert_map.entry(table_name).or_default().push(r.after)
                 }
                 Operation::DELETE => {
@@ -379,16 +379,18 @@ impl Sink for MySqlSink {
                         if !x.is_none() {
                             if x.is_json()
                                 && let Value::Json(json) = x
-                                && json.is_empty()
+                                && (json.is_empty() || json.eq_ignore_ascii_case("null"))
                             {
                                 // query = query.bind::<Json<_>>(Json(json));
                                 query = query.bind("null");
-                            } else if x.is_json()
-                                && let Value::Json(json) = x
-                                && json.eq_ignore_ascii_case("null")
-                            {
-                                query = query.bind("null");
-                            } else {
+                            }
+                            // else if x.is_json()
+                            //     && let Value::Json(json) = x
+                            //     && json.eq_ignore_ascii_case("null")
+                            // {
+                            //     query = query.bind("null");
+                            // }
+                            else {
                                 query = query.bind(x.resolve_string());
                             }
                         } else {
