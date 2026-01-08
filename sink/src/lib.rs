@@ -3,9 +3,9 @@ use log::info;
 use sink_meilisearch::MeiliSearchSink;
 use sink_mysql::MySqlSink;
 use sink_print::PrintSink;
+use sink_starrocks::StarrocksSink;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use sink_starrocks::StarrocksSink;
 
 pub struct SinkFactory;
 
@@ -21,7 +21,9 @@ impl SinkFactory {
                 Arc::new(Mutex::new(MeiliSearchSink::new(config, table_info_list)))
             }
             SinkType::MySQL => Arc::new(Mutex::new(MySqlSink::new(config, table_info_list).await)),
-            SinkType::Starrocks => Arc::new(Mutex::new(StarrocksSink::new(config, table_info_list).await)),
+            SinkType::Starrocks => Arc::new(Mutex::new(
+                StarrocksSink::new(config, table_info_list).await,
+            )),
         }
     }
 }

@@ -1,10 +1,10 @@
-use std::collections::HashMap;
 use async_trait::async_trait;
+use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::{CdcConfig, DataBuffer, FlushByOperation, Sink, TableInfoVo};
+use std::collections::HashMap;
 use std::error::Error;
 use tokio::sync::Mutex;
 use tracing::{error, info};
-use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 
 pub struct PrintSink {
     config: CdcConfig,
@@ -27,7 +27,11 @@ impl Sink for PrintSink {
         Ok(())
     }
 
-    async fn write_record(&mut self, record: &DataBuffer, mysql_check_point_detail_entity: &Option<MysqlCheckPointDetailEntity>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn write_record(
+        &mut self,
+        record: &DataBuffer,
+        mysql_check_point_detail_entity: &Option<MysqlCheckPointDetailEntity>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         info!("进入print");
         info!("{:?}", record);
         if let Some(s) = mysql_check_point_detail_entity {
@@ -39,10 +43,7 @@ impl Sink for PrintSink {
         Ok(())
     }
 
-    async fn flush(
-        &self,
-        _from_timer: &FlushByOperation,
-    ) -> Result<(), String> {
+    async fn flush(&self, _from_timer: &FlushByOperation) -> Result<(), String> {
         Ok(())
     }
 
@@ -50,7 +51,9 @@ impl Sink for PrintSink {
         let err_messages: Vec<String> = self
             .checkpoint
             .lock()
-            .await.values().map(|s| {
+            .await
+            .values()
+            .map(|s| {
                 match s.save() {
                     Ok(_) => "".to_string(),
                     Err(msg) => {
@@ -61,9 +64,10 @@ impl Sink for PrintSink {
                 }
             })
             .find(|x| !x.is_empty())
-            .into_iter().collect();
+            .into_iter()
+            .collect();
         if !err_messages.is_empty() {
-            return Err(err_messages.join("\n").to_string())
+            return Err(err_messages.join("\n").to_string());
         }
         Ok(())
     }

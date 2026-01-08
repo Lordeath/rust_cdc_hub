@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo};
 use meilisearch_sdk::client::Client;
 use meilisearch_sdk::macro_helper::async_trait;
+use std::collections::HashMap;
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
-use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 
 const BATCH_SIZE: usize = 8192;
 
@@ -59,7 +59,11 @@ impl Sink for MeiliSearchSink {
         Ok(())
     }
 
-    async fn write_record(&mut self, record: &DataBuffer, mysql_check_point_detail_entity: &Option<MysqlCheckPointDetailEntity>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn write_record(
+        &mut self,
+        record: &DataBuffer,
+        mysql_check_point_detail_entity: &Option<MysqlCheckPointDetailEntity>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut buf = self.buffer.lock().await;
         buf.push(record.clone());
         if let Some(s) = mysql_check_point_detail_entity {
@@ -76,10 +80,7 @@ impl Sink for MeiliSearchSink {
         Ok(())
     }
 
-    async fn flush(
-        &self,
-        flush_by_operation: &FlushByOperation,
-    ) -> Result<(), String> {
+    async fn flush(&self, flush_by_operation: &FlushByOperation) -> Result<(), String> {
         let mut buf = self.buffer.lock().await;
         match flush_by_operation {
             FlushByOperation::Timer => {
@@ -174,7 +175,9 @@ impl Sink for MeiliSearchSink {
         let err_messages: Vec<String> = self
             .checkpoint
             .lock()
-            .await.values().map(|s| {
+            .await
+            .values()
+            .map(|s| {
                 match s.save() {
                     Ok(_) => "".to_string(),
                     Err(msg) => {
@@ -185,14 +188,11 @@ impl Sink for MeiliSearchSink {
                 }
             })
             .find(|x| !x.is_empty())
-            .into_iter().collect();
+            .into_iter()
+            .collect();
         if !err_messages.is_empty() {
-            return Err(err_messages.join("\n").to_string())
+            return Err(err_messages.join("\n").to_string());
         }
         Ok(())
     }
-
-    // async fn alter_flush(&mut self) -> Result<(), String> {
-    //     Ok(())
-    // }
 }

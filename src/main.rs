@@ -20,7 +20,6 @@ use tracing_subscriber::fmt::time::FormatTime;
 
 #[tokio::main]
 async fn main() {
-
     let config_path = get_env("CONFIG_PATH");
     let config: CdcConfig = load_config(&config_path).expect("Failed to load config");
     let log_level = config.log_level.clone().unwrap_or("info".to_string());

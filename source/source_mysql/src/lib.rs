@@ -530,7 +530,10 @@ impl Source for MySQLSource {
                     );
                     match checkpoint_entity.save() {
                         Ok(_) => {
-                            info!("alter_flush success {}", checkpoint_entity.checkpoint_filepath)
+                            info!(
+                                "alter_flush success {}",
+                                checkpoint_entity.checkpoint_filepath
+                            )
                         }
                         Err(e) => {
                             error!("alter_flush error: {}", e)

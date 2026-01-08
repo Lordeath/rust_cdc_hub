@@ -78,11 +78,13 @@ impl StarrocksClient {
             let text = resp.text().await?;
 
             // 检查是否成功
-            return if text.contains(r#""Status":"Success""#) || text.contains(r#""Status": "Success""#) {
+            return if text.contains(r#""Status":"Success""#)
+                || text.contains(r#""Status": "Success""#)
+            {
                 Ok(())
             } else {
                 Err(format!("StarRocks Stream Load failed: {}", text).into())
-            }
+            };
         }
 
         // 读取响应文本

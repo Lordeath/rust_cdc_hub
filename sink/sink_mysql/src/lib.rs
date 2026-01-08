@@ -218,8 +218,7 @@ impl MySqlSink {
     }
 
     fn remove_cols(cols: &mut [String], to_remove_cols: &Vec<String>) -> Vec<String> {
-        cols
-            .iter()
+        cols.iter()
             .filter(|f| {
                 let mut b = true;
                 for to_check in to_remove_cols {
@@ -234,8 +233,7 @@ impl MySqlSink {
             .collect()
     }
     fn contains_cols(cols: &mut [String], to_remove_cols: &Vec<String>) -> Vec<String> {
-        cols
-            .iter()
+        cols.iter()
             .filter(|f| {
                 let mut b = false;
                 for to_check in to_remove_cols {
@@ -332,7 +330,6 @@ impl Sink for MySqlSink {
                     }
                 }
             }
-            // let table_info_vo = self.table_info_cache.lock().await.get(&table_name).unwrap();
             let pk_name = self
                 .table_info_cache
                 .lock()
@@ -357,7 +354,6 @@ impl Sink for MySqlSink {
                 Operation::DELETE => {
                     let pk = r.get_pk(pk_name.as_str());
                     if !pk.is_none() {
-                        // deletes.push(pk.resolve_string());
                         delete_map
                             .entry(table_name)
                             .or_default()
@@ -436,14 +432,7 @@ impl Sink for MySqlSink {
                             {
                                 // query = query.bind::<Json<_>>(Json(json));
                                 query = query.bind("null");
-                            }
-                            // else if x.is_json()
-                            //     && let Value::Json(json) = x
-                            //     && json.eq_ignore_ascii_case("null")
-                            // {
-                            //     query = query.bind("null");
-                            // }
-                            else {
+                            } else {
                                 query = query.bind(x.resolve_string());
                             }
                         } else {

@@ -263,20 +263,22 @@ impl Sink for StarrocksSink {
         let err_messages: Vec<String> = self
             .checkpoint
             .lock()
-            .await.values().map(|s| {
+            .await
+            .values()
+            .map(|s| {
                 match s.save() {
                     Ok(_) => "".to_string(),
                     Err(msg) => {
                         error!("{}", msg);
-                        // Err(msg);
                         msg
                     }
                 }
             })
             .find(|x| !x.is_empty())
-            .into_iter().collect();
+            .into_iter()
+            .collect();
         if !err_messages.is_empty() {
-            return Err(err_messages.join("\n").to_string())
+            return Err(err_messages.join("\n").to_string());
         }
         Ok(())
     }

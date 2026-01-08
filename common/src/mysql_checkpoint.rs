@@ -20,11 +20,16 @@ pub struct MysqlCheckPointDetailEntity {
 
 // 使用sqlite或者redis来做检查点
 impl MysqlCheckPointDetailEntity {
-    pub async fn from_config(checkpoint_file_path: String, connection_url: &String, table: String) -> Self {
+    pub async fn from_config(
+        checkpoint_file_path: String,
+        connection_url: &String,
+        table: String,
+    ) -> Self {
         // 1. 确保 checkpoint 目录存在
         let dir = Path::new(&checkpoint_file_path);
         if !dir.exists() {
-            fs::create_dir_all(dir).unwrap_or_else(|_| panic!("创建目录失败: {}", &checkpoint_file_path));
+            fs::create_dir_all(dir)
+                .unwrap_or_else(|_| panic!("创建目录失败: {}", &checkpoint_file_path));
         }
         let checkpoint_filepath = format!(
             "{}/checkpoint_{}_{:x}.json",
@@ -34,9 +39,12 @@ impl MysqlCheckPointDetailEntity {
         );
 
         // 3. 建立 MySQL Pool
-        let pool: Pool<MySql> = get_mysql_pool_by_url(connection_url, &format!("checkpoint 初始化建立连接 {}", &table))
-            .await
-            .unwrap_or_else(|_| panic!("获取mysql连接池失败: {}", &connection_url));
+        let pool: Pool<MySql> = get_mysql_pool_by_url(
+            connection_url,
+            &format!("checkpoint 初始化建立连接 {}", &table),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("获取mysql连接池失败: {}", &connection_url));
 
         // 4. 获取当前 MySQL binlog 起点
         let (last_binlog_filename, last_binlog_position) = fetch_mysql_start_position(&pool).await;
@@ -116,14 +124,7 @@ pub async fn fetch_mysql_start_position(pool: &Pool<MySql>) -> (String, u32) {
     let binlog_file: String = row.try_get(0).unwrap();
     let position: u64 = row.try_get(1).unwrap();
     let position = format!("{:?}", position);
-    (
-        // StartPosition::BinlogPosition(
-        //     binlog_file.clone(),
-        //     position.clone().parse::<u32>().unwrap(),
-        // ),
-        binlog_file,
-        position.clone().parse::<u32>().unwrap(),
-    )
+    (binlog_file, position.clone().parse::<u32>().unwrap())
 }
 
 #[cfg(test)]
