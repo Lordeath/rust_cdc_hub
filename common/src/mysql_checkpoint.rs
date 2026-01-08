@@ -48,18 +48,14 @@ impl MysqlCheckPointDetailEntity {
             // let mut file = File::create(checkpoint_file).expect("创建文件失败");
 
             // let init_checkpoint = format!(r#"{"binlog_file": "{}","position": {}}"#, last_binlog_filename, last_binlog_position);
-            let entity = MysqlCheckPointDetailEntity {
+            MysqlCheckPointDetailEntity {
                 last_binlog_filename,
                 last_binlog_position,
                 retry_times: 0,
                 is_new: true,
                 checkpoint_filepath: checkpoint_filepath.to_string(),
                 table,
-            };
-            // let json = serde_json::to_string(&entity).expect("json转换失败");
-
-            // file.write_all(json.as_bytes()).expect("写入文件失败");
-            entity
+            }
         } else {
             // 从文件里面进行查看
             let json = fs::read_to_string(checkpoint_file).expect("读取文件失败");

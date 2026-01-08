@@ -151,14 +151,12 @@ impl MySqlSink {
         query: Query<'_, MySql, MySqlArguments>,
         sql: String,
     ) -> Result<MySqlQueryResult, String> {
-        // let q2 = query.cloned();
         let result: Result<(Option<MySqlQueryResult>, Option<Pool<MySql>>), String> =
             match query.execute(&*self.pool.lock().await).await {
                 Ok(ok) => Ok((Some(ok), None)),
                 Err(err) => {
                     error!("Failed to execute query: {} 进行重试, sql: {}", err, sql);
-                    // tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    let temp = match get_mysql_pool_by_url(
+                    match get_mysql_pool_by_url(
                         &self.connection_url,
                         "sql执行遇到报错，尝试重新获取连接",
                     )
@@ -169,8 +167,7 @@ impl MySqlSink {
                             info!("重连失败");
                             Err(e.to_string())
                         }
-                    };
-                    temp
+                    }
                 }
             };
         if result.is_ok() {
@@ -220,7 +217,7 @@ impl MySqlSink {
         cols
     }
 
-    fn remove_cols(cols: &mut Vec<String>, to_remove_cols: &Vec<String>) -> Vec<String> {
+    fn remove_cols(cols: &mut [String], to_remove_cols: &Vec<String>) -> Vec<String> {
         cols
             .iter()
             .filter(|f| {
@@ -236,7 +233,7 @@ impl MySqlSink {
             .map(|c| c.to_string())
             .collect()
     }
-    fn contains_cols(cols: &mut Vec<String>, to_remove_cols: &Vec<String>) -> Vec<String> {
+    fn contains_cols(cols: &mut [String], to_remove_cols: &Vec<String>) -> Vec<String> {
         cols
             .iter()
             .filter(|f| {
