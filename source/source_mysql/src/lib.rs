@@ -68,6 +68,7 @@ impl MysqlSourceConfig {
             .first_source("except_table_name_prefix")
             .split(',')
             .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
             .collect();
 
         for i in 0..size {

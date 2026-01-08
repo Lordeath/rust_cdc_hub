@@ -186,6 +186,72 @@ impl MySqlSink {
         }
         Err("sql执行失败".to_string())
     }
+
+    async fn get_stored_cols(&self, table_name: &String) -> Vec<String> {
+        // 去掉那些STORED的字段
+        let stored_cols_sql = r#"
+                    select COLUMN_NAME from information_schema.columns where EXTRA = 'STORED GENERATED' AND TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?;
+                "#;
+        let stored_cols: Vec<String> = sqlx::query(stored_cols_sql)
+            .bind(table_name)
+            .fetch_all(&*self.pool.lock().await)
+            .await
+            .unwrap()
+            .iter()
+            .map(mysql_row_to_hashmap)
+            .map(|row| row.get("COLUMN_NAME").resolve_string())
+            .collect();
+        stored_cols
+    }
+    async fn get_exists_cols(&self, table_name: &String) -> Vec<String> {
+        // 去掉那些STORED的字段
+        let stored_cols_sql = r#"
+                    select COLUMN_NAME from information_schema.columns where TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?;
+                "#;
+        let cols: Vec<String> = sqlx::query(stored_cols_sql)
+            .bind(table_name)
+            .fetch_all(&*self.pool.lock().await)
+            .await
+            .unwrap()
+            .iter()
+            .map(mysql_row_to_hashmap)
+            .map(|row| row.get("COLUMN_NAME").resolve_string())
+            .collect();
+        cols
+    }
+
+    fn remove_cols(cols: &mut Vec<String>, to_remove_cols: &Vec<String>) -> Vec<String> {
+        cols
+            .iter()
+            .filter(|f| {
+                let mut b = true;
+                for to_check in to_remove_cols {
+                    if to_check.eq_ignore_ascii_case(f) {
+                        b = false;
+                        break;
+                    }
+                }
+                b
+            })
+            .map(|c| c.to_string())
+            .collect()
+    }
+    fn contains_cols(cols: &mut Vec<String>, to_remove_cols: &Vec<String>) -> Vec<String> {
+        cols
+            .iter()
+            .filter(|f| {
+                let mut b = false;
+                for to_check in to_remove_cols {
+                    if to_check.eq_ignore_ascii_case(f) {
+                        b = true;
+                        break;
+                    }
+                }
+                b
+            })
+            .map(|c| c.to_string())
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -313,20 +379,10 @@ impl Sink for MySqlSink {
             for table_info in &self.table_info_list {
                 let table_name = table_info.table_name.clone();
                 let mut cols = table_info.columns.clone();
-                // 去掉那些STORED的字段
-                let stored_cols_sql = r#"
-                    select COLUMN_NAME from information_schema.columns where EXTRA = 'STORED GENERATED' AND TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?;
-                "#;
-                let stored_cols: Vec<String> = sqlx::query(stored_cols_sql)
-                    .bind(&table_name)
-                    .fetch_all(&*self.pool.lock().await)
-                    .await
-                    .unwrap()
-                    .iter()
-                    .map(mysql_row_to_hashmap)
-                    .map(|row| row.get("COLUMN_NAME").resolve_string())
-                    .collect();
-                cols.retain(|c| !stored_cols.contains(c));
+                let stored_cols = self.get_stored_cols(&table_name).await;
+                let exists_cols = self.get_exists_cols(&table_name).await;
+                cols = Self::remove_cols(&mut cols, &stored_cols);
+                cols = Self::contains_cols(&mut cols, &exists_cols);
 
                 col_info.entry(table_name).or_default().extend(cols);
             }
