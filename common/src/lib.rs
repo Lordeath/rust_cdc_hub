@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::HashMap;
 use std::collections::hash_map::Keys;
 use std::error::Error;
-use std::fmt;
+use std::{fmt, process};
 use std::sync::Arc;
 use std::time::Duration;
 use strum_macros::Display;
@@ -50,6 +50,7 @@ pub trait Sink: Send + Sync {
     async fn flush_with_retry(&mut self, from_timer: &FlushByOperation) {
         let mut loop_count = 0;
         loop {
+            loop_count += 1;
             let sink_result = self.flush(from_timer).await;
             if sink_result.is_ok() {
                 break;
@@ -60,9 +61,9 @@ pub trait Sink: Send + Sync {
                 loop_count
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
-            loop_count += 1;
-            if loop_count >= 30 {
-                panic!("flush error");
+            if loop_count > 30 {
+                error!("flush error");
+                process::exit(1);
             }
         }
         trace!("flush success");

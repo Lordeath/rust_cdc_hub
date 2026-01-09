@@ -482,7 +482,7 @@ impl Source for MySQLSource {
                         .unwrap_or_else(|| panic!("{} not found", table_name))
                         .clone();
                     if !checkpoint_entity.is_new {
-                        info!("跳过初始化数据源: {}", config.connection_url);
+                        info!("跳过初始化数据源: {} {}", config.connection_url, &table_name);
                         continue;
                     }
 
