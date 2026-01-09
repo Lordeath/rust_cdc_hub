@@ -143,6 +143,9 @@ impl MysqlSourceConfig {
             }
 
             for table_name in table_name_list.clone() {
+                if Self::judge_is_skip(&except_table_name_prefix, &table_name) {
+                    continue;
+                }
                 // fill table_info
                 let show_create_table_sql = format!("show create table `{}`", table_name);
                 info!("{}", show_create_table_sql);
