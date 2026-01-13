@@ -1,11 +1,9 @@
 mod starrocks_client;
 
 use crate::starrocks_client::StarrocksClient;
+use common::case_insensitive_hash_map::CaseInsensitiveHashMap;
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
-use common::{
-    CaseInsensitiveHashMap, CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo,
-    Value,
-};
+use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value};
 use meilisearch_sdk::macro_helper::async_trait;
 use std::collections::HashMap;
 use std::error::Error;
@@ -265,13 +263,11 @@ impl Sink for StarrocksSink {
             .lock()
             .await
             .values()
-            .map(|s| {
-                match s.save() {
-                    Ok(_) => "".to_string(),
-                    Err(msg) => {
-                        error!("{}", msg);
-                        msg
-                    }
+            .map(|s| match s.save() {
+                Ok(_) => "".to_string(),
+                Err(msg) => {
+                    error!("{}", msg);
+                    msg
                 }
             })
             .find(|x| !x.is_empty())

@@ -1,10 +1,11 @@
 extern crate core;
 
 use async_trait::async_trait;
+use common::case_insensitive_hash_map::CaseInsensitiveHashMap;
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::{
-    CaseInsensitiveHashMap, CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink,
-    Source, TableInfoVo, Value, get_mysql_pool_by_url, mysql_row_to_hashmap,
+    CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value,
+    get_mysql_pool_by_url, mysql_row_to_hashmap,
 };
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
@@ -482,7 +483,10 @@ impl Source for MySQLSource {
                         .unwrap_or_else(|| panic!("{} not found", table_name))
                         .clone();
                     if !checkpoint_entity.is_new {
-                        info!("跳过初始化数据源: {} {}", config.connection_url, &table_name);
+                        info!(
+                            "跳过初始化数据源: {} {}",
+                            config.connection_url, &table_name
+                        );
                         continue;
                     }
 

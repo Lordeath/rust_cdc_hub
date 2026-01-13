@@ -1,3 +1,4 @@
+pub mod case_insensitive_hash_map;
 pub mod mysql_checkpoint;
 
 use async_trait::async_trait;
@@ -5,11 +6,10 @@ use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, 
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::HashMap;
-use std::collections::hash_map::Keys;
 use std::error::Error;
-use std::{fmt, process};
 use std::sync::Arc;
 use std::time::Duration;
+use std::{fmt, process};
 use strum_macros::Display;
 use tokio::sync::Mutex;
 use tracing::{error, info, trace};
@@ -19,6 +19,7 @@ use sqlx::types::BigDecimal;
 use sqlx::{Column, Row, ValueRef};
 use sqlx::{MySql, Pool, TypeInfo};
 
+use crate::case_insensitive_hash_map::CaseInsensitiveHashMap;
 use crate::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use serde_json::Value as JsonValue;
 
@@ -197,20 +198,10 @@ impl DataBuffer {
         timestamp: u32,
         next_event_position: u32,
     ) -> DataBuffer {
-        let mut before_key_to_lower: HashMap<String, String> = HashMap::new();
-        for key in before.keys() {
-            before_key_to_lower.insert(key.to_lowercase(), key.clone());
-        }
-
-        let mut after_key_to_lower: HashMap<String, String> = HashMap::new();
-        for key in after.keys() {
-            after_key_to_lower.insert(key.to_lowercase(), key.clone());
-        }
-
         DataBuffer {
             table_name,
-            before,
-            after,
+            before: before.clone(),
+            after: after.clone(),
             op,
             binlog_filename,
             timestamp,
@@ -471,49 +462,6 @@ pub struct TableInfoVo {
 pub struct ColumnInfoVo {
     pub column_name: String,
     pub value_for_type: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CaseInsensitiveHashMap {
-    map: HashMap<String, Value>,
-    key_map_to_lowercase: HashMap<String, String>,
-}
-
-impl CaseInsensitiveHashMap {
-    pub fn new_with_no_arg() -> Self {
-        CaseInsensitiveHashMap::new(HashMap::new())
-    }
-    pub fn new(map: HashMap<String, Value>) -> Self {
-        let mut key_map_to_lowercase: HashMap<String, String> = HashMap::new();
-        for key in map.keys() {
-            key_map_to_lowercase.insert(key.to_lowercase(), key.to_string());
-        }
-        CaseInsensitiveHashMap {
-            map,
-            key_map_to_lowercase,
-        }
-    }
-
-    pub fn get(&self, key: &str) -> &Value {
-        match self.key_map_to_lowercase.get(&key.to_lowercase()) {
-            None => &Value::None,
-            Some(real_key) => self.map.get(real_key).unwrap_or(&Value::None),
-        }
-    }
-
-    pub fn keys(&self) -> Keys<'_, String, Value> {
-        self.map.keys()
-    }
-
-    pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
-        self.key_map_to_lowercase
-            .insert(k.to_lowercase(), k.clone());
-        self.map.insert(k, v)
-    }
-
-    pub fn get_raw_map(&self) -> HashMap<String, Value> {
-        self.map.clone()
-    }
 }
 
 #[inline]

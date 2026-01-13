@@ -1,7 +1,10 @@
+use common::case_insensitive_hash_map::{
+    CaseInsensitiveHashMapVecCaseInsensitiveHashMap, CaseInsensitiveHashMapVecString,
+};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::{
-    CaseInsensitiveHashMap, CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo,
-    Value, get_mysql_pool_by_url, mysql_row_to_hashmap,
+    CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value,
+    get_mysql_pool_by_url, mysql_row_to_hashmap,
 };
 use meilisearch_sdk::macro_helper::async_trait;
 use sqlx::mysql::{MySqlArguments, MySqlQueryResult};
@@ -23,7 +26,7 @@ pub struct MySqlSink {
 
     // 缓存所有字段名（第一批数据会取一次）
     table_info_cache: Mutex<HashMap<String, TableInfoVo>>,
-    columns_cache: Mutex<HashMap<String, Vec<String>>>,
+    columns_cache: Mutex<CaseInsensitiveHashMapVecString>,
     checkpoint: Mutex<HashMap<String, MysqlCheckPointDetailEntity>>,
 }
 
@@ -86,7 +89,7 @@ impl MySqlSink {
             initialized: RwLock::new(false),
             sink_batch_size,
             table_info_cache: Mutex::new(HashMap::new()),
-            columns_cache: Mutex::new(HashMap::new()),
+            columns_cache: Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg()),
             checkpoint: Mutex::new(HashMap::new()),
         }
     }
@@ -313,8 +316,10 @@ impl Sink for MySqlSink {
         let batch = std::mem::take(&mut *buf);
         drop(buf);
 
-        let mut insert_map: HashMap<String, Vec<CaseInsensitiveHashMap>> = HashMap::new();
-        let mut delete_map: HashMap<String, Vec<String>> = HashMap::new();
+        let mut insert_map: CaseInsensitiveHashMapVecCaseInsensitiveHashMap =
+            CaseInsensitiveHashMapVecCaseInsensitiveHashMap::new_with_no_arg();
+        let mut delete_map: CaseInsensitiveHashMapVecString =
+            CaseInsensitiveHashMapVecString::new_with_no_arg();
 
         let mut cache_for_roll_back: Vec<DataBuffer> = vec![];
         for r in batch {
@@ -349,15 +354,12 @@ impl Sink for MySqlSink {
             cache_for_roll_back.push(r.clone());
             match r.op {
                 Operation::CREATE(_) | Operation::UPDATE => {
-                    insert_map.entry(table_name).or_default().push(r.after)
+                    insert_map.entry_insert(table_name.clone(), r.after);
                 }
                 Operation::DELETE => {
                     let pk = r.get_pk(pk_name.as_str());
                     if !pk.is_none() {
-                        delete_map
-                            .entry(table_name)
-                            .or_default()
-                            .push(pk.resolve_string());
+                        delete_map.entry_insert(&table_name.clone(), pk.resolve_string());
                     }
                 }
                 _ => {
@@ -368,7 +370,8 @@ impl Sink for MySqlSink {
 
         // 初始化字段名（只做一次）
         if !*self.initialized.read().await {
-            let mut col_info: HashMap<String, Vec<String>> = HashMap::new();
+            let mut col_info: CaseInsensitiveHashMapVecString =
+                CaseInsensitiveHashMapVecString::new_with_no_arg();
             for table_info in &self.table_info_list {
                 let table_name = table_info.table_name.clone();
                 let mut cols = table_info.columns.clone();
@@ -377,7 +380,9 @@ impl Sink for MySqlSink {
                 cols = Self::remove_cols(&mut cols, &stored_cols);
                 cols = Self::contains_cols(&mut cols, &exists_cols);
 
-                col_info.entry(table_name).or_default().extend(cols);
+                for c in cols {
+                    col_info.entry_insert(&table_name, c.clone());
+                }
             }
             let mut cols = self.columns_cache.lock().await;
 
@@ -391,8 +396,18 @@ impl Sink for MySqlSink {
         //       批量 UPSERT（INSERT ... ON DUP）
         // ======================================
         if !insert_map.is_empty() {
-            for (table_name, inserts) in insert_map {
-                let columns = column_map.get(&table_name).unwrap();
+            for table_name in insert_map.keys() {
+                let inserts = insert_map.get(table_name.clone().as_str());
+                if inserts.is_empty() {
+                    error!("inserts is empty: {}", &table_name);
+                    continue;
+                }
+
+                let columns = column_map.get(table_name);
+                if columns.is_empty() {
+                    error!("columns is empty: {}", &table_name);
+                    continue;
+                }
                 // let pk_name = self.get_pk_name_from_cache(&table_name).await;
                 let cols_str = columns
                     .iter()
@@ -422,7 +437,7 @@ impl Sink for MySqlSink {
                 let mut query = sqlx::query(&sql);
 
                 for row in &inserts {
-                    for col in columns {
+                    for col in &columns {
                         let x = row.get(col);
                         debug!("inserting {:?} into {}.{}", x, table_name, col);
                         if !x.is_none() {
@@ -456,9 +471,10 @@ impl Sink for MySqlSink {
         // ======================================
         //             批量 DELETE
         // ======================================
-        for (table_name, deletes) in delete_map {
+        for table_name in delete_map.keys() {
+            let deletes = delete_map.get(table_name);
             if !deletes.is_empty() {
-                let pk_name = self.get_pk_name_from_cache(&table_name).await;
+                let pk_name = self.get_pk_name_from_cache(table_name).await;
                 let ph = (0..deletes.len())
                     .map(|_| "?")
                     .collect::<Vec<_>>()

@@ -1,5 +1,6 @@
 use async_trait::async_trait;
-use common::{CaseInsensitiveHashMap, DataBuffer, Operation, Plugin, PluginConfig, Value};
+use common::case_insensitive_hash_map::CaseInsensitiveHashMap;
+use common::{DataBuffer, Operation, Plugin, PluginConfig, Value};
 use std::collections::HashMap;
 
 pub struct PluginPlus {

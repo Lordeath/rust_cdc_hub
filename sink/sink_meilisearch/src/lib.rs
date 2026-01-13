@@ -137,7 +137,7 @@ impl Sink for MeiliSearchSink {
         if !*self.initialized.read().await
             && let Some(first) = docs.first()
         {
-            let field_names = first.keys().cloned().collect::<Vec<_>>();
+            let field_names = first.raw_keys().cloned().collect::<Vec<_>>();
             let _ = index.set_filterable_attributes(&field_names).await;
             *self.initialized.write().await = true;
         }
