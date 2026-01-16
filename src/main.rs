@@ -57,12 +57,20 @@ async fn main() {
     info!("成功连接到sink");
     add_flush_timer(&config, &sink);
     info!("成功增加flush timer");
-    source
-        .lock()
-        .await
-        .start(sink.clone())
-        .await
-        .expect("Failed to start source");
+    let mut retry_times = 0;
+    loop {
+        let start_result = source.lock().await.start(sink.clone()).await;
+        if let Err(e) = start_result {
+            retry_times += 1;
+            if retry_times >= 30 {
+                error!("重试次数过多，程序退出: {}", retry_times);
+                break;
+            }
+            error!("尝试进行重试 {}: {}", retry_times, e.message);
+        } else {
+            break;
+        }
+    }
     info!("程序结束");
 }
 

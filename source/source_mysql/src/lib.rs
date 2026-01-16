@@ -2,6 +2,7 @@ extern crate core;
 
 use async_trait::async_trait;
 use common::case_insensitive_hash_map::CaseInsensitiveHashMap;
+use common::custom_error::{CustomError, CustomErrorType};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value,
@@ -20,7 +21,6 @@ use sqlx::Row;
 use sqlx::mysql::MySqlRow;
 use sqlx::{MySql, Pool};
 use std::collections::HashMap;
-use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -461,7 +461,7 @@ impl Source for MySQLSource {
     async fn start(
         &mut self,
         mut sink: Arc<Mutex<dyn Sink + Send + Sync>>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), CustomError> {
         let plugins: &Vec<Arc<Mutex<dyn Plugin + Send + Sync>>> = &self.plugins;
         {
             info!("开始MySQL数据源初始化");
@@ -768,8 +768,13 @@ impl Source for MySQLSource {
                     },
                     Err(e) => {
                         // 打印错误信息
-                        error!("Error: {}", e);
-                        panic!("Error: {}", e);
+                        // error!("遇到错误，忽略这个异常: {}", e);
+                        error!("遇到错误，结束内部循环，尝试重新开启source，Error: {}", e);
+                        // panic!("Error: {}", e);
+                        return Err(CustomError {
+                            message: e.to_string(),
+                            error_type: CustomErrorType::Restart,
+                        });
                     }
                 }
                 trace!("Checkpoint: {:?}", to_modify);

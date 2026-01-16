@@ -1,7 +1,7 @@
 use crate::Value;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::collections::hash_map::Keys;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaseInsensitiveHashMap {
@@ -252,5 +252,6 @@ mod tests {
             vec!["n123".to_string(), "n456".to_string(), "n789".to_string()],
             map.get("name")
         );
+        println!("map: {:?}", map.keys())
     }
 }

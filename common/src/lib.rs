@@ -1,5 +1,6 @@
 pub mod case_insensitive_hash_map;
 pub mod mysql_checkpoint;
+pub mod custom_error;
 
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
@@ -22,13 +23,14 @@ use sqlx::{MySql, Pool, TypeInfo};
 use crate::case_insensitive_hash_map::CaseInsensitiveHashMap;
 use crate::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use serde_json::Value as JsonValue;
+use crate::custom_error::CustomError;
 
 #[async_trait]
 pub trait Source: Send + Sync {
     async fn start(
         &mut self,
         sink: Arc<Mutex<dyn Sink + Send + Sync>>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>>;
+    ) -> Result<(), CustomError>;
 
     async fn add_plugins(&mut self, plugin: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>);
 
