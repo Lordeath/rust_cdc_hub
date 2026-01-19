@@ -1,7 +1,7 @@
-use crate::Value;
+use crate::{TableInfoVo, Value};
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::Keys;
 use std::collections::HashMap;
+use std::collections::hash_map::Keys;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaseInsensitiveHashMap {
@@ -175,6 +175,52 @@ impl CaseInsensitiveHashMapVecCaseInsensitiveHashMap {
 
     pub fn entry_insert(&mut self, k: String, v: CaseInsensitiveHashMap) {
         self.map.entry(k.to_lowercase()).or_default().push(v)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaseInsensitiveHashMapTableInfoVo {
+    map: HashMap<String, TableInfoVo>,
+}
+
+impl CaseInsensitiveHashMapTableInfoVo {
+    pub fn new_with_no_arg() -> Self {
+        CaseInsensitiveHashMapTableInfoVo::new(HashMap::new())
+    }
+
+    pub fn new(map: HashMap<String, TableInfoVo>) -> Self {
+        let mut new_map: HashMap<String, TableInfoVo> = HashMap::new();
+        for (k, v) in map {
+            new_map.insert(k.to_lowercase(), v.clone());
+        }
+        CaseInsensitiveHashMapTableInfoVo { map: new_map }
+    }
+
+    pub fn get(&self, key: &str) -> TableInfoVo {
+        self.map
+            .get(key.to_lowercase().as_str())
+            .cloned()
+            .unwrap_or_else(|| panic!("TableInfoVo not found {}", key))
+    }
+    
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.map.contains_key(key.to_lowercase().as_str())
+    }
+
+    pub fn keys(&self) -> Keys<'_, String, TableInfoVo> {
+        self.map.keys()
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    pub fn insert(&mut self, k: String, v: TableInfoVo) -> Option<TableInfoVo> {
+        self.map.insert(k.to_lowercase(), v)
     }
 }
 
