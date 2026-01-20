@@ -1,7 +1,7 @@
 extern crate core;
 
 use async_trait::async_trait;
-use common::case_insensitive_hash_map::CaseInsensitiveHashMap;
+use common::case_insensitive_hash_map::{CaseInsensitiveHashMap, CaseInsensitiveHashMapVecString};
 use common::custom_error::{CustomError, CustomErrorType};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::{
@@ -552,7 +552,7 @@ impl Source for MySQLSource {
         }
 
         info!("Starting MySQL binlog source");
-        let mut columns: Mutex<Vec<String>> = Mutex::new(vec![]);
+        let mut columns: Mutex<CaseInsensitiveHashMapVecString> = Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg());
         // 这里获取列名
         let mut table_map = HashMap::new();
         let mut table_database_map = HashMap::new();
@@ -816,23 +816,26 @@ impl Source for MySQLSource {
 async fn parse_row(
     row: RowEvent,
     table_name: &str,
-    columns: &mut Mutex<Vec<String>>,
+    columns_map: &mut Mutex<CaseInsensitiveHashMapVecString>,
     config: &MysqlSourceConfigDetail,
     pool: &mut Pool<MySql>,
 ) -> CaseInsensitiveHashMap {
     let mut data: HashMap<String, Value> = HashMap::new();
     let mut index = 0;
-    if columns.lock().await.len() != row.column_values.len() {
+    let mut columns = columns_map.lock().await.get(table_name);
+    if columns.len() != row.column_values.len() {
         let columns_new = config.fill_table_column(table_name, pool).await;
-        columns.lock().await.clear();
-        columns.lock().await.extend(columns_new);
+        columns.clear();
+        columns.extend(columns_new);
+        columns_map.lock().await.insert(table_name.to_string(), columns.clone());
     }
-    if columns.lock().await.len() != row.column_values.len() {
+    if columns.len() != row.column_values.len() {
         panic!("columns length not equal to column_values length");
     }
 
     for column_value in row.column_values {
-        let column_name = columns.lock().await[index].clone();
+        // TODO 这里可能存在问题，直接用顺序的索引来获取column_name，会导致字段对不上
+        let column_name = columns[index].clone();
         match column_value {
             ColumnValue::None => {
                 data.insert(column_name, Value::None);
@@ -910,8 +913,6 @@ async fn parse_row(
             }
             _ => {
                 columns
-                    .lock()
-                    .await
                     .iter()
                     .for_each(|column_name| error!("column: {}", column_name));
                 error!("column_name: {:?}", column_name);
