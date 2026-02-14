@@ -224,7 +224,7 @@ impl StarrocksSink {
                             continue;
                         }
                         let need_modify_type =
-                            sink_type.to_ascii_lowercase() != starrocks_type.to_ascii_lowercase();
+                            !sink_type.eq_ignore_ascii_case(&starrocks_type);
                         let need_relax_nullable = src_nullable && !*sink_nullable;
                         if !need_modify_type && !need_relax_nullable {
                             continue;

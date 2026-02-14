@@ -453,10 +453,11 @@ fn compute_resume_position(
     runtime_binlog_position: Option<u32>,
     checkpoints: &HashMap<String, MysqlCheckPointDetailEntity>,
 ) -> ResumePosition {
-    if let (Some(f), Some(p)) = (runtime_binlog_filename, runtime_binlog_position) {
-        if !f.is_empty() && p > 0 {
-            return ResumePosition::BinlogPosition(f.to_string(), p);
-        }
+    if let (Some(f), Some(p)) = (runtime_binlog_filename, runtime_binlog_position)
+        && !f.is_empty()
+        && p > 0
+    {
+        return ResumePosition::BinlogPosition(f.to_string(), p);
     }
     if checkpoints.values().all(|entity| entity.is_new) {
         return ResumePosition::Latest;
@@ -601,7 +602,8 @@ impl Source for MySQLSource {
         }
 
         info!("Starting MySQL binlog source");
-        let mut columns: Mutex<CaseInsensitiveHashMapVecString> = Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg());
+        let mut columns: Mutex<CaseInsensitiveHashMapVecString> =
+            Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg());
         // 这里获取列名
         let mut table_map = HashMap::new();
         let mut table_database_map = HashMap::new();
@@ -631,68 +633,74 @@ impl Source for MySQLSource {
                                     .lock()
                                     .await
                                     .clone();
-                            let table_name = table_map
-                                .get(&event.table_id)
-                                .unwrap_or_else(|| panic!("Table id {} not found", event.table_id))
-                                .as_str();
-                            let database_name = table_database_map
-                                .get(&event.table_id)
-                                .unwrap_or_else(|| panic!("Table id {} not found", event.table_id))
-                                .as_str();
-                            if config.is_target_database_and_table(database_name, table_name) {
-                                debug!("WriteRows: {}.{}", database_name, table_name);
+                                let table_name = table_map
+                                    .get(&event.table_id)
+                                    .unwrap_or_else(|| {
+                                        panic!("Table id {} not found", event.table_id)
+                                    })
+                                    .as_str();
+                                let database_name = table_database_map
+                                    .get(&event.table_id)
+                                    .unwrap_or_else(|| {
+                                        panic!("Table id {} not found", event.table_id)
+                                    })
+                                    .as_str();
+                                if config.is_target_database_and_table(database_name, table_name) {
+                                    debug!("WriteRows: {}.{}", database_name, table_name);
 
-                                let checkpoint_entity: &mut MysqlCheckPointDetailEntity =
-                                    &mut self.checkpoint_entities.lock().await[i]
+                                    let checkpoint_entity: &mut MysqlCheckPointDetailEntity =
+                                        &mut self.checkpoint_entities.lock().await[i]
+                                            .lock()
+                                            .await
+                                            .get(&table_name.to_lowercase())
+                                            .expect("checkpoint_entity not found")
+                                            .clone();
+                                    let mut checkpoint_entity = checkpoint_entity.clone();
+
+                                    let binlog_filename = self.binlog_filename_list.lock().await[i]
                                         .lock()
                                         .await
-                                        .get(&table_name.to_lowercase())
-                                        .expect("checkpoint_entity not found")
                                         .clone();
-                                let mut checkpoint_entity = checkpoint_entity.clone();
-
-                                let binlog_filename = self.binlog_filename_list.lock().await[i]
-                                    .lock()
-                                    .await
-                                    .clone();
-                                let timestamp = header.timestamp;
-                                let next_event_position = header.next_event_position;
-                                for row in event.rows {
-                                    let before: CaseInsensitiveHashMap =
-                                        CaseInsensitiveHashMap::new_with_no_arg();
-                                    let after: CaseInsensitiveHashMap =
-                                        parse_row(row, table_name, &mut columns, config, pool)
+                                    let timestamp = header.timestamp;
+                                    let next_event_position = header.next_event_position;
+                                    for row in event.rows {
+                                        let before: CaseInsensitiveHashMap =
+                                            CaseInsensitiveHashMap::new_with_no_arg();
+                                        let after: CaseInsensitiveHashMap =
+                                            parse_row(row, table_name, &mut columns, config, pool)
+                                                .await;
+                                        let op = Operation::CREATE(false);
+                                        let data_buffer = DataBuffer::new(
+                                            table_name.to_string(),
+                                            before,
+                                            after,
+                                            op,
+                                            binlog_filename.clone(),
+                                            timestamp,
+                                            next_event_position,
+                                        );
+                                        let plugin_data =
+                                            detail_with_plugin(plugins, data_buffer).await;
+                                        if let Ok(item) = plugin_data {
+                                            Self::write_record_with_retry(
+                                                &mut sink,
+                                                &item,
+                                                Some(checkpoint_entity.clone()),
+                                            )
                                             .await;
-                                    let op = Operation::CREATE(false);
-                                    let data_buffer = DataBuffer::new(
-                                        table_name.to_string(),
-                                        before,
-                                        after,
-                                        op,
-                                        binlog_filename.clone(),
-                                        timestamp,
-                                        next_event_position,
-                                    );
-                                    let plugin_data =
-                                        detail_with_plugin(plugins, data_buffer).await;
-                                    if let Ok(item) = plugin_data {
-                                        Self::write_record_with_retry(
-                                            &mut sink,
-                                            &item,
-                                            Some(checkpoint_entity.clone()),
-                                        )
-                                        .await;
+                                        }
+                                    }
+                                    if !binlog_filename.is_empty() {
+                                        checkpoint_entity = checkpoint_entity
+                                            .update(binlog_filename, next_event_position);
+                                        to_modify.insert(
+                                            checkpoint_entity.table.clone(),
+                                            checkpoint_entity,
+                                        );
                                     }
                                 }
-                                if !binlog_filename.is_empty() {
-                                    checkpoint_entity = checkpoint_entity
-                                        .update(binlog_filename, next_event_position);
-                                    to_modify
-                                        .insert(checkpoint_entity.table.clone(), checkpoint_entity);
-                                }
-                            }
-                            trace!("Checkpoint: {:?}", to_modify);
-                            *self.checkpoint_entities.lock().await[i].lock().await = to_modify;
+                                trace!("Checkpoint: {:?}", to_modify);
+                                *self.checkpoint_entities.lock().await[i].lock().await = to_modify;
                             }
                             EventData::DeleteRows(event) => {
                                 let pool: &mut Pool<MySql> = &mut self.pools[i];
@@ -701,67 +709,73 @@ impl Source for MySQLSource {
                                     .lock()
                                     .await
                                     .clone();
-                            let table_name = table_map
-                                .get(&event.table_id)
-                                .unwrap_or_else(|| panic!("Table id {} not found", event.table_id))
-                                .as_str();
-                            let database_name = table_database_map
-                                .get(&event.table_id)
-                                .unwrap_or_else(|| panic!("Table id {} not found", event.table_id))
-                                .as_str();
-                            if config.is_target_database_and_table(database_name, table_name) {
-                                debug!("DeleteRows: {}.{}", database_name, table_name);
-                                let checkpoint_entity: &mut MysqlCheckPointDetailEntity =
-                                    &mut self.checkpoint_entities.lock().await[i]
+                                let table_name = table_map
+                                    .get(&event.table_id)
+                                    .unwrap_or_else(|| {
+                                        panic!("Table id {} not found", event.table_id)
+                                    })
+                                    .as_str();
+                                let database_name = table_database_map
+                                    .get(&event.table_id)
+                                    .unwrap_or_else(|| {
+                                        panic!("Table id {} not found", event.table_id)
+                                    })
+                                    .as_str();
+                                if config.is_target_database_and_table(database_name, table_name) {
+                                    debug!("DeleteRows: {}.{}", database_name, table_name);
+                                    let checkpoint_entity: &mut MysqlCheckPointDetailEntity =
+                                        &mut self.checkpoint_entities.lock().await[i]
+                                            .lock()
+                                            .await
+                                            .get(&table_name.to_lowercase())
+                                            .expect("checkpoint_entity not found")
+                                            .clone();
+                                    let mut checkpoint_entity = checkpoint_entity.clone();
+
+                                    let binlog_filename = self.binlog_filename_list.lock().await[i]
                                         .lock()
                                         .await
-                                        .get(&table_name.to_lowercase())
-                                        .expect("checkpoint_entity not found")
                                         .clone();
-                                let mut checkpoint_entity = checkpoint_entity.clone();
-
-                                let binlog_filename = self.binlog_filename_list.lock().await[i]
-                                    .lock()
-                                    .await
-                                    .clone();
-                                let timestamp = header.timestamp;
-                                let next_event_position = header.next_event_position;
-                                for row in event.rows {
-                                    let before: CaseInsensitiveHashMap =
-                                        parse_row(row, table_name, &mut columns, config, pool)
+                                    let timestamp = header.timestamp;
+                                    let next_event_position = header.next_event_position;
+                                    for row in event.rows {
+                                        let before: CaseInsensitiveHashMap =
+                                            parse_row(row, table_name, &mut columns, config, pool)
+                                                .await;
+                                        let after: CaseInsensitiveHashMap =
+                                            CaseInsensitiveHashMap::new_with_no_arg();
+                                        let op = Operation::DELETE;
+                                        let data_buffer = DataBuffer::new(
+                                            table_name.to_string(),
+                                            before,
+                                            after,
+                                            op,
+                                            binlog_filename.clone(),
+                                            timestamp,
+                                            next_event_position,
+                                        );
+                                        let plugin_data =
+                                            detail_with_plugin(plugins, data_buffer).await;
+                                        if let Ok(item) = plugin_data {
+                                            Self::write_record_with_retry(
+                                                &mut sink,
+                                                &item,
+                                                Some(checkpoint_entity.clone()),
+                                            )
                                             .await;
-                                    let after: CaseInsensitiveHashMap =
-                                        CaseInsensitiveHashMap::new_with_no_arg();
-                                    let op = Operation::DELETE;
-                                    let data_buffer = DataBuffer::new(
-                                        table_name.to_string(),
-                                        before,
-                                        after,
-                                        op,
-                                        binlog_filename.clone(),
-                                        timestamp,
-                                        next_event_position,
-                                    );
-                                    let plugin_data =
-                                        detail_with_plugin(plugins, data_buffer).await;
-                                    if let Ok(item) = plugin_data {
-                                        Self::write_record_with_retry(
-                                            &mut sink,
-                                            &item,
-                                            Some(checkpoint_entity.clone()),
-                                        )
-                                        .await;
+                                        }
+                                    }
+                                    if !binlog_filename.is_empty() {
+                                        checkpoint_entity = checkpoint_entity
+                                            .update(binlog_filename, next_event_position);
+                                        to_modify.insert(
+                                            checkpoint_entity.table.clone(),
+                                            checkpoint_entity,
+                                        );
                                     }
                                 }
-                                if !binlog_filename.is_empty() {
-                                    checkpoint_entity = checkpoint_entity
-                                        .update(binlog_filename, next_event_position);
-                                    to_modify
-                                        .insert(checkpoint_entity.table.clone(), checkpoint_entity);
-                                }
-                            }
-                            trace!("Checkpoint: {:?}", to_modify);
-                            *self.checkpoint_entities.lock().await[i].lock().await = to_modify;
+                                trace!("Checkpoint: {:?}", to_modify);
+                                *self.checkpoint_entities.lock().await[i].lock().await = to_modify;
                             }
                             EventData::UpdateRows(event) => {
                                 let pool: &mut Pool<MySql> = &mut self.pools[i];
@@ -770,68 +784,76 @@ impl Source for MySQLSource {
                                     .lock()
                                     .await
                                     .clone();
-                            let table_name = table_map
-                                .get(&event.table_id)
-                                .unwrap_or_else(|| panic!("Table id {} not found", event.table_id))
-                                .as_str();
-                            let database_name = table_database_map
-                                .get(&event.table_id)
-                                .unwrap_or_else(|| panic!("Table id {} not found", event.table_id))
-                                .as_str();
-                            if config.is_target_database_and_table(database_name, table_name) {
-                                debug!("UpdateRows: {}.{}", database_name, table_name);
-                                let checkpoint_entity: &mut MysqlCheckPointDetailEntity =
-                                    &mut self.checkpoint_entities.lock().await[i]
+                                let table_name = table_map
+                                    .get(&event.table_id)
+                                    .unwrap_or_else(|| {
+                                        panic!("Table id {} not found", event.table_id)
+                                    })
+                                    .as_str();
+                                let database_name = table_database_map
+                                    .get(&event.table_id)
+                                    .unwrap_or_else(|| {
+                                        panic!("Table id {} not found", event.table_id)
+                                    })
+                                    .as_str();
+                                if config.is_target_database_and_table(database_name, table_name) {
+                                    debug!("UpdateRows: {}.{}", database_name, table_name);
+                                    let checkpoint_entity: &mut MysqlCheckPointDetailEntity =
+                                        &mut self.checkpoint_entities.lock().await[i]
+                                            .lock()
+                                            .await
+                                            .get(&table_name.to_lowercase())
+                                            .expect("checkpoint_entity not found")
+                                            .clone();
+                                    let mut checkpoint_entity = checkpoint_entity.clone();
+
+                                    let binlog_filename = self.binlog_filename_list.lock().await[i]
                                         .lock()
                                         .await
-                                        .get(&table_name.to_lowercase())
-                                        .expect("checkpoint_entity not found")
                                         .clone();
-                                let mut checkpoint_entity = checkpoint_entity.clone();
+                                    let timestamp = header.timestamp;
+                                    let next_event_position = header.next_event_position;
+                                    for (b, a) in event.rows {
+                                        let before: CaseInsensitiveHashMap =
+                                            parse_row(b, table_name, &mut columns, config, pool)
+                                                .await;
+                                        let after: CaseInsensitiveHashMap =
+                                            parse_row(a, table_name, &mut columns, config, pool)
+                                                .await;
+                                        let op = Operation::UPDATE;
+                                        let data_buffer = DataBuffer::new(
+                                            table_name.to_string(),
+                                            before,
+                                            after,
+                                            op,
+                                            binlog_filename.clone(),
+                                            timestamp,
+                                            next_event_position,
+                                        );
+                                        let plugin_data =
+                                            detail_with_plugin(plugins, data_buffer).await;
+                                        if let Ok(item) = plugin_data {
+                                            Self::write_record_with_retry(
+                                                &mut sink,
+                                                &item,
+                                                Some(checkpoint_entity.clone()),
+                                            )
+                                            .await;
+                                        }
+                                    }
 
-                                let binlog_filename = self.binlog_filename_list.lock().await[i]
-                                    .lock()
-                                    .await
-                                    .clone();
-                                let timestamp = header.timestamp;
-                                let next_event_position = header.next_event_position;
-                                for (b, a) in event.rows {
-                                    let before: CaseInsensitiveHashMap =
-                                        parse_row(b, table_name, &mut columns, config, pool).await;
-                                    let after: CaseInsensitiveHashMap =
-                                        parse_row(a, table_name, &mut columns, config, pool).await;
-                                    let op = Operation::UPDATE;
-                                    let data_buffer = DataBuffer::new(
-                                        table_name.to_string(),
-                                        before,
-                                        after,
-                                        op,
-                                        binlog_filename.clone(),
-                                        timestamp,
-                                        next_event_position,
-                                    );
-                                    let plugin_data =
-                                        detail_with_plugin(plugins, data_buffer).await;
-                                    if let Ok(item) = plugin_data {
-                                        Self::write_record_with_retry(
-                                            &mut sink,
-                                            &item,
-                                            Some(checkpoint_entity.clone()),
-                                        )
-                                        .await;
+                                    if !binlog_filename.is_empty() {
+                                        checkpoint_entity = checkpoint_entity
+                                            .update(binlog_filename, next_event_position);
+                                        to_modify.insert(
+                                            checkpoint_entity.table.clone(),
+                                            checkpoint_entity,
+                                        );
                                     }
                                 }
-
-                                if !binlog_filename.is_empty() {
-                                    checkpoint_entity = checkpoint_entity
-                                        .update(binlog_filename, next_event_position);
-                                    to_modify
-                                        .insert(checkpoint_entity.table.clone(), checkpoint_entity);
-                                }
+                                trace!("Checkpoint: {:?}", to_modify);
+                                *self.checkpoint_entities.lock().await[i].lock().await = to_modify;
                             }
-                            trace!("Checkpoint: {:?}", to_modify);
-                            *self.checkpoint_entities.lock().await[i].lock().await = to_modify;
-                        }
                             _ => {}
                         }
                     }
@@ -843,12 +865,16 @@ impl Source for MySQLSource {
                         if should_reconnect_read_error(&message) {
                             let connection_url = self.mysql_source[i].connection_url.clone();
                             let server_id = self.mysql_source[i].server_id;
-                            let runtime_binlog_filename =
-                                self.binlog_filename_list.lock().await[i].lock().await.clone();
+                            let runtime_binlog_filename = self.binlog_filename_list.lock().await[i]
+                                .lock()
+                                .await
+                                .clone();
                             let runtime_binlog_position =
                                 *self.binlog_position_list.lock().await[i].lock().await;
-                            let checkpoints =
-                                self.checkpoint_entities.lock().await[i].lock().await.clone();
+                            let checkpoints = self.checkpoint_entities.lock().await[i]
+                                .lock()
+                                .await
+                                .clone();
                             let resume_position = compute_resume_position(
                                 if runtime_binlog_filename.is_empty() {
                                     None
@@ -890,7 +916,10 @@ impl Source for MySQLSource {
                                 }
                             }
                         }
-                        error!("遇到错误，结束内部循环，尝试重新开启source，Error: {}", message);
+                        error!(
+                            "遇到错误，结束内部循环，尝试重新开启source，Error: {}",
+                            message
+                        );
                         return Err(CustomError {
                             message,
                             error_type: CustomErrorType::Restart,
@@ -945,7 +974,10 @@ async fn parse_row(
         let columns_new = config.fill_table_column(table_name, pool).await;
         columns.clear();
         columns.extend(columns_new);
-        columns_map.lock().await.insert(table_name.to_string(), columns.clone());
+        columns_map
+            .lock()
+            .await
+            .insert(table_name.to_string(), columns.clone());
     }
     if columns.len() != row.column_values.len() {
         panic!("columns length not equal to column_values length");
@@ -1115,7 +1147,9 @@ mod tests {
 
     #[test]
     fn eof_errors_trigger_reconnect() {
-        assert!(should_reconnect_read_error("io error: unexpected end of file"));
+        assert!(should_reconnect_read_error(
+            "io error: unexpected end of file"
+        ));
         assert!(should_reconnect_read_error("connection reset by peer"));
         assert!(should_reconnect_read_error("Broken pipe"));
     }
