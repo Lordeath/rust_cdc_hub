@@ -1,6 +1,7 @@
 pub mod case_insensitive_hash_map;
 pub mod mysql_checkpoint;
 pub mod custom_error;
+pub mod schema;
 
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
@@ -120,6 +121,8 @@ pub struct CdcConfig {
     pub sink_config: Vec<HashMap<String, String>>,
     pub auto_create_database: Option<bool>,
     pub auto_create_table: Option<bool>,
+    pub auto_add_column: Option<bool>,
+    pub auto_modify_column: Option<bool>,
     pub plugins: Option<Vec<PluginConfig>>,
     pub source_batch_size: Option<usize>,
     pub sink_batch_size: Option<usize>,

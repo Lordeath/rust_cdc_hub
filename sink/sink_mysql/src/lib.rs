@@ -7,11 +7,16 @@ use common::{
     CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value,
     get_mysql_pool_by_url, mysql_row_to_hashmap,
 };
-use meilisearch_sdk::macro_helper::async_trait;
+use common::schema::{
+    extract_mysql_create_table_column_definitions, mysql_column_allows_null_from_definition,
+    mysql_type_token_from_column_definition,
+};
+use async_trait::async_trait;
 use sqlx::mysql::{MySqlArguments, MySqlQueryResult};
 use sqlx::query::Query;
 use sqlx::{MySql, Pool};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::log::trace;
@@ -79,6 +84,101 @@ impl MySqlSink {
                         .execute(&pool)
                         .await
                         .expect("Failed to create table");
+                }
+            }
+        }
+        if config.auto_add_column.unwrap_or(true) {
+            for table_info in &table_info_list {
+                let table_name = table_info.table_name.clone();
+                let rows = sqlx::query(
+                    "select COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE from information_schema.`COLUMNS` where TABLE_SCHEMA = (select database()) AND TABLE_NAME = ?",
+                )
+                .bind(&table_name)
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_default();
+                let exists_set: HashSet<String> = rows
+                    .iter()
+                    .map(mysql_row_to_hashmap)
+                    .map(|row| row.get("COLUMN_NAME").resolve_string().to_ascii_lowercase())
+                    .collect();
+
+                let defs = extract_mysql_create_table_column_definitions(
+                    table_info.create_table_sql.as_str(),
+                );
+
+                for src_col in &table_info.columns {
+                    let key = src_col.to_ascii_lowercase();
+                    if exists_set.contains(&key) {
+                        continue;
+                    }
+                    let def = match defs.get(&key) {
+                        None => continue,
+                        Some(v) => v,
+                    };
+                    let alter_sql = format!("ALTER TABLE `{}` ADD COLUMN {}", table_name, def);
+                    match sqlx::query(&alter_sql).execute(&pool).await {
+                        Ok(_) => info!("auto add column success: {} {}", table_name, src_col),
+                        Err(e) => error!("auto add column failed: {} {} {}", table_name, src_col, e),
+                    }
+                }
+            }
+        }
+        if config.auto_modify_column.unwrap_or(true) {
+            for table_info in &table_info_list {
+                let table_name = table_info.table_name.clone();
+                let defs = extract_mysql_create_table_column_definitions(
+                    table_info.create_table_sql.as_str(),
+                );
+
+                let rows = sqlx::query(
+                    "select COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE from information_schema.`COLUMNS` where TABLE_SCHEMA = (select database()) AND TABLE_NAME = ?",
+                )
+                .bind(&table_name)
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_default();
+
+                let mut sink_meta: HashMap<String, (String, bool)> = HashMap::new();
+                for r in rows.iter().map(mysql_row_to_hashmap) {
+                    let name = r.get("COLUMN_NAME").resolve_string();
+                    let typ = r.get("COLUMN_TYPE").resolve_string();
+                    let is_nullable = r.get("IS_NULLABLE").resolve_string();
+                    sink_meta.insert(
+                        name.to_ascii_lowercase(),
+                        (typ.to_ascii_lowercase(), is_nullable.eq_ignore_ascii_case("YES")),
+                    );
+                }
+
+                for src_col in &table_info.columns {
+                    let key = src_col.to_ascii_lowercase();
+                    let (sink_type, sink_nullable) = match sink_meta.get(&key) {
+                        None => continue,
+                        Some(v) => v.clone(),
+                    };
+                    let def = match defs.get(&key) {
+                        None => continue,
+                        Some(v) => v,
+                    };
+                    let src_type = match mysql_type_token_from_column_definition(def.as_str()) {
+                        None => continue,
+                        Some(v) => v.to_ascii_lowercase(),
+                    };
+                    let src_nullable = mysql_column_allows_null_from_definition(def.as_str());
+
+                    let need_modify_type = sink_type != src_type;
+                    let need_modify_nullable = src_nullable && !sink_nullable;
+                    if !need_modify_type && !need_modify_nullable {
+                        continue;
+                    }
+                    let modify_sql = format!("ALTER TABLE `{}` MODIFY COLUMN {}", table_name, def);
+                    match sqlx::query(&modify_sql).execute(&pool).await {
+                        Ok(_) => info!("auto modify column success: {} {}", table_name, src_col),
+                        Err(e) => error!(
+                            "auto modify column failed: {} {} {}",
+                            table_name, src_col, e
+                        ),
+                    }
                 }
             }
         }

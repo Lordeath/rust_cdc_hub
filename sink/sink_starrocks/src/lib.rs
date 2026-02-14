@@ -3,8 +3,13 @@ mod starrocks_client;
 use crate::starrocks_client::StarrocksClient;
 use common::case_insensitive_hash_map::CaseInsensitiveHashMap;
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
+use common::schema::{
+    extract_mysql_create_table_column_definitions, mysql_column_allows_null_from_definition,
+    mysql_type_token_from_column_definition,
+};
 use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value};
-use meilisearch_sdk::macro_helper::async_trait;
+use async_trait::async_trait;
+use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
@@ -20,6 +25,8 @@ pub struct StarrocksSink {
     health_url: String,
     database: String,
     sink_batch_size: usize,
+    auto_add_column: bool,
+    auto_modify_column: bool,
 
     table_info_list: Vec<TableInfoVo>,
     buffer: Mutex<Vec<DataBuffer>>,
@@ -45,11 +52,15 @@ impl StarrocksSink {
         let starrocks_client: StarrocksClient =
             StarrocksClient::new(base_url.as_str(), username.as_str(), password.as_str()).await;
         let sink_batch_size = config.sink_batch_size.unwrap_or(1024);
+        let auto_add_column = config.auto_add_column.unwrap_or(true);
+        let auto_modify_column = config.auto_modify_column.unwrap_or(true);
         StarrocksSink {
             starrocks_client,
             health_url: format!("http://{}:{}/api/health", host, http_port),
             database,
             sink_batch_size,
+            auto_add_column,
+            auto_modify_column,
             table_info_list,
             buffer: Mutex::new(Vec::with_capacity(sink_batch_size)),
             initialized: RwLock::new(false),
@@ -57,6 +68,186 @@ impl StarrocksSink {
             columns_cache: Mutex::new(HashMap::new()),
             pks_cache: Mutex::new(HashMap::new()),
             checkpoint: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn fetch_rows(&self, database: &str, sql: &str) -> Result<Vec<Vec<String>>, String> {
+        let text = self.starrocks_client.execute_sql(database, sql).await;
+        if text.is_empty() {
+            return Err("empty response".to_string());
+        }
+        let v: JsonValue = serde_json::from_str(text.as_str()).map_err(|e| e.to_string())?;
+        let data = v
+            .get("data")
+            .ok_or_else(|| "missing data".to_string())?
+            .as_array()
+            .ok_or_else(|| "data not array".to_string())?;
+        let mut out: Vec<Vec<String>> = Vec::with_capacity(data.len());
+        for row in data {
+            let arr = row
+                .as_array()
+                .ok_or_else(|| "row not array".to_string())?;
+            let mut cols: Vec<String> = Vec::with_capacity(arr.len());
+            for c in arr {
+                if let Some(s) = c.as_str() {
+                    cols.push(s.to_string());
+                } else {
+                    cols.push(c.to_string());
+                }
+            }
+            out.push(cols);
+        }
+        Ok(out)
+    }
+
+    fn map_mysql_type_to_starrocks(mysql_type_token: &str) -> String {
+        let t = mysql_type_token.to_ascii_lowercase();
+        if t.starts_with("tinyint(1)") {
+            return "BOOLEAN".to_string();
+        }
+        if t.starts_with("tinyint") {
+            return "TINYINT".to_string();
+        }
+        if t.starts_with("smallint") {
+            return "SMALLINT".to_string();
+        }
+        if t.starts_with("mediumint") {
+            return "INT".to_string();
+        }
+        if t.starts_with("int") || t.starts_with("integer") {
+            return "INT".to_string();
+        }
+        if t.starts_with("bigint") {
+            return "BIGINT".to_string();
+        }
+        if t.starts_with("float") {
+            return "FLOAT".to_string();
+        }
+        if t.starts_with("double") {
+            return "DOUBLE".to_string();
+        }
+        if t.starts_with("decimal") || t.starts_with("numeric") {
+            return mysql_type_token.to_ascii_uppercase();
+        }
+        if t.starts_with("datetime") || t.starts_with("timestamp") {
+            return "DATETIME".to_string();
+        }
+        if t.starts_with("date") {
+            return "DATE".to_string();
+        }
+        if t.starts_with("time") {
+            return "VARCHAR(32)".to_string();
+        }
+        if t.starts_with("varchar") || t.starts_with("char") {
+            return mysql_type_token.to_ascii_uppercase();
+        }
+        if t.contains("text")
+            || t.contains("blob")
+            || t.starts_with("json")
+            || t.starts_with("enum")
+            || t.starts_with("set")
+        {
+            return "STRING".to_string();
+        }
+        "STRING".to_string()
+    }
+
+    async fn ensure_schema(&self) {
+        if !self.auto_add_column && !self.auto_modify_column {
+            return;
+        }
+        for table_info in &self.table_info_list {
+            let table_name = table_info.table_name.clone();
+            let defs = extract_mysql_create_table_column_definitions(
+                table_info.create_table_sql.as_str(),
+            );
+            let sql = format!(
+                "select COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE from information_schema.`COLUMNS` where TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' ORDER BY ORDINAL_POSITION",
+                self.database, table_name
+            );
+            let rows = match self.fetch_rows(self.database.as_str(), sql.as_str()).await {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("fetch starrocks columns failed: {} {}", table_name, e);
+                    continue;
+                }
+            };
+            let mut exists: HashMap<String, (String, bool)> = HashMap::new();
+            for row in rows {
+                if row.len() < 3 {
+                    continue;
+                }
+                let name = row[0].to_ascii_lowercase();
+                let typ = row[1].to_ascii_lowercase();
+                let nullable = row[2].eq_ignore_ascii_case("YES");
+                exists.insert(name, (typ, nullable));
+            }
+
+            for src_col in &table_info.columns {
+                let key = src_col.to_ascii_lowercase();
+                let def = match defs.get(&key) {
+                    None => continue,
+                    Some(v) => v,
+                };
+                let mysql_type = match mysql_type_token_from_column_definition(def.as_str()) {
+                    None => continue,
+                    Some(v) => v,
+                };
+                let starrocks_type = Self::map_mysql_type_to_starrocks(mysql_type.as_str());
+                let src_nullable = mysql_column_allows_null_from_definition(def.as_str());
+                let nullable_sql = if src_nullable { "NULL" } else { "NOT NULL" };
+
+                match exists.get(&key) {
+                    None => {
+                        if !self.auto_add_column {
+                            continue;
+                        }
+                        let alter = format!(
+                            "ALTER TABLE `{}` ADD COLUMN `{}` {} {}",
+                            table_name, src_col, starrocks_type, nullable_sql
+                        );
+                        let resp = self
+                            .starrocks_client
+                            .execute_sql(self.database.as_str(), alter.as_str())
+                            .await;
+                        if resp.is_empty() {
+                            error!(
+                                "auto add column failed: {} {} empty response",
+                                table_name, src_col
+                            );
+                        } else {
+                            info!("auto add column attempted: {} {}", table_name, src_col);
+                        }
+                    }
+                    Some((sink_type, sink_nullable)) => {
+                        if !self.auto_modify_column {
+                            continue;
+                        }
+                        let need_modify_type =
+                            sink_type.to_ascii_lowercase() != starrocks_type.to_ascii_lowercase();
+                        let need_relax_nullable = src_nullable && !*sink_nullable;
+                        if !need_modify_type && !need_relax_nullable {
+                            continue;
+                        }
+                        let alter = format!(
+                            "ALTER TABLE `{}` MODIFY COLUMN `{}` {} {}",
+                            table_name, src_col, starrocks_type, nullable_sql
+                        );
+                        let resp = self
+                            .starrocks_client
+                            .execute_sql(self.database.as_str(), alter.as_str())
+                            .await;
+                        if resp.is_empty() {
+                            error!(
+                                "auto modify column failed: {} {} empty response",
+                                table_name, src_col
+                            );
+                        } else {
+                            info!("auto modify column attempted: {} {}", table_name, src_col);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -115,6 +306,7 @@ impl Sink for StarrocksSink {
             .send()
             .await?;
         info!("Starrocks FE is healthy");
+        self.ensure_schema().await;
         Ok(())
     }
 
