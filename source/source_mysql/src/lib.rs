@@ -33,6 +33,7 @@ pub struct MySQLSource {
     checkpoint_entities: Mutex<Vec<Mutex<HashMap<String, MysqlCheckPointDetailEntity>>>>,
     plugins: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>,
     binlog_filename_list: Mutex<Vec<Mutex<String>>>,
+    binlog_position_list: Mutex<Vec<Mutex<u32>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,6 +338,7 @@ impl MySQLSource {
         let cfg: MysqlSourceConfig = MysqlSourceConfig::new(config).await;
         let size = cfg.mysql_source.len();
         let binlog_filename_list: Mutex<Vec<Mutex<String>>> = Mutex::new(Vec::new());
+        let binlog_position_list: Mutex<Vec<Mutex<u32>>> = Mutex::new(Vec::new());
         let mut checkpoint_entities: Vec<Mutex<HashMap<String, MysqlCheckPointDetailEntity>>> =
             vec![];
         for i in 0..size {
@@ -386,7 +388,6 @@ impl MySQLSource {
             let client: BinlogStream =
                 BinlogClient::new(&connection_url, server_id, start_position)
                     .with_master_heartbeat(Duration::from_secs(5))
-                    .with_read_timeout(Duration::from_secs(60))
                     .with_keepalive(Duration::from_secs(60), Duration::from_secs(10))
                     .connect()
                     .await
@@ -402,6 +403,7 @@ impl MySQLSource {
                 .lock()
                 .await
                 .push(Mutex::new("".to_string()));
+            binlog_position_list.lock().await.push(Mutex::new(0));
         }
 
         Self {
@@ -411,6 +413,7 @@ impl MySQLSource {
             checkpoint_entities: Mutex::new(checkpoint_entities),
             plugins: vec![],
             binlog_filename_list,
+            binlog_position_list,
         }
     }
 
@@ -437,6 +440,52 @@ impl MySQLSource {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResumePosition {
+    Latest,
+    BinlogPosition(String, u32),
+}
+
+fn compute_resume_position(
+    runtime_binlog_filename: Option<&str>,
+    runtime_binlog_position: Option<u32>,
+    checkpoints: &HashMap<String, MysqlCheckPointDetailEntity>,
+) -> ResumePosition {
+    if let (Some(f), Some(p)) = (runtime_binlog_filename, runtime_binlog_position) {
+        if !f.is_empty() && p > 0 {
+            return ResumePosition::BinlogPosition(f.to_string(), p);
+        }
+    }
+    if checkpoints.values().all(|entity| entity.is_new) {
+        return ResumePosition::Latest;
+    }
+    let max: MysqlCheckPointDetailEntity = checkpoints
+        .values()
+        .max_by(|a, b| {
+            a.last_binlog_filename
+                .cmp(&b.last_binlog_filename)
+                .then(a.last_binlog_position.cmp(&b.last_binlog_position))
+        })
+        .unwrap()
+        .clone();
+    ResumePosition::BinlogPosition(max.last_binlog_filename, max.last_binlog_position)
+}
+
+fn should_ignore_read_error(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    msg.contains("timeout") || msg.contains("timed out")
+}
+
+fn should_reconnect_read_error(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    msg.contains("unexpected end of file")
+        || msg.contains("connection reset")
+        || msg.contains("broken pipe")
+        || msg.contains("connection closed")
+        || msg.contains("connection aborted")
+        || msg.contains("eof")
 }
 
 async fn detail_with_plugin(
@@ -559,28 +608,29 @@ impl Source for MySQLSource {
         loop {
             let max = self.streams.len();
             for i in 0..max {
-                let stream: &mut BinlogStream = &mut self.streams[i];
-                let pool: &mut Pool<MySql> = &mut self.pools[i];
-                let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
-                let mut to_modify = self.checkpoint_entities.lock().await[i]
-                    .lock()
-                    .await
-                    .clone();
-
-                match stream.read().await {
-                    Ok((header, data)) => match data {
-                        EventData::Rotate(event) => {
-                            *self.binlog_filename_list.lock().await[i].lock().await =
-                                event.binlog_filename.clone();
-                        }
-                        EventData::TableMap(event) => {
-                            let table_name = event.table_name;
-                            let table_id = event.table_id;
-                            let database_name = event.database_name;
-                            table_map.insert(table_id, table_name);
-                            table_database_map.insert(table_id, database_name);
-                        }
-                        EventData::WriteRows(event) => {
+                match self.streams[i].read().await {
+                    Ok((header, data)) => {
+                        *self.binlog_position_list.lock().await[i].lock().await =
+                            header.next_event_position;
+                        match data {
+                            EventData::Rotate(event) => {
+                                *self.binlog_filename_list.lock().await[i].lock().await =
+                                    event.binlog_filename.clone();
+                            }
+                            EventData::TableMap(event) => {
+                                let table_name = event.table_name;
+                                let table_id = event.table_id;
+                                let database_name = event.database_name;
+                                table_map.insert(table_id, table_name);
+                                table_database_map.insert(table_id, database_name);
+                            }
+                            EventData::WriteRows(event) => {
+                                let pool: &mut Pool<MySql> = &mut self.pools[i];
+                                let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
+                                let mut to_modify = self.checkpoint_entities.lock().await[i]
+                                    .lock()
+                                    .await
+                                    .clone();
                             let table_name = table_map
                                 .get(&event.table_id)
                                 .unwrap_or_else(|| panic!("Table id {} not found", event.table_id))
@@ -641,8 +691,16 @@ impl Source for MySQLSource {
                                         .insert(checkpoint_entity.table.clone(), checkpoint_entity);
                                 }
                             }
-                        }
-                        EventData::DeleteRows(event) => {
+                            trace!("Checkpoint: {:?}", to_modify);
+                            *self.checkpoint_entities.lock().await[i].lock().await = to_modify;
+                            }
+                            EventData::DeleteRows(event) => {
+                                let pool: &mut Pool<MySql> = &mut self.pools[i];
+                                let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
+                                let mut to_modify = self.checkpoint_entities.lock().await[i]
+                                    .lock()
+                                    .await
+                                    .clone();
                             let table_name = table_map
                                 .get(&event.table_id)
                                 .unwrap_or_else(|| panic!("Table id {} not found", event.table_id))
@@ -702,8 +760,16 @@ impl Source for MySQLSource {
                                         .insert(checkpoint_entity.table.clone(), checkpoint_entity);
                                 }
                             }
-                        }
-                        EventData::UpdateRows(event) => {
+                            trace!("Checkpoint: {:?}", to_modify);
+                            *self.checkpoint_entities.lock().await[i].lock().await = to_modify;
+                            }
+                            EventData::UpdateRows(event) => {
+                                let pool: &mut Pool<MySql> = &mut self.pools[i];
+                                let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
+                                let mut to_modify = self.checkpoint_entities.lock().await[i]
+                                    .lock()
+                                    .await
+                                    .clone();
                             let table_name = table_map
                                 .get(&event.table_id)
                                 .unwrap_or_else(|| panic!("Table id {} not found", event.table_id))
@@ -763,22 +829,74 @@ impl Source for MySQLSource {
                                         .insert(checkpoint_entity.table.clone(), checkpoint_entity);
                                 }
                             }
+                            trace!("Checkpoint: {:?}", to_modify);
+                            *self.checkpoint_entities.lock().await[i].lock().await = to_modify;
                         }
-                        _ => {}
-                    },
+                            _ => {}
+                        }
+                    }
                     Err(e) => {
-                        // 打印错误信息
-                        // error!("遇到错误，忽略这个异常: {}", e);
-                        error!("遇到错误，结束内部循环，尝试重新开启source，Error: {}", e);
-                        // panic!("Error: {}", e);
+                        let message = e.to_string();
+                        if should_ignore_read_error(&message) {
+                            continue;
+                        }
+                        if should_reconnect_read_error(&message) {
+                            let connection_url = self.mysql_source[i].connection_url.clone();
+                            let server_id = self.mysql_source[i].server_id;
+                            let runtime_binlog_filename =
+                                self.binlog_filename_list.lock().await[i].lock().await.clone();
+                            let runtime_binlog_position =
+                                *self.binlog_position_list.lock().await[i].lock().await;
+                            let checkpoints =
+                                self.checkpoint_entities.lock().await[i].lock().await.clone();
+                            let resume_position = compute_resume_position(
+                                if runtime_binlog_filename.is_empty() {
+                                    None
+                                } else {
+                                    Some(runtime_binlog_filename.as_str())
+                                },
+                                if runtime_binlog_position == 0 {
+                                    None
+                                } else {
+                                    Some(runtime_binlog_position)
+                                },
+                                &checkpoints,
+                            );
+                            let start_position = match resume_position {
+                                ResumePosition::Latest => StartPosition::Latest,
+                                ResumePosition::BinlogPosition(f, p) => {
+                                    StartPosition::BinlogPosition(f, p)
+                                }
+                            };
+                            match BinlogClient::new(&connection_url, server_id, start_position)
+                                .with_master_heartbeat(Duration::from_secs(5))
+                                .with_keepalive(Duration::from_secs(60), Duration::from_secs(10))
+                                .connect()
+                                .await
+                            {
+                                Ok(new_stream) => {
+                                    self.streams[i] = new_stream;
+                                    continue;
+                                }
+                                Err(connect_err) => {
+                                    error!(
+                                        "遇到错误，重连失败，尝试重新开启source，Error: {}, ConnectError: {}",
+                                        message, connect_err
+                                    );
+                                    return Err(CustomError {
+                                        message,
+                                        error_type: CustomErrorType::Restart,
+                                    });
+                                }
+                            }
+                        }
+                        error!("遇到错误，结束内部循环，尝试重新开启source，Error: {}", message);
                         return Err(CustomError {
-                            message: e.to_string(),
+                            message,
                             error_type: CustomErrorType::Restart,
                         });
                     }
                 }
-                trace!("Checkpoint: {:?}", to_modify);
-                *self.checkpoint_entities.lock().await[i].lock().await = to_modify;
             }
         }
     }
@@ -924,4 +1042,81 @@ async fn parse_row(
         index += 1;
     }
     CaseInsensitiveHashMap::new(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_entity(
+        is_new: bool,
+        last_binlog_filename: &str,
+        last_binlog_position: u32,
+        table: &str,
+    ) -> MysqlCheckPointDetailEntity {
+        MysqlCheckPointDetailEntity {
+            last_binlog_filename: last_binlog_filename.to_string(),
+            last_binlog_position,
+            retry_times: 0,
+            is_new,
+            checkpoint_filepath: "x".to_string(),
+            table: table.to_string(),
+        }
+    }
+
+    #[test]
+    fn compute_resume_position_prefers_runtime() {
+        let mut checkpoints = HashMap::new();
+        checkpoints.insert(
+            "t".to_string(),
+            mk_entity(false, "mysql-bin.000010", 120, "t"),
+        );
+        let rp = compute_resume_position(Some("mysql-bin.000020"), Some(456), &checkpoints);
+        assert_eq!(
+            rp,
+            ResumePosition::BinlogPosition("mysql-bin.000020".to_string(), 456)
+        );
+    }
+
+    #[test]
+    fn compute_resume_position_latest_when_all_new() {
+        let mut checkpoints = HashMap::new();
+        checkpoints.insert("a".to_string(), mk_entity(true, "mysql-bin.000001", 4, "a"));
+        checkpoints.insert("b".to_string(), mk_entity(true, "mysql-bin.000001", 4, "b"));
+        let rp = compute_resume_position(None, None, &checkpoints);
+        assert_eq!(rp, ResumePosition::Latest);
+    }
+
+    #[test]
+    fn compute_resume_position_uses_max_checkpoint() {
+        let mut checkpoints = HashMap::new();
+        checkpoints.insert(
+            "a".to_string(),
+            mk_entity(false, "mysql-bin.000010", 120, "a"),
+        );
+        checkpoints.insert(
+            "b".to_string(),
+            mk_entity(false, "mysql-bin.000011", 4, "b"),
+        );
+        let rp = compute_resume_position(None, None, &checkpoints);
+        assert_eq!(
+            rp,
+            ResumePosition::BinlogPosition("mysql-bin.000011".to_string(), 4)
+        );
+    }
+
+    #[test]
+    fn timeout_errors_are_ignored() {
+        assert!(should_ignore_read_error(
+            "unexpected binlog data: Read binlog header timeout after 60s while waiting for packet header"
+        ));
+        assert!(should_ignore_read_error("Timed out"));
+    }
+
+    #[test]
+    fn eof_errors_trigger_reconnect() {
+        assert!(should_reconnect_read_error("io error: unexpected end of file"));
+        assert!(should_reconnect_read_error("connection reset by peer"));
+        assert!(should_reconnect_read_error("Broken pipe"));
+    }
 }

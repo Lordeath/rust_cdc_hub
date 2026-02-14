@@ -43,7 +43,7 @@ async fn main() {
     error!("App 启动");
 
     info!("Config Loaded");
-    let source: Arc<Mutex<dyn Source>> = SourceFactory::create_source(&config).await;
+    let mut source: Arc<Mutex<dyn Source>> = SourceFactory::create_source(&config).await;
     add_plugin(&config, &source).await;
     info!("成功创建source");
     let table_info_list = source.lock().await.get_table_info().await;
@@ -67,6 +67,8 @@ async fn main() {
                 break;
             }
             error!("尝试进行重试 {}: {}", retry_times, e.message);
+            source = SourceFactory::create_source(&config).await;
+            add_plugin(&config, &source).await;
         } else {
             break;
         }
