@@ -128,6 +128,9 @@ pub struct CdcConfig {
     pub sink_batch_size: Option<usize>,
     pub checkpoint_file_path: Option<String>,
     pub log_level: Option<String>,
+    pub enable_ui: Option<bool>,
+    pub ui_bind: Option<String>,
+    pub ui_port: Option<u16>,
 }
 
 impl CdcConfig {
@@ -654,6 +657,8 @@ pub async fn get_mysql_pool_by_url(
     info!("Connecting to MySQL: {} from: {}", connection_url, from);
     match MySqlPoolOptions::new()
         .max_connections(10)
+        .acquire_timeout(Duration::from_secs(10))
+        .test_before_acquire(true)
         // 连接空闲超过 20 分钟直接丢弃
         .idle_timeout(Duration::from_secs(20 * 60))
         // 不管用不用，活超过 2 小时就重建

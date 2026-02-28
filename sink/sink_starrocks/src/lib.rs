@@ -25,6 +25,8 @@ pub struct StarrocksSink {
     health_url: String,
     database: String,
     sink_batch_size: usize,
+    auto_create_database: bool,
+    auto_create_table: bool,
     auto_add_column: bool,
     auto_modify_column: bool,
 
@@ -52,6 +54,8 @@ impl StarrocksSink {
         let starrocks_client: StarrocksClient =
             StarrocksClient::new(base_url.as_str(), username.as_str(), password.as_str()).await;
         let sink_batch_size = config.sink_batch_size.unwrap_or(1024);
+        let auto_create_database = config.auto_create_database.unwrap_or(true);
+        let auto_create_table = config.auto_create_table.unwrap_or(true);
         let auto_add_column = config.auto_add_column.unwrap_or(true);
         let auto_modify_column = config.auto_modify_column.unwrap_or(true);
         StarrocksSink {
@@ -59,6 +63,8 @@ impl StarrocksSink {
             health_url: format!("http://{}:{}/api/health", host, http_port),
             database,
             sink_batch_size,
+            auto_create_database,
+            auto_create_table,
             auto_add_column,
             auto_modify_column,
             table_info_list,
@@ -98,6 +104,93 @@ impl StarrocksSink {
             out.push(cols);
         }
         Ok(out)
+    }
+
+    async fn ensure_database(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if !self.auto_create_database {
+            return Ok(());
+        }
+        let sql = format!("CREATE DATABASE IF NOT EXISTS `{}`", self.database);
+        let resp = self
+            .starrocks_client
+            .execute_sql("information_schema", sql.as_str())
+            .await;
+        if resp.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("create database failed: {}", self.database),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn ensure_table(
+        &self,
+        table_info: &TableInfoVo,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if !self.auto_create_table {
+            return Ok(());
+        }
+        let sql = format!(
+            "select TABLE_NAME from information_schema.`tables` where TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' limit 1",
+            self.database, table_info.table_name
+        );
+        let rows = self
+            .fetch_rows("information_schema", sql.as_str())
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        if !rows.is_empty() {
+            return Ok(());
+        }
+
+        let defs =
+            extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
+        let mut cols_sql: Vec<String> = Vec::with_capacity(table_info.columns.len() + 1);
+        for src_col in &table_info.columns {
+            let key = src_col.to_ascii_lowercase();
+            let def = match defs.get(&key) {
+                None => continue,
+                Some(v) => v,
+            };
+            let mysql_type = match mysql_type_token_from_column_definition(def.as_str()) {
+                None => continue,
+                Some(v) => v,
+            };
+            let mut nullable = mysql_column_allows_null_from_definition(def.as_str());
+            if src_col.eq_ignore_ascii_case(table_info.pk_column.as_str()) {
+                nullable = false;
+            }
+            let nullable_sql = if nullable { "NULL" } else { "NOT NULL" };
+            let starrocks_type = Self::map_mysql_type_to_starrocks(mysql_type.as_str());
+            cols_sql.push(format!(
+                "`{}` {} {}",
+                src_col, starrocks_type, nullable_sql
+            ));
+        }
+        cols_sql.push("`__op` TINYINT NOT NULL".to_string());
+
+        let pk = table_info.pk_column.clone();
+        let create = format!(
+            "CREATE TABLE IF NOT EXISTS `{}`.`{}` (\n{}\n)\nPRIMARY KEY(`{}`)\nDISTRIBUTED BY HASH(`{}`) BUCKETS 10\nPROPERTIES(\n\"replication_num\"=\"1\",\n\"enable_unique_key_merge_on_write\"=\"true\"\n)",
+            self.database,
+            table_info.table_name,
+            cols_sql.join(",\n"),
+            pk,
+            pk
+        );
+        let resp = self
+            .starrocks_client
+            .execute_sql("information_schema", create.as_str())
+            .await;
+        if resp.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("create table failed: {}", table_info.table_name),
+            )
+            .into());
+        }
+        Ok(())
     }
 
     fn map_mysql_type_to_starrocks(mysql_type_token: &str) -> String {
@@ -248,6 +341,19 @@ impl StarrocksSink {
                     }
                 }
             }
+
+            if !exists.contains_key("__op") && self.auto_add_column {
+                let alter = format!("ALTER TABLE `{}` ADD COLUMN `__op` TINYINT NOT NULL", table_name);
+                let resp = self
+                    .starrocks_client
+                    .execute_sql(self.database.as_str(), alter.as_str())
+                    .await;
+                if resp.is_empty() {
+                    error!("auto add column failed: {} __op empty response", table_name);
+                } else {
+                    info!("auto add column attempted: {} __op", table_name);
+                }
+            }
         }
     }
 
@@ -306,6 +412,10 @@ impl Sink for StarrocksSink {
             .send()
             .await?;
         info!("Starrocks FE is healthy");
+        self.ensure_database().await?;
+        for table_info in &self.table_info_list {
+            self.ensure_table(table_info).await?;
+        }
         self.ensure_schema().await;
         Ok(())
     }

@@ -106,18 +106,18 @@ sink_config:
 - [x] meilisearch 的 sink
 - [x] mysql 的 sink
 - [X] starrocks 的 sink
-- [ ] starrocks的sink时，自动建表，自动建库，自动加字段
-- [ ] 断点续传，挂掉之后自动重启，然后继续执行之前的作业
+- [x] starrocks的sink时，自动建表，自动建库，自动加字段
+- [x] 断点续传，挂掉之后自动重启，然后继续执行之前的作业
 - [x] 重试的时候，不drop掉对象，防止重试的时候对象被drop。等到成功之后再drop对象
 - [x] (mysql sink) auto create database
 - [x] (mysql sink) auto create table
-- [ ] (mysql sink) auto add column
-- [ ] (mysql sink) all table sync
+- [x] (mysql sink) auto add column
+- [x] (mysql sink) all table sync
 - [X] (mysql sink) 忽略这样的字段`fullPath` varchar(120) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci GENERATED ALWAYS AS (concat(`path`,`HouseId`,_utf8mb3'/')) STORED,
-- [ ] (mysql source) 获取binlog的时候，指定获取的binlog位置，防止同步时间过长导致的数据丢失
-- [ ] (mysql sink) 解决pool超时的问题，自行进行连接池的管理，防止连接池超时
+- [x] (mysql source) 获取binlog的时候，指定获取的binlog位置，防止同步时间过长导致的数据丢失
+- [x] (mysql sink) 解决pool超时的问题，自行进行连接池的管理，防止连接池超时
 
 
 
 # 后续想要做的
-- [ ] 可视化界面
+- [x] 可视化界面

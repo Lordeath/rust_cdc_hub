@@ -53,6 +53,8 @@ struct MysqlSourceConfigDetail {
     connection_url: String,
     table_info_list: Vec<TableInfoVo>,
     batchsize: usize,
+    start_binlog_filename: Option<String>,
+    start_binlog_position: Option<u32>,
 }
 
 impl MysqlSourceConfig {
@@ -80,6 +82,15 @@ impl MysqlSourceConfig {
             let port = config.source("port", i);
             let database = config.source("database", i);
             let server_id: u64 = config.source("server_id", i).parse::<u64>().unwrap_or(0);
+            let start_binlog_filename = match config.source("binlog_filename", i) {
+                s if s.is_empty() => None,
+                s => Some(s),
+            };
+            let start_binlog_position = config
+                .source("binlog_position", i)
+                .parse::<u32>()
+                .ok()
+                .filter(|p| *p > 0);
             let connection_url = format!(
                 "mysql://{}:{}@{}:{}/{}",
                 username,
@@ -198,6 +209,8 @@ impl MysqlSourceConfig {
                 connection_url,
                 table_info_list,
                 batchsize: config.source_batch_size.unwrap_or(8192),
+                start_binlog_filename,
+                start_binlog_position,
             });
         }
         table_name_list = table_name_list
@@ -366,22 +379,32 @@ impl MySQLSource {
             }
             checkpoint_entities.push(Mutex::new(mysql_checkpoint_detail_entity_map.clone()));
 
-            let start_position: StartPosition = if mysql_checkpoint_detail_entity_map
+            if let (Some(f), Some(p)) = (
+                cfg.mysql_source[i].start_binlog_filename.clone(),
+                cfg.mysql_source[i].start_binlog_position,
+            ) {
+                for entity in mysql_checkpoint_detail_entity_map.values_mut() {
+                    if entity.is_new {
+                        entity.last_binlog_filename = f.clone();
+                        entity.last_binlog_position = p;
+                    }
+                }
+            }
+
+            let max: MysqlCheckPointDetailEntity = mysql_checkpoint_detail_entity_map
                 .values()
-                .all(|entity| entity.is_new)
+                .max_by(|a, b| {
+                    a.last_binlog_filename
+                        .cmp(&b.last_binlog_filename)
+                        .then(a.last_binlog_position.cmp(&b.last_binlog_position))
+                })
+                .unwrap()
+                .clone();
+            let start_position: StartPosition = if max.last_binlog_filename.is_empty()
+                || max.last_binlog_position == 0
             {
                 StartPosition::Latest
             } else {
-                // 如果部分是新的表，选取最新的一个的binlog开始同步
-                let max: MysqlCheckPointDetailEntity = mysql_checkpoint_detail_entity_map
-                    .values()
-                    .max_by(|a, b| {
-                        a.last_binlog_filename
-                            .cmp(&b.last_binlog_filename)
-                            .then(a.last_binlog_position.cmp(&b.last_binlog_position))
-                    })
-                    .unwrap()
-                    .clone();
                 StartPosition::BinlogPosition(max.last_binlog_filename, max.last_binlog_position)
             };
 
@@ -459,9 +482,6 @@ fn compute_resume_position(
     {
         return ResumePosition::BinlogPosition(f.to_string(), p);
     }
-    if checkpoints.values().all(|entity| entity.is_new) {
-        return ResumePosition::Latest;
-    }
     let max: MysqlCheckPointDetailEntity = checkpoints
         .values()
         .max_by(|a, b| {
@@ -471,6 +491,9 @@ fn compute_resume_position(
         })
         .unwrap()
         .clone();
+    if max.last_binlog_filename.is_empty() || max.last_binlog_position == 0 {
+        return ResumePosition::Latest;
+    }
     ResumePosition::BinlogPosition(max.last_binlog_filename, max.last_binlog_position)
 }
 
