@@ -121,3 +121,14 @@ sink_config:
 
 # 后续想要做的
 - [x] 可视化界面
+- [x] 指标监控：Prometheus metrics（吞吐、延迟、失败、重试、checkpoint位点）
+- [x] 一致性快照：初始化全量与binlog消费对齐同一位点/GTID
+- [ ] DDL 同步：捕获并处理常见表结构变更（ADD/MODIFY/DROP/RENAME）
+- [x] 表/库选择增强：include/exclude（前缀、正则、黑白名单）
+  - [ ] 动态加载配置
+- [x] 多数据源完善：get_table_info 支持汇总多 source_config 的表信息
+- [ ] 多目标写入：支持一个 source fan-out 到多个 sink 或按表路由
+- [x] Checkpoint 存储可插拔：文件/SQLite/Redis（已实现 Manager 接口与文件存储）
+- [ ] 失败旁路与重放：DLQ、按表隔离、指数退避与错误分类
+- [ ] E2E 集成测试：docker compose + 自动验数（MySQL→MySQL/StarRocks/Meili）
+- [ ] 安全与运维：TLS/证书、日志脱敏、限流/背压、热重载配置

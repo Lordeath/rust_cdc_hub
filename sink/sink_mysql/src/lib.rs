@@ -2,6 +2,7 @@ use common::case_insensitive_hash_map::{
     CaseInsensitiveHashMapTableInfoVo, CaseInsensitiveHashMapVecCaseInsensitiveHashMap,
     CaseInsensitiveHashMapVecString,
 };
+use common::metrics::{SINK_EVENTS_TOTAL, SINK_FLUSH_DURATION_SECONDS, SINK_FLUSH_ERRORS_TOTAL};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value,
@@ -387,6 +388,11 @@ impl Sink for MySqlSink {
     }
 
     async fn flush(&self, flush_by_operation: &FlushByOperation) -> Result<(), String> {
+        let trigger = format!("{:?}", flush_by_operation);
+        let _timer = SINK_FLUSH_DURATION_SECONDS
+            .with_label_values(&["mysql", &trigger])
+            .start_timer();
+
         if !*self.initialized.read().await {
             for table_info in &self.table_info_list {
                 self.table_info_cache
@@ -458,6 +464,14 @@ impl Sink for MySqlSink {
             let pk_name = self.get_pk_name_from_cache(&table_name).await;
             cache_for_roll_back.push(r.clone());
             debug!("Flushing Mysql Sink: {:?}", r);
+            let op_str = match r.op {
+                Operation::CREATE(_) => "create",
+                Operation::UPDATE => "update",
+                Operation::DELETE => "delete",
+                _ => "other",
+            };
+            SINK_EVENTS_TOTAL.with_label_values(&["mysql", &table_name, op_str]).inc();
+
             match r.op {
                 Operation::CREATE(_) | Operation::UPDATE => {
                     insert_map.entry_insert(table_name.clone(), r.after);
@@ -543,6 +557,7 @@ impl Sink for MySqlSink {
                 debug!("MySQL batch UPSERT: {}", sql);
                 if let Err(e) = self.execute_with_retry(query, sql.clone()).await {
                     error!("MySQL batch UPSERT error: {:?}", e);
+                    SINK_FLUSH_ERRORS_TOTAL.with_label_values(&["mysql", "upsert"]).inc();
                     error!("need to do it again: {}", cache_for_roll_back.len());
                     let mut buf = self.buffer.lock().await;
                     for cached_data_buffer in cache_for_roll_back {
@@ -577,6 +592,7 @@ impl Sink for MySqlSink {
 
                 if let Err(e) = self.execute_with_retry(query, sql.clone()).await {
                     error!("MySQL batch delete error: {:?}", e);
+                    SINK_FLUSH_ERRORS_TOTAL.with_label_values(&["mysql", "delete"]).inc();
                     error!("need to do it again: {}", cache_for_roll_back.len());
                     let mut buf = self.buffer.lock().await;
                     for cached_data_buffer in cache_for_roll_back {

@@ -1,9 +1,11 @@
 extern crate core;
 
 use common::{CdcConfig, FlushByOperation, Plugin, Sink, Source};
+use common::metrics::{REGISTRY, APP_RESTART_COUNT};
 use sink::SinkFactory;
 use source::SourceFactory;
 use actix_web::{App, HttpResponse, HttpServer, Responder, web};
+use prometheus::{Encoder, TextEncoder};
 use serde_json::json;
 use std::error::Error;
 use std::sync::Arc;
@@ -95,6 +97,17 @@ async fn ui_status(state: web::Data<UiState>) -> impl Responder {
     }))
 }
 
+async fn ui_metrics() -> impl Responder {
+    let encoder = TextEncoder::new();
+    let metric_families = REGISTRY.gather();
+    let mut buffer = vec![];
+    encoder.encode(&metric_families, &mut buffer).unwrap();
+    
+    HttpResponse::Ok()
+        .content_type(encoder.format_type())
+        .body(buffer)
+}
+
 async fn ui_root(state: web::Data<UiState>) -> impl Responder {
     let v = json!({
         "started_at": state.started_at,
@@ -120,6 +133,7 @@ async fn start_ui(ui_state: UiState, bind: String, port: u16) -> Result<(), Box<
     let local_port = local_addr.port();
     info!("curl -sS http://127.0.0.1:{}/health", local_port);
     info!("curl -sS http://127.0.0.1:{}/status", local_port);
+    info!("curl -sS http://127.0.0.1:{}/metrics", local_port);
     info!("curl -sS http://127.0.0.1:{}/", local_port);
     HttpServer::new(move || {
         App::new()
@@ -127,6 +141,7 @@ async fn start_ui(ui_state: UiState, bind: String, port: u16) -> Result<(), Box<
             .route("/", web::get().to(ui_root))
             .route("/health", web::get().to(ui_health))
             .route("/status", web::get().to(ui_status))
+            .route("/metrics", web::get().to(ui_metrics))
     })
     .listen(listener)?
     .run()
@@ -204,6 +219,7 @@ async fn main() {
             ui_state
                 .last_source_restart_at
                 .store(Utc::now().timestamp(), Ordering::Relaxed);
+            APP_RESTART_COUNT.with_label_values(&["source"]).inc();
             error!("尝试进行重试 {}: {}", retry_times, e.message);
             source = SourceFactory::create_source(&config).await;
             add_plugin(&config, &source).await;

@@ -2,8 +2,10 @@ extern crate core;
 
 use async_trait::async_trait;
 use common::case_insensitive_hash_map::{CaseInsensitiveHashMap, CaseInsensitiveHashMapVecString};
+use common::checkpoint_manager::{CheckpointManager, FileCheckpointManager};
 use common::custom_error::{CustomError, CustomErrorType};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
+use common::metrics::{SOURCE_EVENTS_TOTAL, SOURCE_LAG_POSITION};
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value,
     get_mysql_pool_by_url, mysql_row_to_hashmap,
@@ -14,12 +16,13 @@ use mysql_binlog_connector_rust::column::column_value::ColumnValue;
 use mysql_binlog_connector_rust::column::json::json_binary::JsonBinary;
 use mysql_binlog_connector_rust::event::event_data::EventData;
 use mysql_binlog_connector_rust::event::row_event::RowEvent;
+use regex::Regex;
 use serde::Deserialize;
 use serde::Serialize;
 use sqlx::FromRow;
 use sqlx::Row;
 use sqlx::mysql::MySqlRow;
-use sqlx::{MySql, Pool};
+use sqlx::{MySql, Pool, Transaction};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,13 +30,14 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace};
 
 pub struct MySQLSource {
-    streams: Vec<BinlogStream>, // ✅ 多个流
+    streams: Vec<Option<BinlogStream>>, // ✅ 多个流
     mysql_source: Vec<MysqlSourceConfigDetail>,
     pools: Vec<Pool<MySql>>,
     checkpoint_entities: Mutex<Vec<Mutex<HashMap<String, MysqlCheckPointDetailEntity>>>>,
     plugins: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>,
     binlog_filename_list: Mutex<Vec<Mutex<String>>>,
     binlog_position_list: Mutex<Vec<Mutex<u32>>>,
+    checkpoint_manager: Arc<dyn CheckpointManager>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,19 +65,37 @@ impl MysqlSourceConfig {
     pub async fn new(config: &CdcConfig) -> Self {
         let size = config.source_config.len();
         let mut mysql_source: Vec<MysqlSourceConfigDetail> = vec![];
-        // TODO 后续要支持多张表
+        
         // split table_name
-        let mut table_name_list: Vec<String> = config
+        let configured_table_names: Vec<String> = config
             .first_source("table_name")
             .split(',')
             .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
             .collect();
+            
         let except_table_name_prefix: Vec<String> = config
             .first_source("except_table_name_prefix")
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+
+        let include_table_regex_str = config.first_source("include_table_regex");
+        let include_regex = if !include_table_regex_str.is_empty() {
+             Some(Regex::new(&include_table_regex_str).expect("Invalid include_table_regex"))
+        } else {
+             None
+        };
+
+        let exclude_table_regex_str = config.first_source("exclude_table_regex");
+        let exclude_regex = if !exclude_table_regex_str.is_empty() {
+             Some(Regex::new(&exclude_table_regex_str).expect("Invalid exclude_table_regex"))
+        } else {
+             None
+        };
+
+        let mut all_tables_collected: Vec<String> = vec![];
 
         for i in 0..size {
             let username = config.source("username", i);
@@ -103,10 +125,13 @@ impl MysqlSourceConfig {
             let pool = get_mysql_pool_by_url(&connection_url, "mysql source 初始化获取数据结构")
                 .await
                 .unwrap();
-            if table_name_list.is_empty()
-                || table_name_list.len() == 1
-                    && (table_name_list[0].eq_ignore_ascii_case("all")
-                        || table_name_list[0].eq_ignore_ascii_case("*"))
+            
+            let mut current_source_tables = configured_table_names.clone();
+
+            if current_source_tables.is_empty()
+                || (current_source_tables.len() == 1
+                    && (current_source_tables[0].eq_ignore_ascii_case("all")
+                        || current_source_tables[0].eq_ignore_ascii_case("*")))
             {
                 // get all tables
                 let show_tables_sql = r#"
@@ -150,15 +175,31 @@ impl MysqlSourceConfig {
                     })
                     // .map(|row| row.table_name)
                     .collect();
-                info!("get all tables: {:?}", tables);
-                table_name_list.clear();
-                table_name_list.extend(tables);
+                info!("get all tables from {}: {:?}", database, tables);
+                current_source_tables = tables;
             }
 
-            for table_name in table_name_list.clone() {
-                if Self::judge_is_skip(&except_table_name_prefix, &table_name) {
-                    continue;
+            // Apply filters
+            current_source_tables.retain(|table_name| {
+                if Self::judge_is_skip(&except_table_name_prefix, table_name) {
+                    return false;
                 }
+                if let Some(re) = &exclude_regex {
+                    if re.is_match(table_name) {
+                        info!("Exclude table by regex: {}", table_name);
+                        return false;
+                    }
+                }
+                if let Some(re) = &include_regex {
+                    if !re.is_match(table_name) {
+                        info!("Skip table not matching include regex: {}", table_name);
+                        return false;
+                    }
+                }
+                true
+            });
+
+            for table_name in current_source_tables.clone() {
                 // fill table_info
                 let show_create_table_sql = format!("show create table `{}`", table_name);
                 info!("{}", show_create_table_sql);
@@ -185,7 +226,7 @@ impl MysqlSourceConfig {
                     .map(|c| c.column_name.clone())
                     .collect();
                 if pk_column.is_empty() || pk_column.len() > 1 {
-                    error!("pk_column is empty or more than one");
+                    error!("pk_column is empty or more than one for table {}", table_name);
                     // panic!("pk_column is empty or more than one");
                     continue;
                 }
@@ -212,18 +253,17 @@ impl MysqlSourceConfig {
                 start_binlog_filename,
                 start_binlog_position,
             });
+            
+            all_tables_collected.extend(current_source_tables);
         }
-        table_name_list = table_name_list
-            .iter()
-            .filter(|t| !Self::judge_is_skip(&except_table_name_prefix, t))
-            .map(|t| t.to_string())
-            .collect();
-        if table_name_list.is_empty() {
-            error!("no table found");
-            panic!("no table found");
+        
+        if all_tables_collected.is_empty() {
+            error!("no table found after filtering");
+            panic!("no table found after filtering");
         }
+        
         MysqlSourceConfig {
-            table_name_list,
+            table_name_list: all_tables_collected,
             mysql_source,
         }
     }
@@ -294,7 +334,7 @@ impl MysqlSourceConfigDetail {
         table_name: &str,
         pk_column: &str,
         id: i64,
-        pool: &Pool<MySql>,
+        executor: &mut Transaction<'_, MySql>,
     ) -> Vec<DataBuffer> {
         let sql = format!(
             r#"
@@ -312,7 +352,7 @@ impl MysqlSourceConfigDetail {
         );
         // 查询 Row，而不是 HashMap
         let rows: Vec<MySqlRow> = sqlx::query(&sql)
-            .fetch_all(pool)
+            .fetch_all(&mut **executor)
             .await
             .expect("query failed");
         info!(
@@ -344,7 +384,7 @@ impl MysqlSourceConfigDetail {
 
 impl MySQLSource {
     pub async fn new(config: &CdcConfig) -> Self {
-        let mut streams: Vec<BinlogStream> = vec![];
+        let mut streams: Vec<Option<BinlogStream>> = vec![];
         let mut mysql_source: Vec<MysqlSourceConfigDetail> = vec![];
         let mut pools: Vec<Pool<MySql>> = vec![];
         // 这里支持多个数据源配置
@@ -355,7 +395,6 @@ impl MySQLSource {
         let mut checkpoint_entities: Vec<Mutex<HashMap<String, MysqlCheckPointDetailEntity>>> =
             vec![];
         for i in 0..size {
-            let server_id: u64 = cfg.mysql_source[i].server_id;
             let connection_url = cfg.mysql_source[i].connection_url.clone();
             let tables: Vec<String> = cfg.mysql_source[i]
                 .table_info_list
@@ -390,33 +429,9 @@ impl MySQLSource {
                     }
                 }
             }
-
-            let max: MysqlCheckPointDetailEntity = mysql_checkpoint_detail_entity_map
-                .values()
-                .max_by(|a, b| {
-                    a.last_binlog_filename
-                        .cmp(&b.last_binlog_filename)
-                        .then(a.last_binlog_position.cmp(&b.last_binlog_position))
-                })
-                .unwrap()
-                .clone();
-            let start_position: StartPosition = if max.last_binlog_filename.is_empty()
-                || max.last_binlog_position == 0
-            {
-                StartPosition::Latest
-            } else {
-                StartPosition::BinlogPosition(max.last_binlog_filename, max.last_binlog_position)
-            };
-
-            let client: BinlogStream =
-                BinlogClient::new(&connection_url, server_id, start_position)
-                    .with_master_heartbeat(Duration::from_secs(5))
-                    .with_keepalive(Duration::from_secs(60), Duration::from_secs(10))
-                    .connect()
-                    .await
-                    .expect("Failed to connect to MySQL server");
-
-            streams.push(client);
+            
+            // Stream creation deferred to start()
+            streams.push(None);
             mysql_source.push(cfg.mysql_source[i].clone());
             let pool: Pool<MySql> = get_mysql_pool_by_url(&connection_url, "mysql source 初始化")
                 .await
@@ -429,6 +444,10 @@ impl MySQLSource {
             binlog_position_list.lock().await.push(Mutex::new(0));
         }
 
+        let checkpoint_manager = Arc::new(FileCheckpointManager::new(
+            config.checkpoint_file_path.clone().unwrap_or("/checkpoint".to_string()),
+        ));
+
         Self {
             streams,
             mysql_source,
@@ -437,6 +456,20 @@ impl MySQLSource {
             plugins: vec![],
             binlog_filename_list,
             binlog_position_list,
+            checkpoint_manager,
+        }
+    }
+
+    async fn save_checkpoints(&self) {
+        let max = self.pools.len();
+        for i in 0..max {
+            let checkpoints_guard = self.checkpoint_entities.lock().await;
+            let checkpoints = checkpoints_guard[i].lock().await;
+            for (table_name, cp) in checkpoints.iter() {
+                if let Err(e) = self.checkpoint_manager.save(table_name, cp).await {
+                    error!("Failed to save checkpoint for {}: {}", table_name, e);
+                }
+            }
         }
     }
 
@@ -544,82 +577,206 @@ impl Source for MySQLSource {
                 let pool: &mut Pool<MySql> = &mut self.pools[i];
                 let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
 
-                for table_info_vo in config.table_info_list.clone() {
-                    let table_name = table_info_vo.table_name.clone();
-                    let checkpoint_entity: &mut Mutex<
-                        HashMap<String, MysqlCheckPointDetailEntity>,
-                    > = &mut self.checkpoint_entities.lock().await[i];
-                    let checkpoint_entity = &mut checkpoint_entity
-                        .lock()
-                        .await
-                        .get(&table_name.to_lowercase())
-                        .unwrap_or_else(|| panic!("{} not found", table_name))
-                        .clone();
-                    if !checkpoint_entity.is_new {
-                        info!(
-                            "跳过初始化数据源: {} {}",
-                            config.connection_url, &table_name
-                        );
-                        continue;
-                    }
-
-                    let pk_column = table_info_vo.pk_column.clone();
-                    info!("开始初始化数据源: {}.{}", config.connection_url, table_name);
-                    let start = Instant::now();
-                    let mut count = 0;
-                    // 这里进行循环，一批一批进行数据写入
-                    let mut id: i64 = i64::MIN;
-                    loop {
-                        let data_buffer_list: Vec<DataBuffer> = config
-                            .extract_init_data(&table_name, &pk_column, id, pool)
-                            .await;
-                        let len = data_buffer_list.len();
-                        for data_buffer in data_buffer_list.iter().take(len) {
-                            let plugin_data =
-                                detail_with_plugin(plugins, data_buffer.clone()).await;
-                            if let Ok(item) = plugin_data {
-                                Self::write_record_with_retry(&mut sink, &item, None).await;
+                // 1. Check if any table needs initialization
+                let mut any_new = false;
+                {
+                    let checkpoints_guard = self.checkpoint_entities.lock().await;
+                    let checkpoints = checkpoints_guard[i].lock().await;
+                    for table_info in &config.table_info_list {
+                        if let Some(cp) = checkpoints.get(&table_info.table_name.to_lowercase()) {
+                            if cp.is_new {
+                                any_new = true;
+                                break;
                             }
-                            let this_id = data_buffer.after.get(&pk_column);
-                            let this_id = match this_id {
-                                Value::Int64(x) => x,
-                                _ => {
-                                    panic!("pk_column not found");
-                                }
-                            };
-                            if this_id > &id {
-                                id = *this_id;
-                            }
-                        }
-                        count += len;
-                        debug!("当前最大id为 {}", id);
-                        if len != config.batchsize {
-                            break;
-                        }
-                    }
-                    sink.lock()
-                        .await
-                        .flush_with_retry(&FlushByOperation::Init)
-                        .await;
-                    info!(
-                        "MySQL数据源初始化完成 {}.{} count: {} cost: {:?}",
-                        config.connection_url,
-                        table_name,
-                        count,
-                        start.elapsed()
-                    );
-                    match checkpoint_entity.save() {
-                        Ok(_) => {
-                            info!(
-                                "alter_flush success {}",
-                                checkpoint_entity.checkpoint_filepath
-                            )
-                        }
-                        Err(e) => {
-                            error!("alter_flush error: {}", e)
                         }
                     }
                 }
+
+                if any_new {
+                    info!("Detected new tables, starting consistent snapshot initialization");
+                    let mut tx = pool.begin().await.map_err(|e| CustomError {
+                        message: e.to_string(),
+                        error_type: CustomErrorType::Restart,
+                    })?;
+                    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| CustomError {
+                            message: e.to_string(),
+                            error_type: CustomErrorType::Restart,
+                        })?;
+                    sqlx::query("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| CustomError {
+                            message: e.to_string(),
+                            error_type: CustomErrorType::Restart,
+                        })?;
+
+                    let row: MySqlRow = sqlx::query("SHOW MASTER STATUS")
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(|e| CustomError {
+                            message: e.to_string(),
+                            error_type: CustomErrorType::Restart,
+                        })?;
+                    let file: String = row.get("File");
+                    let pos: u32 = row.get("Position");
+                    info!("Consistent Snapshot Position: {}/{}", file, pos);
+
+                    // Update checkpoints for new tables
+                    {
+                        let checkpoints_guard = self.checkpoint_entities.lock().await;
+                        let mut checkpoints = checkpoints_guard[i].lock().await;
+                        for table_info in &config.table_info_list {
+                            if let Some(cp) =
+                                checkpoints.get_mut(&table_info.table_name.to_lowercase())
+                            {
+                                if cp.is_new {
+                                    cp.last_binlog_filename = file.clone();
+                                    cp.last_binlog_position = pos;
+                                }
+                            }
+                        }
+                    }
+
+                    for table_info_vo in config.table_info_list.clone() {
+                        let table_name = table_info_vo.table_name.clone();
+                        let is_new_table = {
+                            let checkpoints_guard = self.checkpoint_entities.lock().await;
+                            let checkpoints = checkpoints_guard[i].lock().await;
+                            checkpoints
+                                .get(&table_name.to_lowercase())
+                                .map(|c| c.is_new)
+                                .unwrap_or(false)
+                        };
+
+                        if !is_new_table {
+                            continue;
+                        }
+
+                        let pk_column = table_info_vo.pk_column.clone();
+                        info!(
+                            "开始初始化数据源: {}.{}",
+                            config.connection_url, table_name
+                        );
+                        let start = Instant::now();
+                        let mut count = 0;
+                        let mut id: i64 = i64::MIN;
+                        loop {
+                            let data_buffer_list: Vec<DataBuffer> = config
+                                .extract_init_data(&table_name, &pk_column, id, &mut tx)
+                                .await;
+                            let len = data_buffer_list.len();
+                            for data_buffer in data_buffer_list.iter().take(len) {
+                                let plugin_data =
+                                    detail_with_plugin(plugins, data_buffer.clone()).await;
+                                if let Ok(item) = plugin_data {
+                                    Self::write_record_with_retry(&mut sink, &item, None).await;
+                                }
+                                let this_id = data_buffer.after.get(&pk_column);
+                                let this_id = match this_id {
+                                    Value::Int64(x) => x,
+                                    _ => {
+                                        panic!("pk_column not found");
+                                    }
+                                };
+                                if this_id > &id {
+                                    id = *this_id;
+                                }
+                            }
+                            count += len;
+                            debug!("当前最大id为 {}", id);
+                            if len != config.batchsize {
+                                break;
+                            }
+                        }
+                        sink.lock()
+                            .await
+                            .flush_with_retry(&FlushByOperation::Init)
+                            .await;
+                        info!(
+                            "MySQL数据源初始化完成 {}.{} count: {} cost: {:?}",
+                            config.connection_url,
+                            table_name,
+                            count,
+                            start.elapsed()
+                        );
+                        // Mark as done and save
+                        {
+                            let checkpoints_guard = self.checkpoint_entities.lock().await;
+                            let mut checkpoints = checkpoints_guard[i].lock().await;
+                            if let Some(cp) =
+                                checkpoints.get_mut(&table_name.to_lowercase())
+                            {
+                                cp.is_new = false;
+                                match self.checkpoint_manager.save(&table_name, cp).await {
+                                    Ok(_) => {
+                                        info!(
+                                            "alter_flush success {}",
+                                            cp.checkpoint_filepath
+                                        )
+                                    }
+                                    Err(e) => {
+                                        error!("alter_flush error: {}", e)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    tx.commit().await.map_err(|e| CustomError {
+                        message: e.to_string(),
+                        error_type: CustomErrorType::Restart,
+                    })?;
+                } else {
+                    info!("No new tables found, skipping full load");
+                }
+
+                // Initialize Binlog Stream
+                let checkpoints = {
+                    let checkpoints_guard = self.checkpoint_entities.lock().await;
+                    checkpoints_guard[i].lock().await.clone()
+                };
+                let max: MysqlCheckPointDetailEntity = checkpoints
+                    .values()
+                    .max_by(|a, b| {
+                        a.last_binlog_filename
+                            .cmp(&b.last_binlog_filename)
+                            .then(a.last_binlog_position.cmp(&b.last_binlog_position))
+                    })
+                    .unwrap()
+                    .clone();
+
+                let start_position: StartPosition =
+                    if max.last_binlog_filename.is_empty() || max.last_binlog_position == 0 {
+                        StartPosition::Latest
+                    } else {
+                        StartPosition::BinlogPosition(
+                            max.last_binlog_filename,
+                            max.last_binlog_position,
+                        )
+                    };
+
+                let start_pos_str = match &start_position {
+                    StartPosition::Latest => "Latest".to_string(),
+                    StartPosition::BinlogPosition(f, p) => format!("{}/{}", f, p),
+                    StartPosition::Gtid(g) => format!("GTID:{}", g),
+                };
+                info!(
+                    "Connecting to Binlog: {:?} with start_position: {}",
+                    config.connection_url, start_pos_str
+                );
+                let client = BinlogClient::new(
+                    &config.connection_url,
+                    config.server_id,
+                    start_position,
+                )
+                .with_master_heartbeat(Duration::from_secs(5))
+                .with_keepalive(Duration::from_secs(60), Duration::from_secs(10))
+                .connect()
+                .await
+                .expect("Failed to connect to MySQL server");
+                self.streams[i] = Some(client);
             }
             info!("MySQL数据源初始化完成, cost: {:?}", start_all.elapsed());
         }
@@ -630,10 +787,15 @@ impl Source for MySQLSource {
         // 这里获取列名
         let mut table_map = HashMap::new();
         let mut table_database_map = HashMap::new();
+        let mut last_checkpoint_save = Instant::now();
         loop {
+            if last_checkpoint_save.elapsed().as_secs() >= 5 {
+                self.save_checkpoints().await;
+                last_checkpoint_save = Instant::now();
+            }
             let max = self.streams.len();
             for i in 0..max {
-                match self.streams[i].read().await {
+                match self.streams[i].as_mut().unwrap().read().await {
                     Ok((header, data)) => {
                         *self.binlog_position_list.lock().await[i].lock().await =
                             header.next_event_position;
@@ -693,6 +855,7 @@ impl Source for MySQLSource {
                                             parse_row(row, table_name, &mut columns, config, pool)
                                                 .await;
                                         let op = Operation::CREATE(false);
+                                        SOURCE_EVENTS_TOTAL.with_label_values(&["mysql", table_name, "create"]).inc();
                                         let data_buffer = DataBuffer::new(
                                             table_name.to_string(),
                                             before,
@@ -714,6 +877,7 @@ impl Source for MySQLSource {
                                         }
                                     }
                                     if !binlog_filename.is_empty() {
+                                        SOURCE_LAG_POSITION.with_label_values(&["mysql", table_name]).set(next_event_position as i64);
                                         checkpoint_entity = checkpoint_entity
                                             .update(binlog_filename, next_event_position);
                                         to_modify.insert(
@@ -768,6 +932,7 @@ impl Source for MySQLSource {
                                         let after: CaseInsensitiveHashMap =
                                             CaseInsensitiveHashMap::new_with_no_arg();
                                         let op = Operation::DELETE;
+                                        SOURCE_EVENTS_TOTAL.with_label_values(&["mysql", table_name, "delete"]).inc();
                                         let data_buffer = DataBuffer::new(
                                             table_name.to_string(),
                                             before,
@@ -789,6 +954,7 @@ impl Source for MySQLSource {
                                         }
                                     }
                                     if !binlog_filename.is_empty() {
+                                        SOURCE_LAG_POSITION.with_label_values(&["mysql", table_name]).set(next_event_position as i64);
                                         checkpoint_entity = checkpoint_entity
                                             .update(binlog_filename, next_event_position);
                                         to_modify.insert(
@@ -844,6 +1010,7 @@ impl Source for MySQLSource {
                                             parse_row(a, table_name, &mut columns, config, pool)
                                                 .await;
                                         let op = Operation::UPDATE;
+                                        SOURCE_EVENTS_TOTAL.with_label_values(&["mysql", table_name, "update"]).inc();
                                         let data_buffer = DataBuffer::new(
                                             table_name.to_string(),
                                             before,
@@ -866,6 +1033,7 @@ impl Source for MySQLSource {
                                     }
 
                                     if !binlog_filename.is_empty() {
+                                        SOURCE_LAG_POSITION.with_label_values(&["mysql", table_name]).set(next_event_position as i64);
                                         checkpoint_entity = checkpoint_entity
                                             .update(binlog_filename, next_event_position);
                                         to_modify.insert(
@@ -924,7 +1092,7 @@ impl Source for MySQLSource {
                                 .await
                             {
                                 Ok(new_stream) => {
-                                    self.streams[i] = new_stream;
+                                    self.streams[i] = Some(new_stream);
                                     continue;
                                 }
                                 Err(connect_err) => {
@@ -958,7 +1126,10 @@ impl Source for MySQLSource {
     }
 
     async fn get_table_info(&mut self) -> Vec<TableInfoVo> {
-        self.mysql_source[0].table_info_list.clone()
+        self.mysql_source
+            .iter()
+            .flat_map(|s| s.table_info_list.clone())
+            .collect()
     }
 
     // async fn alter_flush(&mut self) -> Result<(), String> {
@@ -1136,8 +1307,8 @@ mod tests {
     #[test]
     fn compute_resume_position_latest_when_all_new() {
         let mut checkpoints = HashMap::new();
-        checkpoints.insert("a".to_string(), mk_entity(true, "mysql-bin.000001", 4, "a"));
-        checkpoints.insert("b".to_string(), mk_entity(true, "mysql-bin.000001", 4, "b"));
+        checkpoints.insert("a".to_string(), mk_entity(true, "", 0, "a"));
+        checkpoints.insert("b".to_string(), mk_entity(true, "", 0, "b"));
         let rp = compute_resume_position(None, None, &checkpoints);
         assert_eq!(rp, ResumePosition::Latest);
     }

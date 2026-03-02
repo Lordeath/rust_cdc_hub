@@ -1,5 +1,15 @@
 [workspace]
-members = ["source", "sink", "common", "plugin"]
+members = [
+    "source",
+    "source/source_mysql",
+    "sink",
+    "sink/sink_mysql",
+    "sink/sink_print",
+    "sink/sink_meilisearch",
+    "sink/sink_starrocks",
+    "common",
+    "plugin"
+]
 
 [package]
 name = "rust_cdc_hub"
@@ -19,3 +29,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
 chrono = "0.4"
 actix-web = "4"
+prometheus = "0.14.0"

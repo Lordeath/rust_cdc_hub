@@ -1,7 +1,9 @@
 pub mod case_insensitive_hash_map;
 pub mod mysql_checkpoint;
+pub mod checkpoint_manager;
 pub mod custom_error;
 pub mod schema;
+pub mod metrics;
 
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
@@ -249,6 +251,7 @@ impl DataBuffer {
     }
 }
 
+#[derive(Debug)]
 pub enum FlushByOperation {
     Timer,
     Init,
