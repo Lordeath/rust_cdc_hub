@@ -196,7 +196,7 @@ async fn main() {
     add_plugin(&config, &source).await;
     info!("成功创建source");
     let table_info_list = source.lock().await.get_table_info().await;
-    let sink = SinkFactory::create_sink(&config, table_info_list).await;
+    let mut sink = SinkFactory::create_sink(&config, table_info_list).await;
     info!("成功创建sink");
     sink.lock()
         .await
@@ -223,10 +223,18 @@ async fn main() {
             error!("尝试进行重试 {}: {}", retry_times, e.message);
             // 先关闭旧source释放资源
             source.lock().await.close().await;
+            // 关闭sink确保事务被释放
+            sink.lock().await.close().await;
             // 添加重试间隔，避免立即重试导致资源耗尽
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            // 重新创建source获取表信息
             source = SourceFactory::create_source(&config).await;
             add_plugin(&config, &source).await;
+            let table_info_list = source.lock().await.get_table_info().await;
+            // 重新创建sink并连接
+            sink = SinkFactory::create_sink(&config, table_info_list).await;
+            sink.lock().await.connect().await.expect("Failed to connect to sink");
+            add_flush_timer(&config, &sink, ui_state.clone());
         } else {
             break;
         }

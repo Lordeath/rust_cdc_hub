@@ -88,6 +88,9 @@ pub trait Sink: Send + Sync {
     async fn flush(&self, _from_timer: &FlushByOperation) -> Result<(), String>;
 
     async fn alter_flush(&mut self) -> Result<(), String>;
+
+    /// 关闭sink并释放资源（如连接池）
+    async fn close(&mut self) {}
 }
 
 #[async_trait]
