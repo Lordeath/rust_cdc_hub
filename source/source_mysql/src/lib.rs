@@ -611,17 +611,18 @@ impl Source for MySQLSource {
 
                 if any_new {
                     info!("Detected new tables, starting consistent snapshot initialization");
-                    let mut tx = pool.begin().await.map_err(|e| CustomError {
-                        message: e.to_string(),
-                        error_type: CustomErrorType::Restart,
-                    })?;
+                    // 先在事务外设置隔离级别，避免"Transaction characteristics can't be changed"错误
                     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-                        .execute(&mut *tx)
+                        .execute(&*pool)
                         .await
                         .map_err(|e| CustomError {
                             message: e.to_string(),
                             error_type: CustomErrorType::Restart,
                         })?;
+                    let mut tx = pool.begin().await.map_err(|e| CustomError {
+                        message: e.to_string(),
+                        error_type: CustomErrorType::Restart,
+                    })?;
                     sqlx::query("START TRANSACTION WITH CONSISTENT SNAPSHOT")
                         .execute(&mut *tx)
                         .await
