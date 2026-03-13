@@ -562,6 +562,23 @@ async fn detail_with_plugin(
     }
     Ok(data_buffer)
 }
+
+impl MySQLSource {
+    /// 关闭MySQLSource并释放所有连接池资源
+    pub async fn close(&mut self) {
+        info!("Closing MySQLSource and releasing connection pools...");
+        // 关闭所有连接池
+        for pool in self.pools.drain(..) {
+            pool.close().await;
+        }
+        // 清空streams
+        for stream in self.streams.iter_mut() {
+            *stream = None;
+        }
+        info!("MySQLSource closed successfully");
+    }
+}
+
 #[async_trait]
 impl Source for MySQLSource {
     async fn start(

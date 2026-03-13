@@ -38,6 +38,9 @@ pub trait Source: Send + Sync {
     async fn add_plugins(&mut self, plugin: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>);
 
     async fn get_table_info(&mut self) -> Vec<TableInfoVo>;
+
+    /// 关闭source并释放资源（如连接池）
+    async fn close(&mut self) {}
 }
 
 /// Sink trait: 所有目标端都要实现它

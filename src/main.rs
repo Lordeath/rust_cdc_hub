@@ -221,6 +221,10 @@ async fn main() {
                 .store(Utc::now().timestamp(), Ordering::Relaxed);
             APP_RESTART_COUNT.with_label_values(&["source"]).inc();
             error!("尝试进行重试 {}: {}", retry_times, e.message);
+            // 先关闭旧source释放资源
+            source.lock().await.close().await;
+            // 添加重试间隔，避免立即重试导致资源耗尽
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             source = SourceFactory::create_source(&config).await;
             add_plugin(&config, &source).await;
         } else {
