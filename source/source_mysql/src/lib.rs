@@ -611,20 +611,12 @@ impl Source for MySQLSource {
 
                 if any_new {
                     info!("Detected new tables, starting consistent snapshot initialization");
-                    // 尝试回滚任何未完成的事务，避免"Transaction characteristics can't be changed"和预处理语句错误
-                    let _ = sqlx::query("ROLLBACK").execute(&*pool).await;
-                    // 直接开启事务，MySQL默认隔离级别就是REPEATABLE READ
+                    // 直接开启事务，pool.begin()已经创建了一个事务
+                    // 不使用START TRANSACTION WITH CONSISTENT SNAPSHOT避免预处理语句错误
                     let mut tx = pool.begin().await.map_err(|e| CustomError {
                         message: e.to_string(),
                         error_type: CustomErrorType::Restart,
                     })?;
-                    sqlx::query("START TRANSACTION WITH CONSISTENT SNAPSHOT")
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| CustomError {
-                            message: e.to_string(),
-                            error_type: CustomErrorType::Restart,
-                        })?;
 
                     let row: MySqlRow = sqlx::query("SHOW MASTER STATUS")
                         .fetch_one(&mut *tx)
