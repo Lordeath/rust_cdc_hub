@@ -1,5 +1,7 @@
 use serde_json::json;
 use std::error::Error;
+use sqlx::mysql::{MySqlConnectOptions, MySqlSslMode};
+use sqlx::{MySql, Pool};
 use tracing::{error, info, trace};
 
 #[derive(Debug, Clone)]
@@ -8,9 +10,29 @@ pub struct StarrocksClient {
     pub base_url: String,
     pub username: String,
     pub password: String,
+    pub mysql_pool: Pool<MySql>,
 }
 impl StarrocksClient {
-    pub async fn new(base_url: &str, username: &str, password: &str) -> Self {
+    pub async fn new(
+        base_url: &str,
+        username: &str,
+        password: &str,
+        mysql_host: &str,
+        mysql_port: u16,
+    ) -> Self {
+        let options = MySqlConnectOptions::new()
+            .host(mysql_host)
+            .port(mysql_port)
+            .username(username)
+            .password(password)
+            .database("information_schema")
+            .ssl_mode(MySqlSslMode::Disabled);
+        let mysql_pool = common::get_mysql_pool_by_url(
+            options.to_url_lossy().as_str(),
+            "starrocks mysql client init",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Failed to create starrocks mysql pool: {}", e));
         StarrocksClient {
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -19,6 +41,7 @@ impl StarrocksClient {
             base_url: base_url.to_string(),
             username: username.to_string(),
             password: password.to_string(),
+            mysql_pool,
         }
     }
 
@@ -131,5 +154,13 @@ impl StarrocksClient {
         let text = resp.text().await.expect("Failed to read response text");
         info!("text: {}", text);
         text
+    }
+
+    pub async fn execute_mysql_sql(
+        &self,
+        sql: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        sqlx::query(sql).execute(&self.mysql_pool).await?;
+        Ok(())
     }
 }

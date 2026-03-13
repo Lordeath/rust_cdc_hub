@@ -1,6 +1,6 @@
 use crate::get_mysql_pool_by_url;
 use serde::{Deserialize, Serialize};
-use sqlx::{MySql, Pool, Row};
+use sqlx::{Column, MySql, Pool, Row};
 use std::fs;
 use std::fs::File;
 use std::io::Write;
@@ -121,10 +121,34 @@ pub async fn fetch_mysql_start_position(pool: &Pool<MySql>) -> (String, u32) {
         .await
         .expect("获取mysql binlog文件位置失败");
 
-    let binlog_file: String = row.try_get(0).unwrap();
-    let position: u64 = row.try_get(1).unwrap();
-    let position = format!("{:?}", position);
-    (binlog_file, position.clone().parse::<u32>().unwrap())
+    let columns: Vec<&str> = row.columns().iter().map(|c| c.name()).collect();
+    let binlog_file: String = row
+        .try_get::<String, _>("File")
+        .or_else(|_| row.try_get::<String, _>("Log_name"))
+        .or_else(|_| row.try_get::<String, _>(0))
+        .unwrap_or_else(|e| {
+            panic!(
+                "读取 mysql binlog file 失败: {}; columns={:?}",
+                e, columns
+            )
+        });
+    let position_u64: u64 = row
+        .try_get::<u64, _>("Position")
+        .or_else(|_| row.try_get::<u64, _>("Pos"))
+        .or_else(|_| row.try_get::<u64, _>(1))
+        .unwrap_or_else(|e| {
+            panic!(
+                "读取 mysql binlog position 失败: {}; columns={:?}",
+                e, columns
+            )
+        });
+    let position_u32: u32 = u32::try_from(position_u64).unwrap_or_else(|_| {
+        panic!(
+            "mysql binlog position 超出 u32: {} columns={:?}",
+            position_u64, columns
+        )
+    });
+    (binlog_file, position_u32)
 }
 
 #[cfg(test)]

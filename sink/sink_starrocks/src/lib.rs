@@ -48,11 +48,24 @@ impl StarrocksSink {
         let password = config.first_sink_not_blank("password");
         let host = config.first_sink_not_blank("host");
         let http_port = config.first_sink_not_blank("http_port");
+        let query_port = config.first_sink("query_port");
+        let query_port: u16 = if query_port.is_empty() {
+            9030
+        } else {
+            query_port.parse::<u16>().unwrap_or(9030)
+        };
         let database = config.first_sink_not_blank("database");
 
         let base_url = format!("http://{}:{}/api/", host, http_port);
         let starrocks_client: StarrocksClient =
-            StarrocksClient::new(base_url.as_str(), username.as_str(), password.as_str()).await;
+            StarrocksClient::new(
+                base_url.as_str(),
+                username.as_str(),
+                password.as_str(),
+                host.as_str(),
+                query_port,
+            )
+            .await;
         let sink_batch_size = config.sink_batch_size.unwrap_or(1024);
         let auto_create_database = config.auto_create_database.unwrap_or(true);
         let auto_create_table = config.auto_create_table.unwrap_or(true);
@@ -111,17 +124,7 @@ impl StarrocksSink {
             return Ok(());
         }
         let sql = format!("CREATE DATABASE IF NOT EXISTS `{}`", self.database);
-        let resp = self
-            .starrocks_client
-            .execute_sql("information_schema", sql.as_str())
-            .await;
-        if resp.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("create database failed: {}", self.database),
-            )
-            .into());
-        }
+        self.starrocks_client.execute_mysql_sql(sql.as_str()).await?;
         Ok(())
     }
 
@@ -179,17 +182,9 @@ impl StarrocksSink {
             pk,
             pk
         );
-        let resp = self
-            .starrocks_client
-            .execute_sql("information_schema", create.as_str())
-            .await;
-        if resp.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("create table failed: {}", table_info.table_name),
-            )
-            .into());
-        }
+        self.starrocks_client
+            .execute_mysql_sql(create.as_str())
+            .await?;
         Ok(())
     }
 
@@ -296,17 +291,16 @@ impl StarrocksSink {
                             continue;
                         }
                         let alter = format!(
-                            "ALTER TABLE `{}` ADD COLUMN `{}` {} {}",
-                            table_name, src_col, starrocks_type, nullable_sql
+                            "ALTER TABLE `{}`.`{}` ADD COLUMN `{}` {} {}",
+                            self.database, table_name, src_col, starrocks_type, nullable_sql
                         );
-                        let resp = self
-                            .starrocks_client
-                            .execute_sql(self.database.as_str(), alter.as_str())
-                            .await;
-                        if resp.is_empty() {
+                        let resp = self.starrocks_client.execute_mysql_sql(alter.as_str()).await;
+                        if resp.is_err() {
                             error!(
-                                "auto add column failed: {} {} empty response",
-                                table_name, src_col
+                                "auto add column failed: {} {} {}",
+                                table_name,
+                                src_col,
+                                resp.err().unwrap()
                             );
                         } else {
                             info!("auto add column attempted: {} {}", table_name, src_col);
@@ -323,17 +317,16 @@ impl StarrocksSink {
                             continue;
                         }
                         let alter = format!(
-                            "ALTER TABLE `{}` MODIFY COLUMN `{}` {} {}",
-                            table_name, src_col, starrocks_type, nullable_sql
+                            "ALTER TABLE `{}`.`{}` MODIFY COLUMN `{}` {} {}",
+                            self.database, table_name, src_col, starrocks_type, nullable_sql
                         );
-                        let resp = self
-                            .starrocks_client
-                            .execute_sql(self.database.as_str(), alter.as_str())
-                            .await;
-                        if resp.is_empty() {
+                        let resp = self.starrocks_client.execute_mysql_sql(alter.as_str()).await;
+                        if resp.is_err() {
                             error!(
-                                "auto modify column failed: {} {} empty response",
-                                table_name, src_col
+                                "auto modify column failed: {} {} {}",
+                                table_name,
+                                src_col,
+                                resp.err().unwrap()
                             );
                         } else {
                             info!("auto modify column attempted: {} {}", table_name, src_col);
@@ -343,13 +336,17 @@ impl StarrocksSink {
             }
 
             if !exists.contains_key("__op") && self.auto_add_column {
-                let alter = format!("ALTER TABLE `{}` ADD COLUMN `__op` TINYINT NOT NULL", table_name);
-                let resp = self
-                    .starrocks_client
-                    .execute_sql(self.database.as_str(), alter.as_str())
-                    .await;
-                if resp.is_empty() {
-                    error!("auto add column failed: {} __op empty response", table_name);
+                let alter = format!(
+                    "ALTER TABLE `{}`.`{}` ADD COLUMN `__op` TINYINT NOT NULL",
+                    self.database, table_name
+                );
+                let resp = self.starrocks_client.execute_mysql_sql(alter.as_str()).await;
+                if resp.is_err() {
+                    error!(
+                        "auto add column failed: {} __op {}",
+                        table_name,
+                        resp.err().unwrap()
+                    );
                 } else {
                     info!("auto add column attempted: {} __op", table_name);
                 }

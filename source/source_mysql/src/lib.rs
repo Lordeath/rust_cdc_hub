@@ -20,6 +20,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde::Serialize;
 use sqlx::FromRow;
+use sqlx::Column;
 use sqlx::Row;
 use sqlx::mysql::MySqlRow;
 use sqlx::{MySql, Pool, Transaction};
@@ -619,8 +620,48 @@ impl Source for MySQLSource {
                             message: e.to_string(),
                             error_type: CustomErrorType::Restart,
                         })?;
-                    let file: String = row.get("File");
-                    let pos: u32 = row.get("Position");
+                    let columns: Vec<&str> = row.columns().iter().map(|c| c.name()).collect();
+                    let file: String = row
+                        .try_get::<String, _>("File")
+                        .or_else(|_| row.try_get::<String, _>("Log_name"))
+                        .or_else(|_| row.try_get::<String, _>(0))
+                        .map_err(|e| CustomError {
+                            message: format!(
+                                "SHOW MASTER STATUS 读取 binlog file 失败: {}; columns={:?}",
+                                e, columns
+                            ),
+                            error_type: CustomErrorType::Restart,
+                        })?;
+                    let pos_u64 = match row
+                        .try_get::<u64, _>("Position")
+                        .or_else(|_| row.try_get::<u64, _>("Pos"))
+                        .or_else(|_| row.try_get::<u64, _>(1))
+                    {
+                        Ok(v) => v,
+                        Err(e1) => {
+                            let s: String = row
+                                .try_get::<String, _>("Position")
+                                .or_else(|_| row.try_get::<String, _>(1))
+                                .map_err(|e2| CustomError {
+                                    message: format!(
+                                        "SHOW MASTER STATUS 读取 Position 失败: {}; prior_err={}; columns={:?}",
+                                        e2, e1, columns
+                                    ),
+                                    error_type: CustomErrorType::Restart,
+                                })?;
+                            s.parse::<u64>().map_err(|e| CustomError {
+                                message: format!(
+                                    "SHOW MASTER STATUS Position 解析失败: {}; value={}",
+                                    e, s
+                                ),
+                                error_type: CustomErrorType::Restart,
+                            })?
+                        }
+                    };
+                    let pos: u32 = u32::try_from(pos_u64).map_err(|_| CustomError {
+                        message: format!("SHOW MASTER STATUS Position 超出 u32: {}", pos_u64),
+                        error_type: CustomErrorType::Restart,
+                    })?;
                     info!("Consistent Snapshot Position: {}/{}", file, pos);
 
                     // 然后开启事务读取表数据
