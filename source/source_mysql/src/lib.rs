@@ -611,14 +611,9 @@ impl Source for MySQLSource {
 
                 if any_new {
                     info!("Detected new tables, starting consistent snapshot initialization");
-                    // 先在事务外设置隔离级别，避免"Transaction characteristics can't be changed"错误
-                    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-                        .execute(&*pool)
-                        .await
-                        .map_err(|e| CustomError {
-                            message: e.to_string(),
-                            error_type: CustomErrorType::Restart,
-                        })?;
+                    // 尝试回滚任何未完成的事务，避免"Transaction characteristics can't be changed"和预处理语句错误
+                    let _ = sqlx::query("ROLLBACK").execute(&*pool).await;
+                    // 直接开启事务，MySQL默认隔离级别就是REPEATABLE READ
                     let mut tx = pool.begin().await.map_err(|e| CustomError {
                         message: e.to_string(),
                         error_type: CustomErrorType::Restart,
