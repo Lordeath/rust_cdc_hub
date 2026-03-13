@@ -611,15 +611,9 @@ impl Source for MySQLSource {
 
                 if any_new {
                     info!("Detected new tables, starting consistent snapshot initialization");
-                    // 直接开启事务，pool.begin()已经创建了一个事务
-                    // 不使用START TRANSACTION WITH CONSISTENT SNAPSHOT避免预处理语句错误
-                    let mut tx = pool.begin().await.map_err(|e| CustomError {
-                        message: e.to_string(),
-                        error_type: CustomErrorType::Restart,
-                    })?;
-
+                    // 先在事务外获取binlog位置
                     let row: MySqlRow = sqlx::query("SHOW MASTER STATUS")
-                        .fetch_one(&mut *tx)
+                        .fetch_one(&*pool)
                         .await
                         .map_err(|e| CustomError {
                             message: e.to_string(),
@@ -628,6 +622,12 @@ impl Source for MySQLSource {
                     let file: String = row.get("File");
                     let pos: u32 = row.get("Position");
                     info!("Consistent Snapshot Position: {}/{}", file, pos);
+
+                    // 然后开启事务读取表数据
+                    let mut tx = pool.begin().await.map_err(|e| CustomError {
+                        message: e.to_string(),
+                        error_type: CustomErrorType::Restart,
+                    })?;
 
                     // Update checkpoints for new tables
                     {
