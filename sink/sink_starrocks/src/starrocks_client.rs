@@ -1,6 +1,7 @@
 use serde_json::json;
 use std::error::Error;
 use sqlx::mysql::{MySqlConnectOptions, MySqlSslMode};
+use sqlx::ConnectOptions;
 use sqlx::{MySql, Pool};
 use tracing::{error, info, trace};
 
