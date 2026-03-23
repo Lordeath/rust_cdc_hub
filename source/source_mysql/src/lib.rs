@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use common::case_insensitive_hash_map::{CaseInsensitiveHashMap, CaseInsensitiveHashMapVecString};
 use common::checkpoint_manager::{CheckpointManager, FileCheckpointManager};
 use common::custom_error::{CustomError, CustomErrorType};
-use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::metrics::{SOURCE_EVENTS_TOTAL, SOURCE_LAG_POSITION};
+use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value,
     get_mysql_pool_by_url, mysql_row_to_hashmap,
@@ -19,8 +19,8 @@ use mysql_binlog_connector_rust::event::row_event::RowEvent;
 use regex::Regex;
 use serde::Deserialize;
 use serde::Serialize;
-use sqlx::FromRow;
 use sqlx::Column;
+use sqlx::FromRow;
 use sqlx::Row;
 use sqlx::mysql::MySqlRow;
 use sqlx::{MySql, Pool, Transaction};
@@ -66,7 +66,7 @@ impl MysqlSourceConfig {
     pub async fn new(config: &CdcConfig) -> Self {
         let size = config.source_config.len();
         let mut mysql_source: Vec<MysqlSourceConfigDetail> = vec![];
-        
+
         // split table_name
         let configured_table_names: Vec<String> = config
             .first_source("table_name")
@@ -74,7 +74,7 @@ impl MysqlSourceConfig {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-            
+
         let except_table_name_prefix: Vec<String> = config
             .first_source("except_table_name_prefix")
             .split(',')
@@ -84,16 +84,16 @@ impl MysqlSourceConfig {
 
         let include_table_regex_str = config.first_source("include_table_regex");
         let include_regex = if !include_table_regex_str.is_empty() {
-             Some(Regex::new(&include_table_regex_str).expect("Invalid include_table_regex"))
+            Some(Regex::new(&include_table_regex_str).expect("Invalid include_table_regex"))
         } else {
-             None
+            None
         };
 
         let exclude_table_regex_str = config.first_source("exclude_table_regex");
         let exclude_regex = if !exclude_table_regex_str.is_empty() {
-             Some(Regex::new(&exclude_table_regex_str).expect("Invalid exclude_table_regex"))
+            Some(Regex::new(&exclude_table_regex_str).expect("Invalid exclude_table_regex"))
         } else {
-             None
+            None
         };
 
         let mut all_tables_collected: Vec<String> = vec![];
@@ -126,7 +126,7 @@ impl MysqlSourceConfig {
             let pool = get_mysql_pool_by_url(&connection_url, "mysql source 初始化获取数据结构")
                 .await
                 .unwrap();
-            
+
             let mut current_source_tables = configured_table_names.clone();
 
             if current_source_tables.is_empty()
@@ -227,7 +227,10 @@ impl MysqlSourceConfig {
                     .map(|c| c.column_name.clone())
                     .collect();
                 if pk_column.is_empty() || pk_column.len() > 1 {
-                    error!("pk_column is empty or more than one for table {}", table_name);
+                    error!(
+                        "pk_column is empty or more than one for table {}",
+                        table_name
+                    );
                     // panic!("pk_column is empty or more than one");
                     continue;
                 }
@@ -254,15 +257,15 @@ impl MysqlSourceConfig {
                 start_binlog_filename,
                 start_binlog_position,
             });
-            
+
             all_tables_collected.extend(current_source_tables);
         }
-        
+
         if all_tables_collected.is_empty() {
             error!("no table found after filtering");
             panic!("no table found after filtering");
         }
-        
+
         MysqlSourceConfig {
             table_name_list: all_tables_collected,
             mysql_source,
@@ -430,7 +433,7 @@ impl MySQLSource {
                     }
                 }
             }
-            
+
             // Stream creation deferred to start()
             streams.push(None);
             mysql_source.push(cfg.mysql_source[i].clone());
@@ -446,7 +449,10 @@ impl MySQLSource {
         }
 
         let checkpoint_manager = Arc::new(FileCheckpointManager::new(
-            config.checkpoint_file_path.clone().unwrap_or("/checkpoint".to_string()),
+            config
+                .checkpoint_file_path
+                .clone()
+                .unwrap_or("/checkpoint".to_string()),
         ));
 
         Self {
@@ -617,9 +623,9 @@ impl Source for MySQLSource {
                         .fetch_one(&*pool)
                         .await
                         .map_err(|e| CustomError {
-                            message: e.to_string(),
-                            error_type: CustomErrorType::Restart,
-                        })?;
+                        message: e.to_string(),
+                        error_type: CustomErrorType::Restart,
+                    })?;
                     let columns: Vec<&str> = row.columns().iter().map(|c| c.name()).collect();
                     let file: String = row
                         .try_get::<String, _>("File")
@@ -702,10 +708,7 @@ impl Source for MySQLSource {
                         }
 
                         let pk_column = table_info_vo.pk_column.clone();
-                        info!(
-                            "开始初始化数据源: {}.{}",
-                            config.connection_url, table_name
-                        );
+                        info!("开始初始化数据源: {}.{}", config.connection_url, table_name);
                         let start = Instant::now();
                         let mut count = 0;
                         let mut id: i64 = i64::MIN;
@@ -752,16 +755,11 @@ impl Source for MySQLSource {
                         {
                             let checkpoints_guard = self.checkpoint_entities.lock().await;
                             let mut checkpoints = checkpoints_guard[i].lock().await;
-                            if let Some(cp) =
-                                checkpoints.get_mut(&table_name.to_lowercase())
-                            {
+                            if let Some(cp) = checkpoints.get_mut(&table_name.to_lowercase()) {
                                 cp.is_new = false;
                                 match self.checkpoint_manager.save(&table_name, cp).await {
                                     Ok(_) => {
-                                        info!(
-                                            "alter_flush success {}",
-                                            cp.checkpoint_filepath
-                                        )
+                                        info!("alter_flush success {}", cp.checkpoint_filepath)
                                     }
                                     Err(e) => {
                                         error!("alter_flush error: {}", e)
@@ -812,16 +810,13 @@ impl Source for MySQLSource {
                     "Connecting to Binlog: {:?} with start_position: {}",
                     config.connection_url, start_pos_str
                 );
-                let client = BinlogClient::new(
-                    &config.connection_url,
-                    config.server_id,
-                    start_position,
-                )
-                .with_master_heartbeat(Duration::from_secs(5))
-                .with_keepalive(Duration::from_secs(60), Duration::from_secs(10))
-                .connect()
-                .await
-                .expect("Failed to connect to MySQL server");
+                let client =
+                    BinlogClient::new(&config.connection_url, config.server_id, start_position)
+                        .with_master_heartbeat(Duration::from_secs(5))
+                        .with_keepalive(Duration::from_secs(60), Duration::from_secs(10))
+                        .connect()
+                        .await
+                        .expect("Failed to connect to MySQL server");
                 self.streams[i] = Some(client);
             }
             info!("MySQL数据源初始化完成, cost: {:?}", start_all.elapsed());
@@ -901,7 +896,9 @@ impl Source for MySQLSource {
                                             parse_row(row, table_name, &mut columns, config, pool)
                                                 .await;
                                         let op = Operation::CREATE(false);
-                                        SOURCE_EVENTS_TOTAL.with_label_values(&["mysql", table_name, "create"]).inc();
+                                        SOURCE_EVENTS_TOTAL
+                                            .with_label_values(&["mysql", table_name, "create"])
+                                            .inc();
                                         let data_buffer = DataBuffer::new(
                                             table_name.to_string(),
                                             before,
@@ -923,7 +920,9 @@ impl Source for MySQLSource {
                                         }
                                     }
                                     if !binlog_filename.is_empty() {
-                                        SOURCE_LAG_POSITION.with_label_values(&["mysql", table_name]).set(next_event_position as i64);
+                                        SOURCE_LAG_POSITION
+                                            .with_label_values(&["mysql", table_name])
+                                            .set(next_event_position as i64);
                                         checkpoint_entity = checkpoint_entity
                                             .update(binlog_filename, next_event_position);
                                         to_modify.insert(
@@ -978,7 +977,9 @@ impl Source for MySQLSource {
                                         let after: CaseInsensitiveHashMap =
                                             CaseInsensitiveHashMap::new_with_no_arg();
                                         let op = Operation::DELETE;
-                                        SOURCE_EVENTS_TOTAL.with_label_values(&["mysql", table_name, "delete"]).inc();
+                                        SOURCE_EVENTS_TOTAL
+                                            .with_label_values(&["mysql", table_name, "delete"])
+                                            .inc();
                                         let data_buffer = DataBuffer::new(
                                             table_name.to_string(),
                                             before,
@@ -1000,7 +1001,9 @@ impl Source for MySQLSource {
                                         }
                                     }
                                     if !binlog_filename.is_empty() {
-                                        SOURCE_LAG_POSITION.with_label_values(&["mysql", table_name]).set(next_event_position as i64);
+                                        SOURCE_LAG_POSITION
+                                            .with_label_values(&["mysql", table_name])
+                                            .set(next_event_position as i64);
                                         checkpoint_entity = checkpoint_entity
                                             .update(binlog_filename, next_event_position);
                                         to_modify.insert(
@@ -1056,7 +1059,9 @@ impl Source for MySQLSource {
                                             parse_row(a, table_name, &mut columns, config, pool)
                                                 .await;
                                         let op = Operation::UPDATE;
-                                        SOURCE_EVENTS_TOTAL.with_label_values(&["mysql", table_name, "update"]).inc();
+                                        SOURCE_EVENTS_TOTAL
+                                            .with_label_values(&["mysql", table_name, "update"])
+                                            .inc();
                                         let data_buffer = DataBuffer::new(
                                             table_name.to_string(),
                                             before,
@@ -1079,7 +1084,9 @@ impl Source for MySQLSource {
                                     }
 
                                     if !binlog_filename.is_empty() {
-                                        SOURCE_LAG_POSITION.with_label_values(&["mysql", table_name]).set(next_event_position as i64);
+                                        SOURCE_LAG_POSITION
+                                            .with_label_values(&["mysql", table_name])
+                                            .set(next_event_position as i64);
                                         checkpoint_entity = checkpoint_entity
                                             .update(binlog_filename, next_event_position);
                                         to_modify.insert(

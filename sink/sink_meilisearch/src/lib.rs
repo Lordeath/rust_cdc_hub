@@ -1,7 +1,7 @@
+use async_trait::async_trait;
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo};
 use meilisearch_sdk::client::Client;
-use async_trait::async_trait;
 use std::collections::HashMap;
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};

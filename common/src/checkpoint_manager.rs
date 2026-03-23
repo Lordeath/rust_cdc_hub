@@ -28,7 +28,7 @@ impl CheckpointManager for FileCheckpointManager {
         // But the Manager should manage paths ideally.
         // However, MysqlCheckPointDetailEntity calculates filepath based on md5(connection_url+table).
         // Let's use that for now.
-        
+
         let path = Path::new(&entity.checkpoint_filepath);
         if let Some(parent) = path.parent() {
             if !parent.exists() {

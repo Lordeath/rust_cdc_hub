@@ -1,18 +1,18 @@
+use async_trait::async_trait;
 use common::case_insensitive_hash_map::{
     CaseInsensitiveHashMapTableInfoVo, CaseInsensitiveHashMapVecCaseInsensitiveHashMap,
     CaseInsensitiveHashMapVecString,
 };
 use common::metrics::{SINK_EVENTS_TOTAL, SINK_FLUSH_DURATION_SECONDS, SINK_FLUSH_ERRORS_TOTAL};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
-use common::{
-    CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value,
-    get_mysql_pool_by_url, mysql_row_to_hashmap,
-};
 use common::schema::{
     extract_mysql_create_table_column_definitions, mysql_column_allows_null_from_definition,
     mysql_type_token_from_column_definition,
 };
-use async_trait::async_trait;
+use common::{
+    CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value,
+    get_mysql_pool_by_url, mysql_row_to_hashmap,
+};
 use sqlx::mysql::{MySqlArguments, MySqlQueryResult};
 use sqlx::query::Query;
 use sqlx::{MySql, Pool};
@@ -120,7 +120,9 @@ impl MySqlSink {
                     let alter_sql = format!("ALTER TABLE `{}` ADD COLUMN {}", table_name, def);
                     match sqlx::query(&alter_sql).execute(&pool).await {
                         Ok(_) => info!("auto add column success: {} {}", table_name, src_col),
-                        Err(e) => error!("auto add column failed: {} {} {}", table_name, src_col, e),
+                        Err(e) => {
+                            error!("auto add column failed: {} {} {}", table_name, src_col, e)
+                        }
                     }
                 }
             }
@@ -147,7 +149,10 @@ impl MySqlSink {
                     let is_nullable = r.get("IS_NULLABLE").resolve_string();
                     sink_meta.insert(
                         name.to_ascii_lowercase(),
-                        (typ.to_ascii_lowercase(), is_nullable.eq_ignore_ascii_case("YES")),
+                        (
+                            typ.to_ascii_lowercase(),
+                            is_nullable.eq_ignore_ascii_case("YES"),
+                        ),
                     );
                 }
 
@@ -452,7 +457,6 @@ impl Sink for MySqlSink {
         let batch = std::mem::take(&mut *buf);
         drop(buf);
 
-
         let mut insert_map: CaseInsensitiveHashMapVecCaseInsensitiveHashMap =
             CaseInsensitiveHashMapVecCaseInsensitiveHashMap::new_with_no_arg();
         let mut delete_map: CaseInsensitiveHashMapVecString =
@@ -470,7 +474,9 @@ impl Sink for MySqlSink {
                 Operation::DELETE => "delete",
                 _ => "other",
             };
-            SINK_EVENTS_TOTAL.with_label_values(&["mysql", &table_name, op_str]).inc();
+            SINK_EVENTS_TOTAL
+                .with_label_values(&["mysql", &table_name, op_str])
+                .inc();
 
             match r.op {
                 Operation::CREATE(_) | Operation::UPDATE => {
@@ -487,7 +493,6 @@ impl Sink for MySqlSink {
                 }
             }
         }
-
 
         let column_map = self.columns_cache.lock().await;
 
@@ -557,7 +562,9 @@ impl Sink for MySqlSink {
                 debug!("MySQL batch UPSERT: {}", sql);
                 if let Err(e) = self.execute_with_retry(query, sql.clone()).await {
                     error!("MySQL batch UPSERT error: {:?}", e);
-                    SINK_FLUSH_ERRORS_TOTAL.with_label_values(&["mysql", "upsert"]).inc();
+                    SINK_FLUSH_ERRORS_TOTAL
+                        .with_label_values(&["mysql", "upsert"])
+                        .inc();
                     error!("need to do it again: {}", cache_for_roll_back.len());
                     let mut buf = self.buffer.lock().await;
                     for cached_data_buffer in cache_for_roll_back {
@@ -592,7 +599,9 @@ impl Sink for MySqlSink {
 
                 if let Err(e) = self.execute_with_retry(query, sql.clone()).await {
                     error!("MySQL batch delete error: {:?}", e);
-                    SINK_FLUSH_ERRORS_TOTAL.with_label_values(&["mysql", "delete"]).inc();
+                    SINK_FLUSH_ERRORS_TOTAL
+                        .with_label_values(&["mysql", "delete"])
+                        .inc();
                     error!("need to do it again: {}", cache_for_roll_back.len());
                     let mut buf = self.buffer.lock().await;
                     for cached_data_buffer in cache_for_roll_back {

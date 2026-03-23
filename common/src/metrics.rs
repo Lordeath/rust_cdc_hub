@@ -55,7 +55,7 @@ pub fn register_custom_metrics() {
     // But `register_*` macros use the DEFAULT registry by default unless we use `register_*_with_registry`.
     // Wait, `register_int_counter_vec!` registers to the DEFAULT registry.
     // So `REGISTRY` above is actually unused if I use the macros without `_with_registry`.
-    
+
     // Let's check `prometheus` crate docs behavior.
     // `register_int_counter_vec!` -> registers to `default_registry()`.
     // So we don't need a custom `REGISTRY` unless we want isolation.

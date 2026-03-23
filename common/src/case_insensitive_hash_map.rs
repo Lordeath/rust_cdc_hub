@@ -202,7 +202,7 @@ impl CaseInsensitiveHashMapTableInfoVo {
             .cloned()
             .unwrap_or_else(|| panic!("TableInfoVo not found {}", key))
     }
-    
+
     pub fn contains_key(&self, key: &str) -> bool {
         self.map.contains_key(key.to_lowercase().as_str())
     }

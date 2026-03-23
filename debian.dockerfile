@@ -29,7 +29,7 @@ RUN cargo build --release
 # =========================
 # 2. 运行阶段
 # =========================
-FROM debian:bookworm-20251229
+FROM debian:bookworm-20260223
 
 WORKDIR /app
 

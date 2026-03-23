@@ -1,6 +1,7 @@
 mod starrocks_client;
 
 use crate::starrocks_client::StarrocksClient;
+use async_trait::async_trait;
 use common::case_insensitive_hash_map::CaseInsensitiveHashMap;
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::schema::{
@@ -8,7 +9,6 @@ use common::schema::{
     mysql_type_token_from_column_definition,
 };
 use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value};
-use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::error::Error;
@@ -43,6 +43,41 @@ pub struct StarrocksSink {
 }
 
 impl StarrocksSink {
+    fn parse_starrocks_json_lines(text: &str) -> Result<Vec<JsonValue>, String> {
+        let mut values = Vec::new();
+        for line in text.lines() {
+            let s = line.trim();
+            if s.is_empty() {
+                continue;
+            }
+            let v: JsonValue = serde_json::from_str(s)
+                .map_err(|e| format!("invalid starrocks json line: {} | line={}", e, s))?;
+            let status = v
+                .get("status")
+                .or_else(|| v.get("Status"))
+                .and_then(|x| x.as_str());
+            if let Some(status) = status {
+                if status.eq_ignore_ascii_case("FAILED") {
+                    let msg = v
+                        .get("msg")
+                        .or_else(|| v.get("message"))
+                        .or_else(|| v.get("Message"))
+                        .map(|x| {
+                            x.as_str()
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| x.to_string())
+                        })
+                        .unwrap_or_else(|| "unknown starrocks error".to_string());
+                    return Err(msg);
+                }
+            }
+            values.push(v);
+        }
+        if values.is_empty() {
+            return Err("empty response".to_string());
+        }
+        Ok(values)
+    }
     pub async fn new(config: &CdcConfig, table_info_list: Vec<TableInfoVo>) -> Self {
         let username = config.first_sink_not_blank("username");
         let password = config.first_sink_not_blank("password");
@@ -57,15 +92,14 @@ impl StarrocksSink {
         let database = config.first_sink_not_blank("database");
 
         let base_url = format!("http://{}:{}/api/", host, http_port);
-        let starrocks_client: StarrocksClient =
-            StarrocksClient::new(
-                base_url.as_str(),
-                username.as_str(),
-                password.as_str(),
-                host.as_str(),
-                query_port,
-            )
-            .await;
+        let starrocks_client: StarrocksClient = StarrocksClient::new(
+            base_url.as_str(),
+            username.as_str(),
+            password.as_str(),
+            host.as_str(),
+            query_port,
+        )
+        .await;
         let sink_batch_size = config.sink_batch_size.unwrap_or(1024);
         let auto_create_database = config.auto_create_database.unwrap_or(true);
         let auto_create_table = config.auto_create_table.unwrap_or(true);
@@ -92,22 +126,14 @@ impl StarrocksSink {
 
     async fn fetch_rows(&self, database: &str, sql: &str) -> Result<Vec<Vec<String>>, String> {
         let text = self.starrocks_client.execute_sql(database, sql).await;
-        if text.is_empty() {
-            return Err("empty response".to_string());
-        }
-        let v: JsonValue = serde_json::from_str(text.as_str()).map_err(|e| e.to_string())?;
-        let data = v
-            .get("data")
-            .ok_or_else(|| "missing data".to_string())?
-            .as_array()
-            .ok_or_else(|| "data not array".to_string())?;
-        let mut out: Vec<Vec<String>> = Vec::with_capacity(data.len());
-        for row in data {
-            let arr = row
-                .as_array()
-                .ok_or_else(|| "row not array".to_string())?;
-            let mut cols: Vec<String> = Vec::with_capacity(arr.len());
-            for c in arr {
+        let mut out: Vec<Vec<String>> = Vec::new();
+        for v in Self::parse_starrocks_json_lines(text.as_str())? {
+            let data = match v.get("data").and_then(|x| x.as_array()) {
+                None => continue,
+                Some(v) => v,
+            };
+            let mut cols: Vec<String> = Vec::with_capacity(data.len());
+            for c in data {
                 if let Some(s) = c.as_str() {
                     cols.push(s.to_string());
                 } else {
@@ -124,7 +150,9 @@ impl StarrocksSink {
             return Ok(());
         }
         let sql = format!("CREATE DATABASE IF NOT EXISTS `{}`", self.database);
-        self.starrocks_client.execute_mysql_sql(sql.as_str()).await?;
+        self.starrocks_client
+            .execute_mysql_sql(sql.as_str())
+            .await?;
         Ok(())
     }
 
@@ -166,10 +194,7 @@ impl StarrocksSink {
             }
             let nullable_sql = if nullable { "NULL" } else { "NOT NULL" };
             let starrocks_type = Self::map_mysql_type_to_starrocks(mysql_type.as_str());
-            cols_sql.push(format!(
-                "`{}` {} {}",
-                src_col, starrocks_type, nullable_sql
-            ));
+            cols_sql.push(format!("`{}` {} {}", src_col, starrocks_type, nullable_sql));
         }
         cols_sql.push("`__op` TINYINT NOT NULL".to_string());
 
@@ -246,9 +271,8 @@ impl StarrocksSink {
         }
         for table_info in &self.table_info_list {
             let table_name = table_info.table_name.clone();
-            let defs = extract_mysql_create_table_column_definitions(
-                table_info.create_table_sql.as_str(),
-            );
+            let defs =
+                extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
             let sql = format!(
                 "select COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE from information_schema.`COLUMNS` where TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' ORDER BY ORDINAL_POSITION",
                 self.database, table_name
@@ -294,7 +318,10 @@ impl StarrocksSink {
                             "ALTER TABLE `{}`.`{}` ADD COLUMN `{}` {} {}",
                             self.database, table_name, src_col, starrocks_type, nullable_sql
                         );
-                        let resp = self.starrocks_client.execute_mysql_sql(alter.as_str()).await;
+                        let resp = self
+                            .starrocks_client
+                            .execute_mysql_sql(alter.as_str())
+                            .await;
                         if resp.is_err() {
                             error!(
                                 "auto add column failed: {} {} {}",
@@ -310,8 +337,7 @@ impl StarrocksSink {
                         if !self.auto_modify_column {
                             continue;
                         }
-                        let need_modify_type =
-                            !sink_type.eq_ignore_ascii_case(&starrocks_type);
+                        let need_modify_type = !sink_type.eq_ignore_ascii_case(&starrocks_type);
                         let need_relax_nullable = src_nullable && !*sink_nullable;
                         if !need_modify_type && !need_relax_nullable {
                             continue;
@@ -320,7 +346,10 @@ impl StarrocksSink {
                             "ALTER TABLE `{}`.`{}` MODIFY COLUMN `{}` {} {}",
                             self.database, table_name, src_col, starrocks_type, nullable_sql
                         );
-                        let resp = self.starrocks_client.execute_mysql_sql(alter.as_str()).await;
+                        let resp = self
+                            .starrocks_client
+                            .execute_mysql_sql(alter.as_str())
+                            .await;
                         if resp.is_err() {
                             error!(
                                 "auto modify column failed: {} {} {}",
@@ -340,7 +369,10 @@ impl StarrocksSink {
                     "ALTER TABLE `{}`.`{}` ADD COLUMN `__op` TINYINT NOT NULL",
                     self.database, table_name
                 );
-                let resp = self.starrocks_client.execute_mysql_sql(alter.as_str()).await;
+                let resp = self
+                    .starrocks_client
+                    .execute_mysql_sql(alter.as_str())
+                    .await;
                 if resp.is_err() {
                     error!(
                         "auto add column failed: {} __op {}",
@@ -490,14 +522,22 @@ impl Sink for StarrocksSink {
                 "#,
                     table_name.clone()
                 );
-                let result = self.starrocks_client.execute_sql(&self.database, sql).await;
-                for s in result.split("\n") {
-                    if !s.starts_with("{\"data\":[\"") {
-                        continue;
+                let result = self.fetch_rows(&self.database, sql).await;
+                match result {
+                    Ok(rows) => {
+                        for row in rows {
+                            if let Some(pk) = row.first() {
+                                info!("pk: {}", pk);
+                                pks_info
+                                    .entry(table_name.clone())
+                                    .or_default()
+                                    .push(pk.clone());
+                            }
+                        }
                     }
-                    let pk = s[10..s.len() - 3].to_string();
-                    info!("pk: {}", pk);
-                    pks_info.entry(table_name.clone()).or_default().push(pk);
+                    Err(e) => {
+                        error!("fetch starrocks pk failed: {} {}", table_name, e);
+                    }
                 }
             }
             *self.columns_cache.lock().await = col_info;
@@ -582,6 +622,25 @@ impl Sink for StarrocksSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_starrocks_json_lines_ndjson() {
+        let text = r#"{"connectionId":16777464}
+{"meta":[{"name":"TABLE_NAME","type":"varchar(2048)"}]}
+{"data":["owner_house_result"]}
+{"statistics":{"scanRows":0,"scanBytes":0,"returnRows":1}}"#;
+        let values = StarrocksSink::parse_starrocks_json_lines(text).unwrap();
+        assert_eq!(values.len(), 4);
+        assert_eq!(values[2]["data"][0], "owner_house_result");
+    }
+
+    #[test]
+    fn test_parse_starrocks_json_lines_failed_status() {
+        let text = r#"{"Status":"FAILED","Message":"table not found"}"#;
+        let err = StarrocksSink::parse_starrocks_json_lines(text).unwrap_err();
+        assert_eq!(err, "table not found");
+    }
+
     #[tokio::test]
     async fn test_json() {
         let data: HashMap<String, Value> = HashMap::new();

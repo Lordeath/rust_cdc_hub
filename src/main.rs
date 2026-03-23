@@ -1,12 +1,12 @@
 extern crate core;
 
-use common::{CdcConfig, FlushByOperation, Plugin, Sink, Source};
-use common::metrics::{REGISTRY, APP_RESTART_COUNT};
-use sink::SinkFactory;
-use source::SourceFactory;
 use actix_web::{App, HttpResponse, HttpServer, Responder, web};
+use common::metrics::{APP_RESTART_COUNT, REGISTRY};
+use common::{CdcConfig, FlushByOperation, Plugin, Sink, Source};
 use prometheus::{Encoder, TextEncoder};
 use serde_json::json;
+use sink::SinkFactory;
+use source::SourceFactory;
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -50,6 +50,14 @@ fn resolve_ui_port(config: &CdcConfig, env_port: Option<u16>) -> u16 {
         return p;
     }
     config.ui_port.unwrap_or(0)
+}
+
+fn ensure_default_backtrace() {
+    if env::var_os("RUST_BACKTRACE").is_none() {
+        unsafe {
+            env::set_var("RUST_BACKTRACE", "1");
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -102,7 +110,7 @@ async fn ui_metrics() -> impl Responder {
     let metric_families = REGISTRY.gather();
     let mut buffer = vec![];
     encoder.encode(&metric_families, &mut buffer).unwrap();
-    
+
     HttpResponse::Ok()
         .content_type(encoder.format_type())
         .body(buffer)
@@ -151,6 +159,7 @@ async fn start_ui(ui_state: UiState, bind: String, port: u16) -> Result<(), Box<
 
 #[tokio::main]
 async fn main() {
+    ensure_default_backtrace();
     let config_path = get_env("CONFIG_PATH");
     let config: CdcConfig = load_config(&config_path).expect("Failed to load config");
     let log_level = config.log_level.clone().unwrap_or("info".to_string());
@@ -183,14 +192,13 @@ async fn main() {
         std::thread::Builder::new()
             .name("ui-server".to_string())
             .spawn(move || {
-            let result = actix_web::rt::System::new().block_on(async move {
-                start_ui(ui_state_for_server, bind, port).await
-            });
-            if let Err(e) = result {
-                error!("UI server error: {}", e);
-            }
-        })
-        .expect("spawn ui-server thread failed");
+                let result = actix_web::rt::System::new()
+                    .block_on(async move { start_ui(ui_state_for_server, bind, port).await });
+                if let Err(e) = result {
+                    error!("UI server error: {}", e);
+                }
+            })
+            .expect("spawn ui-server thread failed");
     }
     let mut source: Arc<Mutex<dyn Source>> = SourceFactory::create_source(&config).await;
     add_plugin(&config, &source).await;
@@ -198,11 +206,10 @@ async fn main() {
     let table_info_list = source.lock().await.get_table_info().await;
     let mut sink = SinkFactory::create_sink(&config, table_info_list).await;
     info!("成功创建sink");
-    sink.lock()
-        .await
-        .connect()
-        .await
-        .expect("Failed to connect to sink");
+    if let Err(e) = sink.lock().await.connect().await {
+        error!("Failed to connect to sink: {}", e);
+        panic!("Failed to connect to sink: {}", e);
+    }
     info!("成功连接到sink");
     add_flush_timer(&config, &sink, ui_state.clone());
     info!("成功增加flush timer");
@@ -233,7 +240,10 @@ async fn main() {
             let table_info_list = source.lock().await.get_table_info().await;
             // 重新创建sink并连接
             sink = SinkFactory::create_sink(&config, table_info_list).await;
-            sink.lock().await.connect().await.expect("Failed to connect to sink");
+            if let Err(e) = sink.lock().await.connect().await {
+                error!("Failed to connect to sink: {}", e);
+                panic!("Failed to connect to sink: {}", e);
+            }
             add_flush_timer(&config, &sink, ui_state.clone());
         } else {
             break;

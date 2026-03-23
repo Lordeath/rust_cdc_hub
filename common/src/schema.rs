@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-pub fn extract_mysql_create_table_column_definitions(create_table_sql: &str) -> HashMap<String, String> {
+pub fn extract_mysql_create_table_column_definitions(
+    create_table_sql: &str,
+) -> HashMap<String, String> {
     let mut result: HashMap<String, String> = HashMap::new();
     for raw_line in create_table_sql.lines() {
         let line = raw_line.trim();
@@ -90,4 +92,3 @@ mod tests {
         ));
     }
 }
-

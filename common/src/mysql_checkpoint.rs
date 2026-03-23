@@ -126,12 +126,7 @@ pub async fn fetch_mysql_start_position(pool: &Pool<MySql>) -> (String, u32) {
         .try_get::<String, _>("File")
         .or_else(|_| row.try_get::<String, _>("Log_name"))
         .or_else(|_| row.try_get::<String, _>(0))
-        .unwrap_or_else(|e| {
-            panic!(
-                "读取 mysql binlog file 失败: {}; columns={:?}",
-                e, columns
-            )
-        });
+        .unwrap_or_else(|e| panic!("读取 mysql binlog file 失败: {}; columns={:?}", e, columns));
     let position_u64: u64 = row
         .try_get::<u64, _>("Position")
         .or_else(|_| row.try_get::<u64, _>("Pos"))

@@ -1,8 +1,7 @@
+use mysql_async::prelude::Queryable;
+use mysql_async::{OptsBuilder, Pool};
 use serde_json::json;
 use std::error::Error;
-use sqlx::mysql::{MySqlConnectOptions, MySqlSslMode};
-use sqlx::ConnectOptions;
-use sqlx::{MySql, Pool};
 use tracing::{error, info, trace};
 
 #[derive(Debug, Clone)]
@@ -11,7 +10,7 @@ pub struct StarrocksClient {
     pub base_url: String,
     pub username: String,
     pub password: String,
-    pub mysql_pool: Pool<MySql>,
+    pub mysql_pool: Pool,
 }
 impl StarrocksClient {
     pub async fn new(
@@ -21,19 +20,14 @@ impl StarrocksClient {
         mysql_host: &str,
         mysql_port: u16,
     ) -> Self {
-        let options = MySqlConnectOptions::new()
-            .host(mysql_host)
-            .port(mysql_port)
-            .username(username)
-            .password(password)
-            .database("information_schema")
-            .ssl_mode(MySqlSslMode::Disabled);
-        let mysql_pool = common::get_mysql_pool_by_url(
-            options.to_url_lossy().as_str(),
-            "starrocks mysql client init",
-        )
-        .await
-        .unwrap_or_else(|e| panic!("Failed to create starrocks mysql pool: {}", e));
+        let opts = OptsBuilder::default()
+            .ip_or_hostname(mysql_host)
+            .tcp_port(mysql_port)
+            .user(Some(username))
+            .pass(Some(password))
+            .db_name(Some("information_schema"))
+            .prefer_socket(false);
+        let mysql_pool = Pool::new(opts);
         StarrocksClient {
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -157,11 +151,9 @@ impl StarrocksClient {
         text
     }
 
-    pub async fn execute_mysql_sql(
-        &self,
-        sql: &str,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        sqlx::query(sql).execute(&self.mysql_pool).await?;
+    pub async fn execute_mysql_sql(&self, sql: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut conn = self.mysql_pool.get_conn().await?;
+        conn.query_drop(sql).await?;
         Ok(())
     }
 }
