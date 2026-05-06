@@ -1,9 +1,9 @@
 extern crate core;
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, web};
-use common::metrics::{APP_RESTART_COUNT, REGISTRY};
+use common::metrics::APP_RESTART_COUNT;
 use common::{CdcConfig, FlushByOperation, Plugin, Sink, Source};
-use prometheus::{Encoder, TextEncoder};
+use prometheus::{Encoder, TextEncoder, gather};
 use serde_json::json;
 use sink::SinkFactory;
 use source::SourceFactory;
@@ -65,8 +65,10 @@ struct UiState {
     started_at: i64,
     config_summary: serde_json::Value,
     last_timer_flush_at: Arc<AtomicI64>,
+    timer_flush_count: Arc<AtomicI64>,
     last_source_error: Arc<Mutex<Option<String>>>,
     last_source_restart_at: Arc<AtomicI64>,
+    source_restart_count: Arc<AtomicI64>,
 }
 
 impl UiState {
@@ -79,13 +81,25 @@ impl UiState {
             "sink_type": format!("{}", config.sink_type),
             "source_count": config.source_config.len(),
             "sink_count": config.sink_config.len(),
+            "plugin_count": config.plugins.as_ref().map(|plugins| plugins.len()).unwrap_or(0),
+            "source_batch_size": config.source_batch_size,
+            "sink_batch_size": config.sink_batch_size,
+            "checkpoint_file_path": config.checkpoint_file_path.clone(),
+            "auto_create_database": config.auto_create_database.unwrap_or(true),
+            "auto_create_table": config.auto_create_table.unwrap_or(true),
+            "auto_add_column": config.auto_add_column.unwrap_or(true),
+            "auto_modify_column": config.auto_modify_column.unwrap_or(true),
+            "ui_bind": config.ui_bind.clone(),
+            "ui_port": config.ui_port,
         });
         UiState {
             started_at,
             config_summary,
             last_timer_flush_at: Arc::new(AtomicI64::new(0)),
+            timer_flush_count: Arc::new(AtomicI64::new(0)),
             last_source_error: Arc::new(Mutex::new(None)),
             last_source_restart_at: Arc::new(AtomicI64::new(0)),
+            source_restart_count: Arc::new(AtomicI64::new(0)),
         }
     }
 }
@@ -94,20 +108,48 @@ async fn ui_health() -> impl Responder {
     HttpResponse::Ok().body("ok")
 }
 
+impl UiState {
+    async fn snapshot(&self) -> serde_json::Value {
+        let now = Utc::now().timestamp();
+        let last_source_error = self.last_source_error.lock().await.clone();
+        let source_restart_count = self.source_restart_count.load(Ordering::Relaxed);
+        let last_timer_flush_at = self.last_timer_flush_at.load(Ordering::Relaxed);
+        let timer_flush_count = self.timer_flush_count.load(Ordering::Relaxed);
+        let last_source_restart_at = self.last_source_restart_at.load(Ordering::Relaxed);
+        let health_status = if last_source_error.is_some() {
+            "degraded"
+        } else {
+            "running"
+        };
+
+        json!({
+            "status": health_status,
+            "now": now,
+            "started_at": self.started_at,
+            "uptime_seconds": now.saturating_sub(self.started_at),
+            "config": self.config_summary,
+            "last_timer_flush_at": last_timer_flush_at,
+            "timer_flush_count": timer_flush_count,
+            "last_source_restart_at": last_source_restart_at,
+            "source_restart_count": source_restart_count,
+            "last_source_error": last_source_error,
+            "links": {
+                "dashboard": "/",
+                "status": "/status",
+                "metrics": "/metrics",
+                "health": "/health"
+            }
+        })
+    }
+}
+
 async fn ui_status(state: web::Data<UiState>) -> impl Responder {
-    let last_source_error = state.last_source_error.lock().await.clone();
-    HttpResponse::Ok().json(json!({
-        "started_at": state.started_at,
-        "config": state.config_summary,
-        "last_timer_flush_at": state.last_timer_flush_at.load(Ordering::Relaxed),
-        "last_source_restart_at": state.last_source_restart_at.load(Ordering::Relaxed),
-        "last_source_error": last_source_error,
-    }))
+    HttpResponse::Ok().json(state.snapshot().await)
 }
 
 async fn ui_metrics() -> impl Responder {
     let encoder = TextEncoder::new();
-    let metric_families = REGISTRY.gather();
+    let metric_families = gather();
     let mut buffer = vec![];
     encoder.encode(&metric_families, &mut buffer).unwrap();
 
@@ -116,22 +158,251 @@ async fn ui_metrics() -> impl Responder {
         .body(buffer)
 }
 
-async fn ui_root(state: web::Data<UiState>) -> impl Responder {
-    let v = json!({
-        "started_at": state.started_at,
-        "config": state.config_summary,
-        "last_timer_flush_at": state.last_timer_flush_at.load(Ordering::Relaxed),
-        "last_source_restart_at": state.last_source_restart_at.load(Ordering::Relaxed),
-        "last_source_error": state.last_source_error.lock().await.clone(),
-    });
-    let body = format!(
-        "<html><head><meta charset=\"utf-8\"></head><body><pre>{}</pre></body></html>",
-        serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".to_string())
-    );
+async fn ui_root() -> impl Responder {
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
-        .body(body)
+        .body(DASHBOARD_HTML)
 }
+
+const DASHBOARD_HTML: &str = r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rust CDC Hub Dashboard</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07111f;
+      --panel: rgba(15, 23, 42, 0.82);
+      --panel-strong: rgba(17, 24, 39, 0.96);
+      --line: rgba(148, 163, 184, 0.22);
+      --muted: #94a3b8;
+      --text: #e5eefb;
+      --accent: #38bdf8;
+      --accent-2: #22c55e;
+      --warning: #f97316;
+      --danger: #ef4444;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.34);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(56, 189, 248, 0.24), transparent 36rem),
+        radial-gradient(circle at 80% 20%, rgba(34, 197, 94, 0.16), transparent 28rem),
+        linear-gradient(145deg, #020617 0%, var(--bg) 55%, #0f172a 100%);
+    }
+    a { color: inherit; text-decoration: none; }
+    .shell { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 32px 0 42px; }
+    .hero {
+      display: grid;
+      grid-template-columns: 1.5fr 0.9fr;
+      gap: 20px;
+      align-items: stretch;
+      margin-bottom: 20px;
+    }
+    .card {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+    }
+    .hero-main { padding: 28px; position: relative; overflow: hidden; }
+    .hero-main::after {
+      content: "";
+      position: absolute;
+      inset: auto -90px -120px auto;
+      width: 260px;
+      height: 260px;
+      border-radius: 999px;
+      background: rgba(56, 189, 248, 0.14);
+      filter: blur(4px);
+    }
+    .eyebrow { color: var(--accent); font-size: 13px; font-weight: 700; letter-spacing: 0.18em; text-transform: uppercase; }
+    h1 { margin: 12px 0 8px; font-size: clamp(30px, 5vw, 54px); line-height: 1; }
+    .subtitle { margin: 0; max-width: 720px; color: var(--muted); font-size: 16px; line-height: 1.7; }
+    .status-pill {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      padding: 8px 12px;
+      margin-top: 20px;
+      border: 1px solid rgba(34, 197, 94, 0.36);
+      color: #bbf7d0;
+      background: rgba(34, 197, 94, 0.11);
+      border-radius: 999px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      font-size: 12px;
+    }
+    .status-pill.degraded { border-color: rgba(249, 115, 22, 0.44); background: rgba(249, 115, 22, 0.14); color: #fed7aa; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent-2); box-shadow: 0 0 0 6px rgba(34, 197, 94, 0.12); }
+    .degraded .dot { background: var(--warning); box-shadow: 0 0 0 6px rgba(249, 115, 22, 0.12); }
+    .hero-side { padding: 22px; display: grid; gap: 14px; }
+    .route { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 14px; border: 1px solid var(--line); border-radius: 18px; background: rgba(15, 23, 42, 0.52); }
+    .route span { color: var(--muted); font-size: 13px; }
+    .route strong { font-size: 15px; }
+    .metrics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 16px; }
+    .metric { padding: 20px; }
+    .metric .label { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
+    .metric .value { font-size: 30px; font-weight: 800; letter-spacing: -0.04em; }
+    .metric .hint { margin-top: 8px; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .content-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .section { padding: 22px; }
+    .section h2 { margin: 0 0 16px; font-size: 18px; }
+    .kv { display: grid; gap: 10px; }
+    .kv-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 11px 0; border-bottom: 1px solid rgba(148, 163, 184, 0.13); }
+    .kv-row:last-child { border-bottom: 0; }
+    .kv-key { color: var(--muted); }
+    .kv-value { text-align: right; font-weight: 700; word-break: break-word; }
+    .error-box { min-height: 92px; padding: 14px; border-radius: 16px; background: rgba(2, 6, 23, 0.45); border: 1px solid var(--line); color: #fecaca; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .error-box.empty { color: #bbf7d0; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+    .btn { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 999px; padding: 10px 14px; background: rgba(15, 23, 42, 0.8); color: var(--text); font-weight: 700; }
+    .btn.primary { border-color: rgba(56, 189, 248, 0.5); color: #bae6fd; }
+    pre { margin: 0; max-height: 360px; overflow: auto; padding: 14px; border-radius: 16px; background: #020617; border: 1px solid var(--line); color: #c4b5fd; font-size: 12px; line-height: 1.6; }
+    .footer { margin-top: 16px; color: var(--muted); text-align: center; font-size: 12px; }
+    @media (max-width: 900px) { .hero, .content-grid { grid-template-columns: 1fr; } .metrics-grid { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 560px) { .shell { width: min(100% - 20px, 1180px); padding-top: 18px; } .metrics-grid { grid-template-columns: 1fr; } .hero-main, .hero-side, .section, .metric { padding: 16px; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div class="card hero-main">
+        <div class="eyebrow">Change Data Capture</div>
+        <h1>Rust CDC Hub</h1>
+        <p class="subtitle">实时查看 CDC 作业状态、source/sink 配置摘要、flush 与重启信息。页面每 5 秒自动刷新，也可以手动刷新。</p>
+        <div id="statusPill" class="status-pill"><span class="dot"></span><span id="statusText">loading</span></div>
+        <div class="actions">
+          <button class="btn primary" type="button" onclick="loadStatus()">立即刷新</button>
+          <a class="btn" href="/status" target="_blank" rel="noreferrer">JSON 状态</a>
+          <a class="btn" href="/metrics" target="_blank" rel="noreferrer">Prometheus 指标</a>
+          <a class="btn" href="/health" target="_blank" rel="noreferrer">健康检查</a>
+        </div>
+      </div>
+      <aside class="card hero-side">
+        <div class="route"><span>Source</span><strong id="sourceType">-</strong></div>
+        <div class="route"><span>Sink</span><strong id="sinkType">-</strong></div>
+        <div class="route"><span>自动刷新</span><strong>5s</strong></div>
+      </aside>
+    </section>
+
+    <section class="metrics-grid">
+      <div class="card metric"><div class="label">运行时间</div><div class="value" id="uptime">-</div><div class="hint" id="startedAt">started: -</div></div>
+      <div class="card metric"><div class="label">定时 flush</div><div class="value" id="flushCount">0</div><div class="hint" id="lastFlush">last flush: -</div></div>
+      <div class="card metric"><div class="label">Source 重启</div><div class="value" id="restartCount">0</div><div class="hint" id="lastRestart">last restart: -</div></div>
+      <div class="card metric"><div class="label">配置规模</div><div class="value" id="configScale">-</div><div class="hint" id="pluginCount">plugins: -</div></div>
+    </section>
+
+    <section class="content-grid">
+      <div class="card section">
+        <h2>配置摘要</h2>
+        <div class="kv" id="configKv"></div>
+      </div>
+      <div class="card section">
+        <h2>最近错误</h2>
+        <div id="errorBox" class="error-box empty">暂无 source 错误</div>
+        <div class="actions"><span class="btn">最后更新：<span id="lastUpdated">-</span></span></div>
+      </div>
+    </section>
+
+    <section class="card section" style="margin-top:16px">
+      <h2>原始状态 JSON</h2>
+      <pre id="rawJson">loading...</pre>
+    </section>
+    <div class="footer">Powered by actix-web · rust_cdc_hub</div>
+  </main>
+
+<script>
+const el = (id) => document.getElementById(id);
+function fmtTs(ts) {
+  if (!ts) return '-';
+  return new Date(ts * 1000).toLocaleString();
+}
+function fmtDuration(seconds) {
+  seconds = Number(seconds || 0);
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+function setText(id, value) { el(id).textContent = value ?? '-'; }
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[ch]));
+}
+function kvRow(key, value) {
+  const safe = value === null || value === undefined || value === '' ? '-' : value;
+  return `<div class="kv-row"><span class="kv-key">${escapeHtml(key)}</span><span class="kv-value">${escapeHtml(safe)}</span></div>`;
+}
+async function loadStatus() {
+  try {
+    const response = await fetch('/status', { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const cfg = data.config || {};
+    const degraded = data.status !== 'running';
+    el('statusPill').classList.toggle('degraded', degraded);
+    setText('statusText', data.status || 'unknown');
+    setText('sourceType', cfg.source_type);
+    setText('sinkType', cfg.sink_type);
+    setText('uptime', fmtDuration(data.uptime_seconds));
+    setText('startedAt', `started: ${fmtTs(data.started_at)}`);
+    setText('flushCount', data.timer_flush_count ?? 0);
+    setText('lastFlush', `last flush: ${fmtTs(data.last_timer_flush_at)}`);
+    setText('restartCount', data.source_restart_count ?? 0);
+    setText('lastRestart', `last restart: ${fmtTs(data.last_source_restart_at)}`);
+    setText('configScale', `${cfg.source_count ?? 0} → ${cfg.sink_count ?? 0}`);
+    setText('pluginCount', `plugins: ${cfg.plugin_count ?? 0}`);
+    el('configKv').innerHTML = [
+      kvRow('Source 类型', cfg.source_type),
+      kvRow('Sink 类型', cfg.sink_type),
+      kvRow('Source 配置数量', cfg.source_count),
+      kvRow('Sink 配置数量', cfg.sink_count),
+      kvRow('插件数量', cfg.plugin_count),
+      kvRow('Source batch size', cfg.source_batch_size),
+      kvRow('Sink batch size', cfg.sink_batch_size),
+      kvRow('Checkpoint 路径', cfg.checkpoint_file_path),
+      kvRow('自动建库', cfg.auto_create_database),
+      kvRow('自动建表', cfg.auto_create_table),
+      kvRow('自动加字段', cfg.auto_add_column),
+      kvRow('自动改字段', cfg.auto_modify_column),
+      kvRow('UI bind', cfg.ui_bind),
+      kvRow('UI port', cfg.ui_port),
+    ].join('');
+    const errBox = el('errorBox');
+    errBox.textContent = data.last_source_error || '暂无 source 错误';
+    errBox.classList.toggle('empty', !data.last_source_error);
+    setText('lastUpdated', fmtTs(data.now));
+    el('rawJson').textContent = JSON.stringify(data, null, 2);
+  } catch (err) {
+    el('statusPill').classList.add('degraded');
+    setText('statusText', 'ui-error');
+    el('errorBox').textContent = `无法加载 /status: ${err.message}`;
+    el('errorBox').classList.remove('empty');
+  }
+}
+loadStatus();
+setInterval(loadStatus, 5000);
+</script>
+</body>
+</html>"#;
 
 async fn start_ui(ui_state: UiState, bind: String, port: u16) -> Result<(), Box<dyn Error>> {
     let addr = format!("{}:{}", bind, port);
@@ -149,6 +420,7 @@ async fn start_ui(ui_state: UiState, bind: String, port: u16) -> Result<(), Box<
             .route("/", web::get().to(ui_root))
             .route("/health", web::get().to(ui_health))
             .route("/status", web::get().to(ui_status))
+            .route("/api/status", web::get().to(ui_status))
             .route("/metrics", web::get().to(ui_metrics))
     })
     .listen(listener)?
@@ -227,6 +499,9 @@ async fn main() {
                 .last_source_restart_at
                 .store(Utc::now().timestamp(), Ordering::Relaxed);
             APP_RESTART_COUNT.with_label_values(&["source"]).inc();
+            ui_state
+                .source_restart_count
+                .fetch_add(1, Ordering::Relaxed);
             error!("尝试进行重试 {}: {}", retry_times, e.message);
             // 先关闭旧source释放资源
             source.lock().await.close().await;
@@ -300,6 +575,9 @@ fn add_flush_timer(
             ui_state_for_timer
                 .last_timer_flush_at
                 .store(Utc::now().timestamp(), Ordering::Relaxed);
+            ui_state_for_timer
+                .timer_flush_count
+                .fetch_add(1, Ordering::Relaxed);
             sink_for_timer
                 .lock()
                 .await
@@ -410,8 +688,12 @@ sink_config:
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v.get("started_at").unwrap().as_i64().unwrap(), 123);
         assert!(v.get("config").is_some());
+        assert_eq!(v.get("status").unwrap().as_str().unwrap(), "running");
+        assert!(v.get("uptime_seconds").is_some());
         assert!(v.get("last_timer_flush_at").is_some());
+        assert!(v.get("timer_flush_count").is_some());
         assert!(v.get("last_source_restart_at").is_some());
+        assert!(v.get("source_restart_count").is_some());
         assert!(v.get("last_source_error").is_some());
     }
 
@@ -431,7 +713,9 @@ sink_config:
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body()).await.unwrap();
         let s = std::str::from_utf8(&body).unwrap();
-        assert!(s.contains("<pre>"));
-        assert!(s.contains("\"started_at\": 123"));
+        assert!(s.contains("Rust CDC Hub"));
+        assert!(s.contains("/status"));
+        assert!(s.contains("Prometheus 指标"));
+        assert!(s.contains("rawJson"));
     }
 }
