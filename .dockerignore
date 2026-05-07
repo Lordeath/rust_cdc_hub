@@ -1,0 +1,14 @@
+.git
+.github
+.idea
+target
+
+*.log
+*.tmp
+
+.env
+.env.*
+
+README*.md
+CLAUDE.md
+AGENTS.md
