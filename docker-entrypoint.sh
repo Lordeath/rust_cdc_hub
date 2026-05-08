@@ -7,8 +7,11 @@ fi
 
 if [ "$(id -u)" = "0" ]; then
     mkdir -p /checkpoint
-    chown -R appuser:appuser /checkpoint
-    exec gosu appuser "$@"
+
+    if [ "${RUN_AS_USER:-root}" != "root" ]; then
+        chown -R "${RUN_AS_USER}:${RUN_AS_USER}" /checkpoint
+        exec gosu "${RUN_AS_USER}" "$@"
+    fi
 fi
 
 exec "$@"

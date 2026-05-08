@@ -20,6 +20,9 @@ Cargo.lock
 *.iml
 *.ipr
 *.log
+*.tar
+*.tar.gz
+*.tgz
 
 ### NetBeans ###
 nbproject/private/

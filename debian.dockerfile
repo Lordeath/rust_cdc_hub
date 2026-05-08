@@ -1,8 +1,8 @@
 # =========================
 # 1. 构建阶段
 # =========================
-ARG RUST_IMAGE=rust:1.95-bookworm
-ARG RUNTIME_IMAGE=debian:bookworm-slim
+ARG RUST_IMAGE=rust:1-bullseye
+ARG RUNTIME_IMAGE=debian:bullseye-20260421
 ARG DEBIAN_MIRROR=mirrors.aliyun.com
 ARG CARGO_REGISTRY=sparse+https://rsproxy.cn/index/
 FROM ${RUST_IMAGE} AS builder
@@ -32,7 +32,6 @@ COPY source ./source
 # ---------- 正式编译 ----------
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
     cargo build --release \
     && cp /app/target/release/rust_cdc_hub /tmp/rust_cdc_hub \
     && strip /tmp/rust_cdc_hub
@@ -45,9 +44,10 @@ FROM ${RUNTIME_IMAGE}
 WORKDIR /app
 
 ENV TZ=Asia/Shanghai
+ENV RUN_AS_USER=root
 ARG DEBIAN_MIRROR
 
-RUN sed -i "s|http://deb.debian.org/debian-security|http://${DEBIAN_MIRROR}/debian-security|g; s|http://deb.debian.org/debian|http://${DEBIAN_MIRROR}/debian|g; s|http://security.debian.org/debian-security|http://${DEBIAN_MIRROR}/debian-security|g" /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true \
+RUN sed -i "s|http://deb.debian.org/debian-security|http://${DEBIAN_MIRROR}/debian-security|g; s|http://deb.debian.org/debian|http://${DEBIAN_MIRROR}/debian|g; s|http://security.debian.org/debian-security|http://${DEBIAN_MIRROR}/debian-security|g; s|http://security.debian.org/debian|http://${DEBIAN_MIRROR}/debian-security|g" /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates gosu tzdata \
     && rm -rf /var/lib/apt/lists/* \

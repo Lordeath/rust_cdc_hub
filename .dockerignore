@@ -5,6 +5,9 @@ target
 
 *.log
 *.tmp
+*.tar
+*.tar.gz
+*.tgz
 
 .env
 .env.*
