@@ -319,6 +319,8 @@ plugins:
 
 当 `enable_ui: true` 时，程序会启动 Actix Web 服务。可通过 `ui_bind`、`ui_port` 配置监听地址和端口；未配置端口时默认监听 `18088`，也可用 `UI_PORT` 或 `PORT` 环境变量覆盖端口。
 
+如果通过 Nginx 子路径转发，例如 `/rust_cdc_hub/`，前端页面会使用相对路径访问 `status`、`metrics`、`health` 等接口，可配合 `rewrite` 将子路径转发到程序根路径。
+
 常用端点：
 
 | 端点 | 说明 |

@@ -288,6 +288,8 @@ Planned UI capabilities:
 
 When `enable_ui: true`, the application starts an Actix Web server. Use `ui_bind` and `ui_port` to configure the listening address and port. If no port is configured, it defaults to `18088`. The port can also be overridden with the `UI_PORT` or `PORT` environment variable.
 
+When serving the UI behind an Nginx subpath such as `/rust_cdc_hub/`, the frontend uses relative URLs for `status`, `metrics`, `health`, and related endpoints, so a rewrite from the subpath to the application root is supported.
+
 Common endpoints:
 
 | Endpoint | Description |

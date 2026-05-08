@@ -148,11 +148,11 @@ impl UiState {
             "split_mode": split_snapshot.clone(),
             "database_split": split_snapshot.clone(),
             "links": {
-                "dashboard": "/",
-                "status": "/status",
-                "metrics": "/metrics",
-                "health": "/health",
-                "split": if self.database_split_enabled() { "/split" } else { "" }
+                "dashboard": ".",
+                "status": "status",
+                "metrics": "metrics",
+                "health": "health",
+                "split": if self.database_split_enabled() { "split" } else { "" }
             }
         })
     }
@@ -305,7 +305,7 @@ fn render_dashboard_html(split_enabled: bool) -> String {
 }
 
 const SPLIT_ENTRY_HTML: &str =
-    r#"<a class="btn primary" href="/split" target="_blank" rel="noreferrer">数据库拆分</a>"#;
+    r#"<a class="btn primary" href="split" target="_blank" rel="noreferrer">数据库拆分</a>"#;
 
 const SPLIT_HTML: &str = r#"<!doctype html>
 <html lang="zh-CN">
@@ -359,7 +359,7 @@ const SPLIT_HTML: &str = r#"<!doctype html>
         <h1>数据库拆分</h1>
         <p class="subtitle">查看拆分任务配置、同步范围和后续清理策略。V1 仅提供状态与入口，不执行删除或外部命令。</p>
       </div>
-      <a class="btn" href="/">返回 Dashboard</a>
+      <a class="btn" href=".">返回 Dashboard</a>
     </div>
     <section class="grid">
       <div class="card">
@@ -413,7 +413,7 @@ function renderProgressTable(tables) {
   return `<table><thead><tr><th>表名</th><th>阶段</th><th>读取</th><th>同步</th><th>过滤</th><th>最后主键</th></tr></thead><tbody>${body}</tbody></table>`;
 }
 async function loadSplitStatus() {
-  const response = await fetch('/api/split/status', { cache: 'no-store' });
+  const response = await fetch('api/split/status', { cache: 'no-store' });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   const data = await response.json();
   el('taskKv').innerHTML = [
@@ -573,9 +573,9 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         <div id="statusPill" class="status-pill"><span class="dot"></span><span id="statusText">loading</span></div>
         <div class="actions">
           <button class="btn primary" type="button" onclick="loadStatus()">立即刷新</button>
-          <a class="btn" href="/status" target="_blank" rel="noreferrer">JSON 状态</a>
-          <a class="btn" href="/metrics" target="_blank" rel="noreferrer">Prometheus 指标</a>
-          <a class="btn" href="/health" target="_blank" rel="noreferrer">健康检查</a>
+          <a class="btn" href="status" target="_blank" rel="noreferrer">JSON 状态</a>
+          <a class="btn" href="metrics" target="_blank" rel="noreferrer">Prometheus 指标</a>
+          <a class="btn" href="health" target="_blank" rel="noreferrer">健康检查</a>
           {{SPLIT_ENTRY}}
         </div>
       </div>
@@ -655,7 +655,8 @@ function kvRow(key, value) {
 }
 async function loadStatus() {
   try {
-    const response = await fetch('/status', { cache: 'no-store' });
+    // Modified By Codex 20260508 ITOPS-130877 使用相对路径以兼容 Nginx 子路径代理
+    const response = await fetch('status', { cache: 'no-store' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     const cfg = data.config || {};
@@ -709,7 +710,7 @@ async function loadStatus() {
   } catch (err) {
     el('statusPill').classList.add('degraded');
     setText('statusText', 'ui-error');
-    el('errorBox').textContent = `无法加载 /status: ${err.message}`;
+    el('errorBox').textContent = `无法加载 status: ${err.message}`;
     el('errorBox').classList.remove('empty');
   }
 }
@@ -1168,7 +1169,9 @@ plugins:
         let body = to_bytes(resp.into_body()).await.unwrap();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(s.contains("Rust CDC Hub"));
-        assert!(s.contains("/status"));
+        assert!(s.contains("href=\"status\""));
+        assert!(s.contains("fetch('status'"));
+        assert!(!s.contains("fetch('/status'"));
         assert!(s.contains("Prometheus 指标"));
         assert!(s.contains("初始化进度"));
         assert!(s.contains("rawJson"));
@@ -1200,5 +1203,7 @@ plugins:
         let body = to_bytes(resp.into_body()).await.unwrap();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(s.contains("progressTableWrap"));
+        assert!(s.contains("fetch('api/split/status'"));
+        assert!(!s.contains("fetch('/api/split/status'"));
     }
 }
