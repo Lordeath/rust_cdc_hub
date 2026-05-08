@@ -2,6 +2,7 @@ extern crate core;
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, web};
 use common::metrics::APP_RESTART_COUNT;
+use common::runtime_progress;
 use common::{CdcConfig, FlushByOperation, Plugin, PluginConfig, PluginType, Sink, Source};
 use prometheus::{Encoder, TextEncoder, gather};
 use serde_json::json;
@@ -122,11 +123,15 @@ impl UiState {
         let last_timer_flush_at = self.last_timer_flush_at.load(Ordering::Relaxed);
         let timer_flush_count = self.timer_flush_count.load(Ordering::Relaxed);
         let last_source_restart_at = self.last_source_restart_at.load(Ordering::Relaxed);
+        let runtime_progress = runtime_progress::snapshot().await;
         let health_status = if last_source_error.is_some() {
             "degraded"
+        } else if runtime_progress.initializing {
+            "initializing"
         } else {
             "running"
         };
+        let split_snapshot = self.split_snapshot_with_progress(runtime_progress.clone());
 
         json!({
             "status": health_status,
@@ -139,8 +144,9 @@ impl UiState {
             "last_source_restart_at": last_source_restart_at,
             "source_restart_count": source_restart_count,
             "last_source_error": last_source_error,
-            "split_mode": self.database_split.clone(),
-            "database_split": self.database_split.clone(),
+            "runtime_progress": runtime_progress,
+            "split_mode": split_snapshot.clone(),
+            "database_split": split_snapshot.clone(),
             "links": {
                 "dashboard": "/",
                 "status": "/status",
@@ -157,6 +163,21 @@ impl UiState {
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
     }
+
+    async fn split_snapshot(&self) -> serde_json::Value {
+        self.split_snapshot_with_progress(runtime_progress::snapshot().await)
+    }
+
+    fn split_snapshot_with_progress(
+        &self,
+        runtime_progress: runtime_progress::RuntimeProgress,
+    ) -> serde_json::Value {
+        let mut split = self.database_split.clone();
+        if let Some(obj) = split.as_object_mut() {
+            obj.insert("runtime_progress".to_string(), json!(runtime_progress));
+        }
+        split
+    }
 }
 
 async fn ui_status(state: web::Data<UiState>) -> impl Responder {
@@ -170,7 +191,7 @@ async fn ui_split_status(state: web::Data<UiState>) -> impl Responder {
             "message": "DatabaseSplit plugin is not enabled"
         }));
     }
-    HttpResponse::Ok().json(state.database_split.clone())
+    HttpResponse::Ok().json(state.split_snapshot().await)
 }
 
 async fn ui_metrics() -> impl Responder {
@@ -321,6 +342,12 @@ const SPLIT_HTML: &str = r#"<!doctype html>
     .key { color: var(--muted); }
     .value { text-align: right; font-weight: 700; overflow-wrap: anywhere; }
     .pill { display: inline-flex; align-items: center; border: 1px solid rgba(34, 197, 94, 0.35); color: #bbf7d0; background: rgba(34, 197, 94, 0.1); border-radius: 999px; padding: 7px 10px; font-size: 12px; font-weight: 800; text-transform: uppercase; }
+    .wide { grid-column: 1 / -1; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px 8px; border-bottom: 1px solid rgba(148, 163, 184, 0.14); text-align: left; }
+    th { color: var(--muted); font-size: 12px; font-weight: 700; }
+    td { font-size: 13px; font-weight: 700; }
+    .empty { color: var(--muted); padding: 16px 0; }
     pre { margin: 16px 0 0; max-height: 360px; overflow: auto; padding: 14px; border-radius: 14px; background: #020617; border: 1px solid var(--line); color: #bae6fd; font-size: 12px; line-height: 1.6; }
     @media (max-width: 780px) { .grid, .topbar { grid-template-columns: 1fr; display: grid; } .topbar { align-items: start; } }
   </style>
@@ -351,6 +378,11 @@ const SPLIT_HTML: &str = r#"<!doctype html>
         <h2>Sink</h2>
         <div class="kv" id="sinkKv"></div>
       </div>
+      <div class="card wide">
+        <h2>同步进度</h2>
+        <div id="progressSummary" class="kv"></div>
+        <div id="progressTableWrap" style="margin-top:14px"></div>
+      </div>
     </section>
     <pre id="rawJson">loading...</pre>
   </main>
@@ -367,6 +399,18 @@ function row(key, value) {
 }
 function rows(obj, keys) {
   return keys.map(([label, key]) => row(label, obj?.[key])).join('');
+}
+function renderProgressTable(tables) {
+  if (!tables.length) return '<div class="empty">暂无运行态统计</div>';
+  const body = tables.map((table) => `<tr>
+    <td>${escapeHtml(table.table_name)}</td>
+    <td>${escapeHtml(table.phase)}</td>
+    <td>${escapeHtml(table.read_total ?? 0)}</td>
+    <td>${escapeHtml(table.synced_total ?? 0)}</td>
+    <td>${escapeHtml(table.filtered_total ?? 0)}</td>
+    <td>${escapeHtml(table.last_pk)}</td>
+  </tr>`).join('');
+  return `<table><thead><tr><th>表名</th><th>阶段</th><th>读取</th><th>同步</th><th>过滤</th><th>最后主键</th></tr></thead><tbody>${body}</tbody></table>`;
 }
 async function loadSplitStatus() {
   const response = await fetch('/api/split/status', { cache: 'no-store' });
@@ -386,6 +430,18 @@ async function loadSplitStatus() {
   ].join('');
   el('sourceKv').innerHTML = rows(data.source, [['Host', 'host'], ['Port', 'port'], ['Database', 'database'], ['Table', 'table_name'], ['Exclude Prefix', 'except_table_name_prefix'], ['Server ID', 'server_id']]);
   el('sinkKv').innerHTML = rows(data.sink, [['Host', 'host'], ['Port', 'port'], ['Database', 'database']]);
+  const progress = data.runtime_progress || {};
+  const tables = Object.values(progress.tables || {});
+  const readTotal = tables.reduce((sum, table) => sum + Number(table.read_total || 0), 0);
+  const syncedTotal = tables.reduce((sum, table) => sum + Number(table.synced_total || 0), 0);
+  const filteredTotal = tables.reduce((sum, table) => sum + Number(table.filtered_total || 0), 0);
+  el('progressSummary').innerHTML = [
+    row('初始化中', progress.initializing ? 'yes' : 'no'),
+    row('当前表', progress.current_table),
+    row('读取 / 同步', `${readTotal} / ${syncedTotal}`),
+    row('过滤', filteredTotal),
+  ].join('');
+  el('progressTableWrap').innerHTML = renderProgressTable(tables);
   el('rawJson').textContent = JSON.stringify(data, null, 2);
 }
 loadSplitStatus().catch((err) => { el('rawJson').textContent = `无法加载拆分状态: ${err.message}`; });
@@ -471,8 +527,10 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       font-size: 12px;
     }
     .status-pill.degraded { border-color: rgba(249, 115, 22, 0.44); background: rgba(249, 115, 22, 0.14); color: #fed7aa; }
+    .status-pill.initializing { border-color: rgba(56, 189, 248, 0.5); background: rgba(56, 189, 248, 0.14); color: #bae6fd; }
     .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent-2); box-shadow: 0 0 0 6px rgba(34, 197, 94, 0.12); }
     .degraded .dot { background: var(--warning); box-shadow: 0 0 0 6px rgba(249, 115, 22, 0.12); }
+    .initializing .dot { background: var(--accent); box-shadow: 0 0 0 6px rgba(56, 189, 248, 0.12); }
     .hero-side { padding: 22px; display: grid; gap: 14px; }
     .route { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 14px; border: 1px solid var(--line); border-radius: 18px; background: rgba(15, 23, 42, 0.52); }
     .route span { color: var(--muted); font-size: 13px; }
@@ -483,6 +541,10 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     .metric .value { font-size: 30px; font-weight: 800; letter-spacing: -0.04em; }
     .metric .hint { margin-top: 8px; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .content-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .progress-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+    .progress-box { border: 1px solid rgba(148, 163, 184, 0.18); border-radius: 14px; padding: 14px; background: rgba(2, 6, 23, 0.26); }
+    .progress-box .label { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+    .progress-box .value { font-size: 22px; font-weight: 800; overflow-wrap: anywhere; }
     .section { padding: 22px; }
     .section h2 { margin: 0 0 16px; font-size: 18px; }
     .kv { display: grid; gap: 10px; }
@@ -497,8 +559,8 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     .btn.primary { border-color: rgba(56, 189, 248, 0.5); color: #bae6fd; }
     pre { margin: 0; max-height: 360px; overflow: auto; padding: 14px; border-radius: 16px; background: #020617; border: 1px solid var(--line); color: #c4b5fd; font-size: 12px; line-height: 1.6; }
     .footer { margin-top: 16px; color: var(--muted); text-align: center; font-size: 12px; }
-    @media (max-width: 900px) { .hero, .content-grid { grid-template-columns: 1fr; } .metrics-grid { grid-template-columns: repeat(2, 1fr); } }
-    @media (max-width: 560px) { .shell { width: min(100% - 20px, 1180px); padding-top: 18px; } .metrics-grid { grid-template-columns: 1fr; } .hero-main, .hero-side, .section, .metric { padding: 16px; } }
+    @media (max-width: 900px) { .hero, .content-grid { grid-template-columns: 1fr; } .metrics-grid, .progress-grid { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 560px) { .shell { width: min(100% - 20px, 1180px); padding-top: 18px; } .metrics-grid, .progress-grid { grid-template-columns: 1fr; } .hero-main, .hero-side, .section, .metric { padding: 16px; } }
   </style>
 </head>
 <body>
@@ -540,6 +602,16 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         <h2>最近错误</h2>
         <div id="errorBox" class="error-box empty">暂无 source 错误</div>
         <div class="actions"><span class="btn">最后更新：<span id="lastUpdated">-</span></span></div>
+      </div>
+    </section>
+
+    <section class="card section" style="margin-top:16px">
+      <h2>初始化进度</h2>
+      <div class="progress-grid">
+        <div class="progress-box"><div class="label">当前状态</div><div class="value" id="progressState">-</div></div>
+        <div class="progress-box"><div class="label">当前表</div><div class="value" id="progressTable">-</div></div>
+        <div class="progress-box"><div class="label">读取 / 同步</div><div class="value" id="progressReadSynced">-</div></div>
+        <div class="progress-box"><div class="label">过滤条数</div><div class="value" id="progressFiltered">-</div></div>
       </div>
     </section>
 
@@ -587,8 +659,15 @@ async function loadStatus() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     const cfg = data.config || {};
-    const degraded = data.status !== 'running';
+    const progress = data.runtime_progress || {};
+    const progressTables = Object.values(progress.tables || {});
+    const progressRead = progressTables.reduce((sum, table) => sum + Number(table.read_total || 0), 0);
+    const progressSynced = progressTables.reduce((sum, table) => sum + Number(table.synced_total || 0), 0);
+    const progressFiltered = progressTables.reduce((sum, table) => sum + Number(table.filtered_total || 0), 0);
+    const degraded = data.status === 'degraded';
+    const initializing = data.status === 'initializing';
     el('statusPill').classList.toggle('degraded', degraded);
+    el('statusPill').classList.toggle('initializing', initializing);
     setText('statusText', data.status || 'unknown');
     setText('sourceType', cfg.source_type);
     setText('sinkType', cfg.sink_type);
@@ -600,6 +679,10 @@ async function loadStatus() {
     setText('lastRestart', `last restart: ${fmtTs(data.last_source_restart_at)}`);
     setText('configScale', `${cfg.source_count ?? 0} → ${cfg.sink_count ?? 0}`);
     setText('pluginCount', `plugins: ${cfg.plugin_count ?? 0}`);
+    setText('progressState', progress.initializing ? 'initializing' : (progressTables.length > 0 ? 'cdc' : 'running'));
+    setText('progressTable', progress.current_table || '-');
+    setText('progressReadSynced', `${progressRead} / ${progressSynced}`);
+    setText('progressFiltered', progressFiltered);
     el('configKv').innerHTML = [
       kvRow('Source 类型', cfg.source_type),
       kvRow('Sink 类型', cfg.sink_type),
@@ -1001,6 +1084,7 @@ plugins:
         assert!(v.get("last_source_restart_at").is_some());
         assert!(v.get("source_restart_count").is_some());
         assert!(v.get("last_source_error").is_some());
+        assert!(v.get("runtime_progress").is_some());
         assert_eq!(
             v.get("database_split")
                 .unwrap()
@@ -1031,6 +1115,7 @@ plugins:
         let body = to_bytes(resp.into_body()).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v.get("enabled").unwrap().as_bool().unwrap(), true);
+        assert!(v.get("runtime_progress").is_some());
         assert_eq!(
             v.get("filter")
                 .unwrap()
@@ -1085,6 +1170,7 @@ plugins:
         assert!(s.contains("Rust CDC Hub"));
         assert!(s.contains("/status"));
         assert!(s.contains("Prometheus 指标"));
+        assert!(s.contains("初始化进度"));
         assert!(s.contains("rawJson"));
         assert!(!s.contains("数据库拆分</a>"));
     }
@@ -1111,5 +1197,8 @@ plugins:
         let req = actix_test::TestRequest::get().uri("/split").to_request();
         let resp = actix_test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body()).await.unwrap();
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(s.contains("progressTableWrap"));
     }
 }

@@ -3,6 +3,7 @@ pub mod checkpoint_manager;
 pub mod custom_error;
 pub mod metrics;
 pub mod mysql_checkpoint;
+pub mod runtime_progress;
 pub mod schema;
 
 use async_trait::async_trait;

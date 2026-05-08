@@ -6,6 +6,7 @@ use common::checkpoint_manager::{CheckpointManager, FileCheckpointManager};
 use common::custom_error::{CustomError, CustomErrorType};
 use common::metrics::{SOURCE_EVENTS_TOTAL, SOURCE_LAG_POSITION};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
+use common::runtime_progress;
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value,
     get_mysql_pool_by_url, mysql_row_to_hashmap,
@@ -552,6 +553,23 @@ fn should_reconnect_read_error(message: &str) -> bool {
         || msg.contains("eof")
 }
 
+fn pk_value_for_progress(data_buffer: &DataBuffer, pk_column: &str) -> Option<String> {
+    let value = data_buffer.get_pk(pk_column);
+    if value.is_none() {
+        None
+    } else {
+        Some(value.resolve_string())
+    }
+}
+
+fn table_pk_column(config: &MysqlSourceConfigDetail, table_name: &str) -> Option<String> {
+    config
+        .table_info_list
+        .iter()
+        .find(|table| table.table_name.eq_ignore_ascii_case(table_name))
+        .map(|table| table.pk_column.clone())
+}
+
 async fn detail_with_plugin(
     plugins: &Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>,
     data_buffer: DataBuffer,
@@ -709,6 +727,7 @@ impl Source for MySQLSource {
 
                         let pk_column = table_info_vo.pk_column.clone();
                         info!("开始初始化数据源: {}.{}", config.connection_url, table_name);
+                        runtime_progress::begin_table_initialization(&table_name).await;
                         let start = Instant::now();
                         let mut count = 0;
                         let mut id: i64 = i64::MIN;
@@ -718,10 +737,19 @@ impl Source for MySQLSource {
                                 .await;
                             let len = data_buffer_list.len();
                             for data_buffer in data_buffer_list.iter().take(len) {
+                                runtime_progress::record_read(
+                                    &table_name,
+                                    "initializing",
+                                    pk_value_for_progress(data_buffer, &pk_column),
+                                )
+                                .await;
                                 let plugin_data =
                                     detail_with_plugin(plugins, data_buffer.clone()).await;
                                 if let Ok(item) = plugin_data {
                                     Self::write_record_with_retry(&mut sink, &item, None).await;
+                                    runtime_progress::record_synced(&table_name).await;
+                                } else {
+                                    runtime_progress::record_filtered(&table_name).await;
                                 }
                                 let this_id = data_buffer.after.get(&pk_column);
                                 let this_id = match this_id {
@@ -751,6 +779,7 @@ impl Source for MySQLSource {
                             count,
                             start.elapsed()
                         );
+                        runtime_progress::finish_table_initialization(&table_name).await;
                         // Mark as done and save
                         {
                             let checkpoints_guard = self.checkpoint_entities.lock().await;
@@ -768,6 +797,7 @@ impl Source for MySQLSource {
                             }
                         }
                     }
+                    runtime_progress::finish_initialization().await;
                     tx.commit().await.map_err(|e| CustomError {
                         message: e.to_string(),
                         error_type: CustomErrorType::Restart,
@@ -889,6 +919,7 @@ impl Source for MySQLSource {
                                         .clone();
                                     let timestamp = header.timestamp;
                                     let next_event_position = header.next_event_position;
+                                    let pk_column = table_pk_column(config, table_name);
                                     for row in event.rows {
                                         let before: CaseInsensitiveHashMap =
                                             CaseInsensitiveHashMap::new_with_no_arg();
@@ -908,6 +939,14 @@ impl Source for MySQLSource {
                                             timestamp,
                                             next_event_position,
                                         );
+                                        runtime_progress::record_read(
+                                            table_name,
+                                            "cdc",
+                                            pk_column.as_ref().and_then(|pk| {
+                                                pk_value_for_progress(&data_buffer, pk)
+                                            }),
+                                        )
+                                        .await;
                                         let plugin_data =
                                             detail_with_plugin(plugins, data_buffer).await;
                                         if let Ok(item) = plugin_data {
@@ -917,6 +956,9 @@ impl Source for MySQLSource {
                                                 Some(checkpoint_entity.clone()),
                                             )
                                             .await;
+                                            runtime_progress::record_synced(table_name).await;
+                                        } else {
+                                            runtime_progress::record_filtered(table_name).await;
                                         }
                                     }
                                     if !binlog_filename.is_empty() {
@@ -970,6 +1012,7 @@ impl Source for MySQLSource {
                                         .clone();
                                     let timestamp = header.timestamp;
                                     let next_event_position = header.next_event_position;
+                                    let pk_column = table_pk_column(config, table_name);
                                     for row in event.rows {
                                         let before: CaseInsensitiveHashMap =
                                             parse_row(row, table_name, &mut columns, config, pool)
@@ -989,6 +1032,14 @@ impl Source for MySQLSource {
                                             timestamp,
                                             next_event_position,
                                         );
+                                        runtime_progress::record_read(
+                                            table_name,
+                                            "cdc",
+                                            pk_column.as_ref().and_then(|pk| {
+                                                pk_value_for_progress(&data_buffer, pk)
+                                            }),
+                                        )
+                                        .await;
                                         let plugin_data =
                                             detail_with_plugin(plugins, data_buffer).await;
                                         if let Ok(item) = plugin_data {
@@ -998,6 +1049,9 @@ impl Source for MySQLSource {
                                                 Some(checkpoint_entity.clone()),
                                             )
                                             .await;
+                                            runtime_progress::record_synced(table_name).await;
+                                        } else {
+                                            runtime_progress::record_filtered(table_name).await;
                                         }
                                     }
                                     if !binlog_filename.is_empty() {
@@ -1051,6 +1105,7 @@ impl Source for MySQLSource {
                                         .clone();
                                     let timestamp = header.timestamp;
                                     let next_event_position = header.next_event_position;
+                                    let pk_column = table_pk_column(config, table_name);
                                     for (b, a) in event.rows {
                                         let before: CaseInsensitiveHashMap =
                                             parse_row(b, table_name, &mut columns, config, pool)
@@ -1071,6 +1126,14 @@ impl Source for MySQLSource {
                                             timestamp,
                                             next_event_position,
                                         );
+                                        runtime_progress::record_read(
+                                            table_name,
+                                            "cdc",
+                                            pk_column.as_ref().and_then(|pk| {
+                                                pk_value_for_progress(&data_buffer, pk)
+                                            }),
+                                        )
+                                        .await;
                                         let plugin_data =
                                             detail_with_plugin(plugins, data_buffer).await;
                                         if let Ok(item) = plugin_data {
@@ -1080,6 +1143,9 @@ impl Source for MySQLSource {
                                                 Some(checkpoint_entity.clone()),
                                             )
                                             .await;
+                                            runtime_progress::record_synced(table_name).await;
+                                        } else {
+                                            runtime_progress::record_filtered(table_name).await;
                                         }
                                     }
 
