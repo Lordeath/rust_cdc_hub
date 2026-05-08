@@ -248,6 +248,42 @@ plugins:
       plus: 10000000000
 ```
 
+### DatabaseSplit: database split plugin (planned)
+
+`DatabaseSplit` is planned for shard-split scenarios where part of the business data in one database shard needs to be synchronized to another database. It will not replace the CDC pipeline. Instead, it will add split-task management on top of the existing Source, Sink, filtering plugins, and Actix Web UI.
+
+Planned goals:
+
+- Explicitly enable database split mode through a plugin.
+- Reuse filtering plugins such as `ColumnIn` for project, tenant, organization, or similar business-scope filters.
+- Load split-task pages in the Actix Web UI for sync configuration, task status, checklists, and operation records.
+- Keep data sync, cutover preparation, and cleanup SQL generation as separate steps.
+- Do not require the source CDC account to have `DELETE` privileges by default; cleanup should first provide dry-run counts or generated SQL.
+
+Example shape:
+
+```yaml
+plugins:
+  - plugin_type: ColumnIn
+    config:
+      columns: project_id,projectId,tenant_id
+      values: 10001,10002
+  - plugin_type: DatabaseSplit
+    config:
+      task_name: split-project-10001-10002
+      mode: shard_data_split
+      cleanup_strategy: generate_sql
+      cleanup_confirm_phrase: I_UNDERSTAND_THE_RISK
+```
+
+Planned UI capabilities:
+
+- Split task overview: source database, target database, filters, checkpoints, and sync status.
+- Sync checks: show initial-load and incremental catch-up status before manual cutover.
+- Cleanup dry-run: count matching rows per table without deleting data or generating SQL files by default.
+- Cleanup SQL generation: generate reviewable `DELETE` SQL after explicit confirmation.
+- Operation records: store dry-run, SQL generation, confirmation phrase, operator notes, and timestamps.
+
 ## Monitoring UI and Metrics
 
 When `enable_ui: true`, the application starts an Actix Web server. Use `ui_bind` and `ui_port` to configure the listening address and port. The port can also be overridden with the `UI_PORT` or `PORT` environment variable.
@@ -326,6 +362,10 @@ To add a new Source or Sink:
 - [x] plugin system
 - [x] built-in UI and Prometheus metrics
 - [x] table/database include and exclude support
+- [ ] Database split plugin: enable split mode through a plugin and load split-task management pages in Actix Web
+- [ ] Split task status and operation records: record sync checks, dry-runs, SQL generation, confirmations, and operator notes
+- [ ] Cleanup dry-run and delete SQL generation: count by default, generate reviewable SQL after confirmation, do not delete by default
+- [ ] Generic command plugin for optional config cutover, service restart, notifications, and other external actions
 - [ ] More complete DDL synchronization: MODIFY/DROP/RENAME and more
 - [ ] Multi-target fan-out or table-based routing
 - [ ] Failure bypass and replay: DLQ, error classification, exponential backoff

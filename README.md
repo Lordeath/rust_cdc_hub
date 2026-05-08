@@ -248,6 +248,73 @@ plugins:
       plus: 10000000000
 ```
 
+### DatabaseSplit：数据库拆分插件（计划中）
+
+`DatabaseSplit` 计划用于“分库场景下，将单个分库中的一部分业务数据拆分到另一个数据库”的迁移工作。它不是替代 CDC 同步链路，而是在现有 Source、Sink、过滤插件和 Actix Web UI 之上增加拆分任务管理能力。
+
+设计目标：
+
+- 通过插件显式进入数据库拆分模式。
+- 复用 `ColumnIn` 等过滤插件完成项目、租户、组织等业务维度的数据筛选。
+- 在 Actix Web 中加载拆分任务页面，展示同步配置、任务状态、检查项和操作记录。
+- 将“数据同步”“切换准备”“清理 SQL 生成”拆成独立步骤，避免一次性自动执行高风险操作。
+- 默认不要求源库账号具备 `DELETE` 权限；清理阶段优先生成 SQL 或统计待清理数量。
+
+建议用法示例：
+
+```yaml
+source_type: MySQL
+sink_type: MySQL
+source_config:
+  - host: 127.0.0.1
+    port: 3306
+    username: cdc_user
+    password: cdc_password
+    database: source_shard_01
+    table_name: "*"
+    except_table_name_prefix: "tmp_,dws_"
+    server_id: 10010
+
+sink_config:
+  - host: 127.0.0.1
+    port: 3306
+    username: sink_user
+    password: sink_password
+    database: target_shard_08
+
+plugins:
+  - plugin_type: ColumnIn
+    config:
+      columns: project_id,projectId,tenant_id
+      values: 10001,10002
+  - plugin_type: DatabaseSplit
+    config:
+      task_name: split-project-10001-10002
+      mode: shard_data_split
+      cleanup_strategy: generate_sql
+      cleanup_confirm_phrase: I_UNDERSTAND_THE_RISK
+```
+
+计划中的页面能力：
+
+- 拆分任务概览：源库、目标库、过滤条件、checkpoint、同步状态。
+- 同步检查：展示当前全量同步和增量追平情况，作为人工切换前参考。
+- 清理 dry-run：只统计各表命中数量，不直接删除数据，也不默认生成 SQL 文件。
+- 清理 SQL 生成：人工确认后生成可审查的 `DELETE` SQL；是否执行由使用方自行决定。
+- 操作记录：记录 dry-run、SQL 生成、确认口令、执行人备注和时间。
+
+清理阶段默认策略：
+
+- 默认 `dry-run`，只做数量统计。
+- 如需生成删除 SQL，需要二次确认，并输入配置中的确认口令。
+- 工具不默认执行 `DELETE`，因为 CDC 账号通常只需要 `SELECT`、`REPLICATION SLAVE`、`REPLICATION CLIENT` 权限。
+- 如果未来支持执行删除，也应作为显式可选能力，并要求单独配置具备删除权限的账号。
+
+后续可扩展能力：
+
+- `Command` 类插件：用于在页面中登记或触发外部命令，例如调用配置中心接口、执行脚本、发送通知等。
+- 配置切换建议优先通过外部命令或人工流程完成，避免将特定 Spring、Docker 或部署平台逻辑固化到 CDC 主流程。
+
 ## 监控 UI 与 Metrics
 
 当 `enable_ui: true` 时，程序会启动 Actix Web 服务。可通过 `ui_bind`、`ui_port` 配置监听地址和端口，也可用 `UI_PORT` 或 `PORT` 环境变量覆盖端口。
@@ -326,6 +393,10 @@ cargo test -p common --verbose
 - [x] 插件系统
 - [x] 内置 UI 与 Prometheus metrics
 - [x] 表/库 include/exclude 能力
+- [ ] 数据库拆分插件：通过插件进入拆分模式，并在 Actix Web 中加载拆分任务管理页面
+- [ ] 拆分任务状态与操作记录：记录同步检查、dry-run、SQL 生成、确认信息和人工备注
+- [ ] 清理 dry-run 与删除 SQL 生成：默认只统计数量，确认后生成可审查 SQL，不默认执行删除
+- [ ] 通用命令插件：登记或触发外部命令，用于配置切换、服务重启、通知等可选流程
 - [ ] 更完整的 DDL 同步（MODIFY/DROP/RENAME 等）
 - [ ] 多目标 fan-out 或按表路由
 - [ ] 失败旁路与重放（DLQ、错误分类、指数退避）
