@@ -134,7 +134,7 @@ export CONFIG_PATH=/path/to/config.yaml
 | `log_level` | 否 | 日志级别，如 `debug`、`info`。 |
 | `enable_ui` | 否 | 是否启用监控 UI，默认 `true`。 |
 | `ui_bind` | 否 | UI 监听地址。 |
-| `ui_port` | 否 | UI 监听端口。 |
+| `ui_port` | 否 | UI 监听端口，默认 `18088`。 |
 
 ### MySQL Source 配置
 
@@ -317,7 +317,7 @@ plugins:
 
 ## 监控 UI 与 Metrics
 
-当 `enable_ui: true` 时，程序会启动 Actix Web 服务。可通过 `ui_bind`、`ui_port` 配置监听地址和端口，也可用 `UI_PORT` 或 `PORT` 环境变量覆盖端口。
+当 `enable_ui: true` 时，程序会启动 Actix Web 服务。可通过 `ui_bind`、`ui_port` 配置监听地址和端口；未配置端口时默认监听 `18088`，也可用 `UI_PORT` 或 `PORT` 环境变量覆盖端口。
 
 常用端点：
 

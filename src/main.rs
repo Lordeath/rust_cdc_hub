@@ -2,7 +2,7 @@ extern crate core;
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, web};
 use common::metrics::APP_RESTART_COUNT;
-use common::{CdcConfig, FlushByOperation, Plugin, Sink, Source};
+use common::{CdcConfig, FlushByOperation, Plugin, PluginConfig, PluginType, Sink, Source};
 use prometheus::{Encoder, TextEncoder, gather};
 use serde_json::json;
 use sink::SinkFactory;
@@ -23,6 +23,8 @@ use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::FmtSubscriber;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
+
+const DEFAULT_UI_PORT: u16 = 18088;
 
 fn parse_port(s: &str) -> Option<u16> {
     let t = s.trim();
@@ -49,7 +51,7 @@ fn resolve_ui_port(config: &CdcConfig, env_port: Option<u16>) -> u16 {
     if let Some(p) = env_port {
         return p;
     }
-    config.ui_port.unwrap_or(0)
+    config.ui_port.unwrap_or(DEFAULT_UI_PORT)
 }
 
 fn ensure_default_backtrace() {
@@ -64,6 +66,7 @@ fn ensure_default_backtrace() {
 struct UiState {
     started_at: i64,
     config_summary: serde_json::Value,
+    database_split: serde_json::Value,
     last_timer_flush_at: Arc<AtomicI64>,
     timer_flush_count: Arc<AtomicI64>,
     last_source_error: Arc<Mutex<Option<String>>>,
@@ -76,6 +79,7 @@ impl UiState {
         Self::new_with_started_at(config, Utc::now().timestamp())
     }
     fn new_with_started_at(config: &CdcConfig, started_at: i64) -> Self {
+        let database_split = database_split_summary(config);
         let config_summary = json!({
             "source_type": format!("{}", config.source_type),
             "sink_type": format!("{}", config.sink_type),
@@ -91,10 +95,12 @@ impl UiState {
             "auto_modify_column": config.auto_modify_column.unwrap_or(true),
             "ui_bind": config.ui_bind.clone(),
             "ui_port": config.ui_port,
+            "database_split": database_split.clone(),
         });
         UiState {
             started_at,
             config_summary,
+            database_split,
             last_timer_flush_at: Arc::new(AtomicI64::new(0)),
             timer_flush_count: Arc::new(AtomicI64::new(0)),
             last_source_error: Arc::new(Mutex::new(None)),
@@ -133,18 +139,38 @@ impl UiState {
             "last_source_restart_at": last_source_restart_at,
             "source_restart_count": source_restart_count,
             "last_source_error": last_source_error,
+            "split_mode": self.database_split.clone(),
+            "database_split": self.database_split.clone(),
             "links": {
                 "dashboard": "/",
                 "status": "/status",
                 "metrics": "/metrics",
-                "health": "/health"
+                "health": "/health",
+                "split": if self.database_split_enabled() { "/split" } else { "" }
             }
         })
+    }
+
+    fn database_split_enabled(&self) -> bool {
+        self.database_split
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     }
 }
 
 async fn ui_status(state: web::Data<UiState>) -> impl Responder {
     HttpResponse::Ok().json(state.snapshot().await)
+}
+
+async fn ui_split_status(state: web::Data<UiState>) -> impl Responder {
+    if !state.database_split_enabled() {
+        return HttpResponse::NotFound().json(json!({
+            "enabled": false,
+            "message": "DatabaseSplit plugin is not enabled"
+        }));
+    }
+    HttpResponse::Ok().json(state.database_split.clone())
 }
 
 async fn ui_metrics() -> impl Responder {
@@ -158,11 +184,214 @@ async fn ui_metrics() -> impl Responder {
         .body(buffer)
 }
 
-async fn ui_root() -> impl Responder {
+async fn ui_root(state: web::Data<UiState>) -> impl Responder {
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
-        .body(DASHBOARD_HTML)
+        .body(render_dashboard_html(state.database_split_enabled()))
 }
+
+async fn ui_split(state: web::Data<UiState>) -> impl Responder {
+    if !state.database_split_enabled() {
+        return HttpResponse::NotFound()
+            .content_type("text/plain; charset=utf-8")
+            .body("DatabaseSplit plugin is not enabled");
+    }
+    HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(SPLIT_HTML)
+}
+
+fn plugin_config<'a>(config: &'a CdcConfig, plugin_type: PluginType) -> Option<&'a PluginConfig> {
+    config
+        .plugins
+        .as_ref()?
+        .iter()
+        .find(|plugin| plugin.plugin_type.to_string() == plugin_type.to_string())
+}
+
+fn configured_plugin_values(config: &CdcConfig, plugin_type: PluginType, key: &str) -> Vec<String> {
+    plugin_config(config, plugin_type)
+        .map(|plugin| {
+            plugin
+                .get_config(key)
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn database_split_summary(config: &CdcConfig) -> serde_json::Value {
+    let split_plugin = plugin_config(config, PluginType::DatabaseSplit);
+    let enabled = split_plugin.is_some();
+    let split_config = split_plugin.map(|p| &p.config);
+    let get_split_value = |key: &str, default: &str| -> String {
+        split_config
+            .and_then(|m| m.get(key))
+            .cloned()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| default.to_string())
+    };
+    // Modified By Codex 20260508 ITOPS-130877 DatabaseSplit 只暴露控制摘要，避免把确认口令原文返回到 UI/API
+    json!({
+        "enabled": enabled,
+        "task_name": if enabled { get_split_value("task_name", "database-split-task") } else { "".to_string() },
+        "mode": if enabled { get_split_value("mode", "shard_data_split") } else { "".to_string() },
+        "cleanup_strategy": if enabled { get_split_value("cleanup_strategy", "generate_sql") } else { "".to_string() },
+        "cleanup_confirm_phrase": {
+            "configured": split_config
+                .and_then(|m| m.get("cleanup_confirm_phrase"))
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+        },
+        "filter": {
+            "plugin": "ColumnIn",
+            "columns": configured_plugin_values(config, PluginType::ColumnIn, "columns"),
+            "values": configured_plugin_values(config, PluginType::ColumnIn, "values")
+        },
+        "source": summarize_config_item(config.source_config.first()),
+        "sink": summarize_config_item(config.sink_config.first()),
+        "capabilities": {
+            "dry_run_count": false,
+            "delete_sql_generation": false,
+            "delete_execution": false,
+            "external_command": false
+        }
+    })
+}
+
+fn summarize_config_item(
+    item: Option<&std::collections::HashMap<String, String>>,
+) -> serde_json::Value {
+    let value =
+        |key: &str| -> String { item.and_then(|m| m.get(key)).cloned().unwrap_or_default() };
+    json!({
+        "host": value("host"),
+        "port": value("port"),
+        "database": value("database"),
+        "table_name": value("table_name"),
+        "except_table_name_prefix": value("except_table_name_prefix"),
+        "server_id": value("server_id")
+    })
+}
+
+fn render_dashboard_html(split_enabled: bool) -> String {
+    DASHBOARD_HTML.replace(
+        "{{SPLIT_ENTRY}}",
+        if split_enabled { SPLIT_ENTRY_HTML } else { "" },
+    )
+}
+
+const SPLIT_ENTRY_HTML: &str =
+    r#"<a class="btn primary" href="/split" target="_blank" rel="noreferrer">数据库拆分</a>"#;
+
+const SPLIT_HTML: &str = r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Database Split - Rust CDC Hub</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #06131d;
+      --panel: rgba(17, 24, 39, 0.92);
+      --line: rgba(148, 163, 184, 0.22);
+      --muted: #9ca3af;
+      --text: #eef2ff;
+      --accent: #38bdf8;
+      --ok: #22c55e;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; color: var(--text); background: linear-gradient(145deg, #020617 0%, var(--bg) 100%); }
+    a { color: inherit; text-decoration: none; }
+    .shell { width: min(1120px, calc(100% - 32px)); margin: 0 auto; padding: 28px 0 40px; }
+    .topbar { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 18px; }
+    h1 { margin: 0; font-size: 30px; line-height: 1.15; }
+    .subtitle { margin: 8px 0 0; color: var(--muted); line-height: 1.7; }
+    .btn { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 999px; padding: 10px 14px; background: rgba(15, 23, 42, 0.84); font-weight: 700; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .card { border: 1px solid var(--line); background: var(--panel); border-radius: 18px; padding: 20px; }
+    .card h2 { margin: 0 0 14px; font-size: 17px; }
+    .kv { display: grid; gap: 10px; }
+    .row { display: flex; justify-content: space-between; gap: 18px; padding: 9px 0; border-bottom: 1px solid rgba(148, 163, 184, 0.13); }
+    .row:last-child { border-bottom: 0; }
+    .key { color: var(--muted); }
+    .value { text-align: right; font-weight: 700; overflow-wrap: anywhere; }
+    .pill { display: inline-flex; align-items: center; border: 1px solid rgba(34, 197, 94, 0.35); color: #bbf7d0; background: rgba(34, 197, 94, 0.1); border-radius: 999px; padding: 7px 10px; font-size: 12px; font-weight: 800; text-transform: uppercase; }
+    pre { margin: 16px 0 0; max-height: 360px; overflow: auto; padding: 14px; border-radius: 14px; background: #020617; border: 1px solid var(--line); color: #bae6fd; font-size: 12px; line-height: 1.6; }
+    @media (max-width: 780px) { .grid, .topbar { grid-template-columns: 1fr; display: grid; } .topbar { align-items: start; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <div class="topbar">
+      <div>
+        <h1>数据库拆分</h1>
+        <p class="subtitle">查看拆分任务配置、同步范围和后续清理策略。V1 仅提供状态与入口，不执行删除或外部命令。</p>
+      </div>
+      <a class="btn" href="/">返回 Dashboard</a>
+    </div>
+    <section class="grid">
+      <div class="card">
+        <h2>任务</h2>
+        <div class="kv" id="taskKv"></div>
+      </div>
+      <div class="card">
+        <h2>同步范围</h2>
+        <div class="kv" id="filterKv"></div>
+      </div>
+      <div class="card">
+        <h2>Source</h2>
+        <div class="kv" id="sourceKv"></div>
+      </div>
+      <div class="card">
+        <h2>Sink</h2>
+        <div class="kv" id="sinkKv"></div>
+      </div>
+    </section>
+    <pre id="rawJson">loading...</pre>
+  </main>
+<script>
+const el = (id) => document.getElementById(id);
+function escapeHtml(value) {
+  return String(value ?? '-').replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[ch]));
+}
+function row(key, value) {
+  const safe = value === null || value === undefined || value === '' ? '-' : value;
+  return `<div class="row"><span class="key">${escapeHtml(key)}</span><span class="value">${escapeHtml(safe)}</span></div>`;
+}
+function rows(obj, keys) {
+  return keys.map(([label, key]) => row(label, obj?.[key])).join('');
+}
+async function loadSplitStatus() {
+  const response = await fetch('/api/split/status', { cache: 'no-store' });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const data = await response.json();
+  el('taskKv').innerHTML = [
+    row('状态', data.enabled ? 'enabled' : 'disabled'),
+    row('任务名称', data.task_name),
+    row('模式', data.mode),
+    row('清理策略', data.cleanup_strategy),
+    row('确认口令', data.cleanup_confirm_phrase?.configured ? 'configured' : 'not configured'),
+  ].join('');
+  el('filterKv').innerHTML = [
+    row('过滤插件', data.filter?.plugin),
+    row('过滤列', (data.filter?.columns || []).join(', ')),
+    row('过滤值', (data.filter?.values || []).join(', ')),
+  ].join('');
+  el('sourceKv').innerHTML = rows(data.source, [['Host', 'host'], ['Port', 'port'], ['Database', 'database'], ['Table', 'table_name'], ['Exclude Prefix', 'except_table_name_prefix'], ['Server ID', 'server_id']]);
+  el('sinkKv').innerHTML = rows(data.sink, [['Host', 'host'], ['Port', 'port'], ['Database', 'database']]);
+  el('rawJson').textContent = JSON.stringify(data, null, 2);
+}
+loadSplitStatus().catch((err) => { el('rawJson').textContent = `无法加载拆分状态: ${err.message}`; });
+</script>
+</body>
+</html>"#;
 
 const DASHBOARD_HTML: &str = r#"<!doctype html>
 <html lang="zh-CN">
@@ -285,6 +514,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
           <a class="btn" href="/status" target="_blank" rel="noreferrer">JSON 状态</a>
           <a class="btn" href="/metrics" target="_blank" rel="noreferrer">Prometheus 指标</a>
           <a class="btn" href="/health" target="_blank" rel="noreferrer">健康检查</a>
+          {{SPLIT_ENTRY}}
         </div>
       </div>
       <aside class="card hero-side">
@@ -373,6 +603,8 @@ async function loadStatus() {
     el('configKv').innerHTML = [
       kvRow('Source 类型', cfg.source_type),
       kvRow('Sink 类型', cfg.sink_type),
+      kvRow('数据库拆分模式', data.database_split?.enabled ? 'enabled' : 'disabled'),
+      kvRow('拆分任务', data.database_split?.task_name),
       kvRow('Source 配置数量', cfg.source_count),
       kvRow('Sink 配置数量', cfg.sink_count),
       kvRow('插件数量', cfg.plugin_count),
@@ -421,6 +653,8 @@ async fn start_ui(ui_state: UiState, bind: String, port: u16) -> Result<(), Box<
             .route("/health", web::get().to(ui_health))
             .route("/status", web::get().to(ui_status))
             .route("/api/status", web::get().to(ui_status))
+            .route("/split", web::get().to(ui_split))
+            .route("/api/split/status", web::get().to(ui_split_status))
             .route("/metrics", web::get().to(ui_metrics))
     })
     .listen(listener)?
@@ -544,6 +778,11 @@ async fn add_plugin(config: &CdcConfig, source: &Arc<Mutex<dyn Source>>) {
             .iter()
         {
             info!("正在加载插件 {}", plugin.plugin_type);
+            // Modified By Codex 20260508 ITOPS-130877 控制插件只驱动 UI/模式状态，不能进入 CDC 事件处理链
+            if matches!(plugin.plugin_type, PluginType::DatabaseSplit) {
+                info!("DatabaseSplit 是控制插件，跳过事件处理链加载");
+                continue;
+            }
             let plugin = PluginFactory::create_plugin(plugin).await;
             plugins.push(plugin);
         }
@@ -640,6 +879,38 @@ sink_config:
         .unwrap()
     }
 
+    fn test_split_config() -> CdcConfig {
+        serde_yaml::from_str(
+            r#"
+source_type: MySQL
+sink_type: Print
+source_config:
+  - host: 127.0.0.1
+    port: 3306
+    database: source_shard_01
+    table_name: "*"
+    except_table_name_prefix: tmp_
+    server_id: 10010
+sink_config:
+  - host: 127.0.0.2
+    port: 3306
+    database: target_shard_08
+plugins:
+  - plugin_type: ColumnIn
+    config:
+      columns: project_id,tenant_id
+      values: 10001,10002
+  - plugin_type: DatabaseSplit
+    config:
+      task_name: split-project-10001-10002
+      mode: shard_data_split
+      cleanup_strategy: generate_sql
+      cleanup_confirm_phrase: I_UNDERSTAND_THE_RISK
+"#,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn test_resolve_ui_port_env_overrides() {
         let cfg = test_config();
@@ -647,9 +918,44 @@ sink_config:
     }
 
     #[test]
-    fn test_resolve_ui_port_default_is_ephemeral() {
+    fn test_resolve_ui_port_default_is_18088() {
         let cfg = test_config();
-        assert_eq!(resolve_ui_port(&cfg, None), 0);
+        assert_eq!(resolve_ui_port(&cfg, None), 18088);
+    }
+
+    #[test]
+    fn test_resolve_ui_port_config_overrides_default() {
+        let mut cfg = test_config();
+        cfg.ui_port = Some(19000);
+        assert_eq!(resolve_ui_port(&cfg, None), 19000);
+    }
+
+    #[test]
+    fn test_database_split_config_is_sanitized() {
+        let cfg = test_split_config();
+        let split = database_split_summary(&cfg);
+        assert_eq!(split["enabled"].as_bool().unwrap(), true);
+        assert_eq!(
+            split["task_name"].as_str().unwrap(),
+            "split-project-10001-10002"
+        );
+        assert_eq!(split["mode"].as_str().unwrap(), "shard_data_split");
+        assert_eq!(split["cleanup_strategy"].as_str().unwrap(), "generate_sql");
+        assert_eq!(
+            split["cleanup_confirm_phrase"]["configured"]
+                .as_bool()
+                .unwrap(),
+            true
+        );
+        let serialized = serde_json::to_string(&split).unwrap();
+        assert!(!serialized.contains("I_UNDERSTAND_THE_RISK"));
+    }
+
+    #[test]
+    fn test_database_split_disabled_by_default() {
+        let cfg = test_config();
+        let split = database_split_summary(&cfg);
+        assert_eq!(split["enabled"].as_bool().unwrap(), false);
     }
 
     #[actix_web::test]
@@ -695,6 +1001,69 @@ sink_config:
         assert!(v.get("last_source_restart_at").is_some());
         assert!(v.get("source_restart_count").is_some());
         assert!(v.get("last_source_error").is_some());
+        assert_eq!(
+            v.get("database_split")
+                .unwrap()
+                .get("enabled")
+                .unwrap()
+                .as_bool()
+                .unwrap(),
+            false
+        );
+    }
+
+    #[actix_web::test]
+    async fn test_ui_split_status_enabled() {
+        let cfg = test_split_config();
+        let state = UiState::new_with_started_at(&cfg, 123);
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .route("/api/split/status", web::get().to(ui_split_status)),
+        )
+        .await;
+
+        let req = actix_test::TestRequest::get()
+            .uri("/api/split/status")
+            .to_request();
+        let resp = actix_test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v.get("enabled").unwrap().as_bool().unwrap(), true);
+        assert_eq!(
+            v.get("filter")
+                .unwrap()
+                .get("columns")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[actix_web::test]
+    async fn test_ui_split_status_disabled_returns_404() {
+        let cfg = test_config();
+        let state = UiState::new_with_started_at(&cfg, 123);
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .route("/api/split/status", web::get().to(ui_split_status))
+                .route("/split", web::get().to(ui_split)),
+        )
+        .await;
+
+        let req = actix_test::TestRequest::get()
+            .uri("/api/split/status")
+            .to_request();
+        let resp = actix_test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let req = actix_test::TestRequest::get().uri("/split").to_request();
+        let resp = actix_test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[actix_web::test]
@@ -717,5 +1086,30 @@ sink_config:
         assert!(s.contains("/status"));
         assert!(s.contains("Prometheus 指标"));
         assert!(s.contains("rawJson"));
+        assert!(!s.contains("数据库拆分</a>"));
+    }
+
+    #[actix_web::test]
+    async fn test_ui_root_html_contains_split_entry_when_enabled() {
+        let cfg = test_split_config();
+        let state = UiState::new_with_started_at(&cfg, 123);
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .route("/", web::get().to(ui_root))
+                .route("/split", web::get().to(ui_split)),
+        )
+        .await;
+
+        let req = actix_test::TestRequest::get().uri("/").to_request();
+        let resp = actix_test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body()).await.unwrap();
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(s.contains("数据库拆分</a>"));
+
+        let req = actix_test::TestRequest::get().uri("/split").to_request();
+        let resp = actix_test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

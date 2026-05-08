@@ -116,6 +116,8 @@ pub enum PluginType {
     ColumnIn,
     #[strum(serialize = "plus")]
     Plus,
+    // Modified By Codex 20260508 标识数据库拆分控制插件，不参与事件转换链路
+    DatabaseSplit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

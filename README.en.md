@@ -134,7 +134,7 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 | `log_level` | No | Log level, for example `debug` or `info`. |
 | `enable_ui` | No | Enable the monitoring UI. Defaults to `true`. |
 | `ui_bind` | No | UI bind address. |
-| `ui_port` | No | UI port. |
+| `ui_port` | No | UI port. Defaults to `18088`. |
 
 ### MySQL source options
 
@@ -286,7 +286,7 @@ Planned UI capabilities:
 
 ## Monitoring UI and Metrics
 
-When `enable_ui: true`, the application starts an Actix Web server. Use `ui_bind` and `ui_port` to configure the listening address and port. The port can also be overridden with the `UI_PORT` or `PORT` environment variable.
+When `enable_ui: true`, the application starts an Actix Web server. Use `ui_bind` and `ui_port` to configure the listening address and port. If no port is configured, it defaults to `18088`. The port can also be overridden with the `UI_PORT` or `PORT` environment variable.
 
 Common endpoints:
 
