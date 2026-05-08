@@ -68,6 +68,7 @@ struct UiState {
     started_at: i64,
     config_summary: serde_json::Value,
     database_split: serde_json::Value,
+    column_in_enabled: bool,
     last_timer_flush_at: Arc<AtomicI64>,
     timer_flush_count: Arc<AtomicI64>,
     last_source_error: Arc<Mutex<Option<String>>>,
@@ -81,6 +82,7 @@ impl UiState {
     }
     fn new_with_started_at(config: &CdcConfig, started_at: i64) -> Self {
         let database_split = database_split_summary(config);
+        let column_in_enabled = plugin_config(config, PluginType::ColumnIn).is_some();
         let config_summary = json!({
             "source_type": format!("{}", config.source_type),
             "sink_type": format!("{}", config.sink_type),
@@ -97,11 +99,13 @@ impl UiState {
             "ui_bind": config.ui_bind.clone(),
             "ui_port": config.ui_port,
             "database_split": database_split.clone(),
+            "plugins": plugin_summary(config),
         });
         UiState {
             started_at,
             config_summary,
             database_split,
+            column_in_enabled,
             last_timer_flush_at: Arc::new(AtomicI64::new(0)),
             timer_flush_count: Arc::new(AtomicI64::new(0)),
             last_source_error: Arc::new(Mutex::new(None)),
@@ -208,7 +212,10 @@ async fn ui_metrics() -> impl Responder {
 async fn ui_root(state: web::Data<UiState>) -> impl Responder {
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
-        .body(render_dashboard_html(state.database_split_enabled()))
+        .body(render_dashboard_html(
+            state.database_split_enabled(),
+            state.column_in_enabled,
+        ))
 }
 
 async fn ui_split(state: web::Data<UiState>) -> impl Responder {
@@ -243,6 +250,35 @@ fn configured_plugin_values(config: &CdcConfig, plugin_type: PluginType, key: &s
         .unwrap_or_default()
 }
 
+fn plugin_summary(config: &CdcConfig) -> serde_json::Value {
+    let plugins: Vec<serde_json::Value> = config
+        .plugins
+        .as_ref()
+        .map(|plugins| {
+            plugins
+                .iter()
+                .map(|plugin| match &plugin.plugin_type {
+                    PluginType::ColumnIn => {
+                        // Expose only safe ColumnIn config summary so the Dashboard can explain filter stats.
+                        json!({
+                            "plugin_type": "ColumnIn",
+                            "columns": configured_plugin_values(config, PluginType::ColumnIn, "columns"),
+                            "values": configured_plugin_values(config, PluginType::ColumnIn, "values")
+                        })
+                    }
+                    PluginType::Plus => json!({
+                        "plugin_type": "Plus"
+                    }),
+                    PluginType::DatabaseSplit => json!({
+                        "plugin_type": "DatabaseSplit"
+                    }),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!(plugins)
+}
+
 fn database_split_summary(config: &CdcConfig) -> serde_json::Value {
     let split_plugin = plugin_config(config, PluginType::DatabaseSplit);
     let enabled = split_plugin.is_some();
@@ -254,7 +290,7 @@ fn database_split_summary(config: &CdcConfig) -> serde_json::Value {
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| default.to_string())
     };
-    // Modified By Codex 20260508 ITOPS-130877 DatabaseSplit 只暴露控制摘要，避免把确认口令原文返回到 UI/API
+    // DatabaseSplit only exposes control summary fields; never return the raw confirm phrase.
     json!({
         "enabled": enabled,
         "task_name": if enabled { get_split_value("task_name", "database-split-task") } else { "".to_string() },
@@ -297,15 +333,38 @@ fn summarize_config_item(
     })
 }
 
-fn render_dashboard_html(split_enabled: bool) -> String {
-    DASHBOARD_HTML.replace(
-        "{{SPLIT_ENTRY}}",
-        if split_enabled { SPLIT_ENTRY_HTML } else { "" },
-    )
+fn render_dashboard_html(split_enabled: bool, column_in_enabled: bool) -> String {
+    DASHBOARD_HTML
+        .replace(
+            "{{SPLIT_ENTRY}}",
+            if split_enabled { SPLIT_ENTRY_HTML } else { "" },
+        )
+        .replace(
+            "{{PLUGIN_FILTER_SECTION}}",
+            if column_in_enabled {
+                PLUGIN_FILTER_SECTION_HTML
+            } else {
+                ""
+            },
+        )
 }
 
-const SPLIT_ENTRY_HTML: &str =
-    r#"<a class="btn primary" href="split" target="_blank" rel="noreferrer">数据库拆分</a>"#;
+const SPLIT_ENTRY_HTML: &str = r#"<a class="btn primary" href="split" target="_blank" rel="noreferrer" data-i18n="database_split">数据库拆分</a>"#;
+
+const PLUGIN_FILTER_SECTION_HTML: &str = r#"
+    <section class="card section plugin-filter-section" id="pluginFilterSection">
+      <div class="section-title-row">
+        <h2 data-i18n="plugin_filter">插件过滤</h2>
+        <span class="tag">ColumnIn</span>
+      </div>
+      <div class="plugin-filter-grid">
+        <div class="progress-box"><div class="label" data-i18n="filter_columns">过滤字段</div><div class="value compact" id="columnInColumns">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="filter_values">过滤值</div><div class="value compact" id="columnInValues">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="filtered_total">过滤总数</div><div class="value" id="columnInFilteredTotal">0</div></div>
+      </div>
+      <div id="columnInFilterTable" class="table-wrap"></div>
+    </section>
+"#;
 
 const SPLIT_HTML: &str = r#"<!doctype html>
 <html lang="zh-CN">
@@ -541,10 +600,22 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     .metric .value { font-size: 30px; font-weight: 800; letter-spacing: -0.04em; }
     .metric .hint { margin-top: 8px; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .content-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .plugin-filter-section { margin-bottom: 16px; }
+    .section-title-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+    .section-title-row h2 { margin: 0; }
+    .tag { display: inline-flex; align-items: center; border: 1px solid rgba(56, 189, 248, 0.4); color: #bae6fd; background: rgba(56, 189, 248, 0.1); border-radius: 999px; padding: 6px 10px; font-size: 12px; font-weight: 800; }
+    .plugin-filter-grid { display: grid; grid-template-columns: 1.2fr 1.2fr 0.7fr; gap: 12px; }
     .progress-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
     .progress-box { border: 1px solid rgba(148, 163, 184, 0.18); border-radius: 14px; padding: 14px; background: rgba(2, 6, 23, 0.26); }
     .progress-box .label { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
     .progress-box .value { font-size: 22px; font-weight: 800; overflow-wrap: anywhere; }
+    .progress-box .value.compact { font-size: 16px; line-height: 1.45; letter-spacing: 0; }
+    .table-wrap { margin-top: 14px; overflow: auto; border: 1px solid rgba(148, 163, 184, 0.18); border-radius: 14px; }
+    table { width: 100%; border-collapse: collapse; min-width: 620px; }
+    th, td { padding: 12px 14px; border-bottom: 1px solid rgba(148, 163, 184, 0.13); text-align: left; font-size: 13px; }
+    th { color: var(--muted); font-weight: 700; background: rgba(2, 6, 23, 0.28); }
+    tr:last-child td { border-bottom: 0; }
+    .empty { color: var(--muted); padding: 14px; }
     .section { padding: 22px; }
     .section h2 { margin: 0 0 16px; font-size: 18px; }
     .kv { display: grid; gap: 10px; }
@@ -559,64 +630,72 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     .btn.primary { border-color: rgba(56, 189, 248, 0.5); color: #bae6fd; }
     pre { margin: 0; max-height: 360px; overflow: auto; padding: 14px; border-radius: 16px; background: #020617; border: 1px solid var(--line); color: #c4b5fd; font-size: 12px; line-height: 1.6; }
     .footer { margin-top: 16px; color: var(--muted); text-align: center; font-size: 12px; }
-    @media (max-width: 900px) { .hero, .content-grid { grid-template-columns: 1fr; } .metrics-grid, .progress-grid { grid-template-columns: repeat(2, 1fr); } }
-    @media (max-width: 560px) { .shell { width: min(100% - 20px, 1180px); padding-top: 18px; } .metrics-grid, .progress-grid { grid-template-columns: 1fr; } .hero-main, .hero-side, .section, .metric { padding: 16px; } }
+    .top-actions { display: flex; justify-content: flex-end; margin-bottom: 12px; }
+    .lang-toggle { border: 1px solid rgba(56, 189, 248, 0.42); color: #bae6fd; background: rgba(15, 23, 42, 0.86); border-radius: 999px; padding: 8px 12px; font-weight: 800; cursor: pointer; }
+    @media (max-width: 900px) { .hero, .content-grid { grid-template-columns: 1fr; } .metrics-grid, .progress-grid, .plugin-filter-grid { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 560px) { .shell { width: min(100% - 20px, 1180px); padding-top: 18px; } .metrics-grid, .progress-grid, .plugin-filter-grid { grid-template-columns: 1fr; } .hero-main, .hero-side, .section, .metric { padding: 16px; } }
   </style>
 </head>
 <body>
   <main class="shell">
+    <div class="top-actions">
+      <button class="lang-toggle" type="button" id="langToggle">English</button>
+    </div>
     <section class="hero">
       <div class="card hero-main">
         <div class="eyebrow">Change Data Capture</div>
         <h1>Rust CDC Hub</h1>
-        <p class="subtitle">实时查看 CDC 作业状态、source/sink 配置摘要、flush 与重启信息。页面每 5 秒自动刷新，也可以手动刷新。</p>
+        <p class="subtitle" data-i18n="subtitle">实时查看 CDC 作业状态、source/sink 配置摘要、flush 与重启信息。页面每 5 秒自动刷新，也可以手动刷新。</p>
         <div id="statusPill" class="status-pill"><span class="dot"></span><span id="statusText">loading</span></div>
         <div class="actions">
-          <button class="btn primary" type="button" onclick="loadStatus()">立即刷新</button>
-          <a class="btn" href="status" target="_blank" rel="noreferrer">JSON 状态</a>
-          <a class="btn" href="metrics" target="_blank" rel="noreferrer">Prometheus 指标</a>
-          <a class="btn" href="health" target="_blank" rel="noreferrer">健康检查</a>
+          <button class="btn primary" type="button" onclick="loadStatus()" data-i18n="refresh_now">立即刷新</button>
+          <a class="btn" href="status" target="_blank" rel="noreferrer" data-i18n="json_status">JSON 状态</a>
+          <a class="btn" href="metrics" target="_blank" rel="noreferrer" data-i18n="metrics">Prometheus 指标</a>
+          <a class="btn" href="health" target="_blank" rel="noreferrer" data-i18n="health">健康检查</a>
           {{SPLIT_ENTRY}}
         </div>
       </div>
       <aside class="card hero-side">
         <div class="route"><span>Source</span><strong id="sourceType">-</strong></div>
         <div class="route"><span>Sink</span><strong id="sinkType">-</strong></div>
-        <div class="route"><span>自动刷新</span><strong>5s</strong></div>
+        <div class="route"><span data-i18n="auto_refresh">自动刷新</span><strong>5s</strong></div>
       </aside>
     </section>
 
+    {{PLUGIN_FILTER_SECTION}}
+
     <section class="metrics-grid">
-      <div class="card metric"><div class="label">运行时间</div><div class="value" id="uptime">-</div><div class="hint" id="startedAt">started: -</div></div>
-      <div class="card metric"><div class="label">定时 flush</div><div class="value" id="flushCount">0</div><div class="hint" id="lastFlush">last flush: -</div></div>
-      <div class="card metric"><div class="label">Source 重启</div><div class="value" id="restartCount">0</div><div class="hint" id="lastRestart">last restart: -</div></div>
-      <div class="card metric"><div class="label">配置规模</div><div class="value" id="configScale">-</div><div class="hint" id="pluginCount">plugins: -</div></div>
+      <div class="card metric"><div class="label" data-i18n="uptime">运行时间</div><div class="value" id="uptime">-</div><div class="hint" id="startedAt">started: -</div></div>
+      <div class="card metric"><div class="label" data-i18n="timer_flush">定时 flush</div><div class="value" id="flushCount">0</div><div class="hint" id="lastFlush">last flush: -</div></div>
+      <div class="card metric"><div class="label" data-i18n="source_restart">Source 重启</div><div class="value" id="restartCount">0</div><div class="hint" id="lastRestart">last restart: -</div></div>
+      <div class="card metric"><div class="label" data-i18n="config_scale">配置规模</div><div class="value" id="configScale">-</div><div class="hint" id="pluginCount">plugins: -</div></div>
     </section>
 
     <section class="content-grid">
       <div class="card section">
-        <h2>配置摘要</h2>
+        <h2 data-i18n="config_summary">配置摘要</h2>
         <div class="kv" id="configKv"></div>
       </div>
       <div class="card section">
-        <h2>最近错误</h2>
+        <h2 data-i18n="recent_error">最近错误</h2>
         <div id="errorBox" class="error-box empty">暂无 source 错误</div>
-        <div class="actions"><span class="btn">最后更新：<span id="lastUpdated">-</span></span></div>
+        <div class="actions"><span class="btn"><span data-i18n="last_updated">最后更新</span>：<span id="lastUpdated">-</span></span></div>
       </div>
     </section>
 
     <section class="card section" style="margin-top:16px">
-      <h2>初始化进度</h2>
+      <h2 data-i18n="sync_progress">数据同步进度</h2>
       <div class="progress-grid">
-        <div class="progress-box"><div class="label">当前状态</div><div class="value" id="progressState">-</div></div>
-        <div class="progress-box"><div class="label">当前表</div><div class="value" id="progressTable">-</div></div>
-        <div class="progress-box"><div class="label">读取 / 同步</div><div class="value" id="progressReadSynced">-</div></div>
-        <div class="progress-box"><div class="label">过滤条数</div><div class="value" id="progressFiltered">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="current_status">当前状态</div><div class="value" id="progressState">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="current_table">当前表</div><div class="value" id="progressTable">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="read_sink">读取 / 写入 Sink</div><div class="value" id="progressReadSynced">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="filtered_rows">过滤条数</div><div class="value" id="progressFiltered">-</div></div>
       </div>
+      <div id="syncProgressTable" class="table-wrap"></div>
     </section>
 
     <section class="card section" style="margin-top:16px">
-      <h2>原始状态 JSON</h2>
+      <h2 data-i18n="raw_json">原始状态 JSON</h2>
       <pre id="rawJson">loading...</pre>
     </section>
     <div class="footer">Powered by actix-web · rust_cdc_hub</div>
@@ -624,6 +703,137 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 
 <script>
 const el = (id) => document.getElementById(id);
+const translations = {
+  zh: {
+    lang_toggle: 'English',
+    subtitle: '实时查看 CDC 作业状态、source/sink 配置摘要、flush 与重启信息。页面每 5 秒自动刷新，也可以手动刷新。',
+    refresh_now: '立即刷新',
+    json_status: 'JSON 状态',
+    metrics: 'Prometheus 指标',
+    health: '健康检查',
+    database_split: '数据库拆分',
+    auto_refresh: '自动刷新',
+    plugin_filter: '插件过滤',
+    filter_columns: '过滤字段',
+    filter_values: '过滤值',
+    filtered_total: '过滤总数',
+    uptime: '运行时间',
+    timer_flush: '定时 flush',
+    source_restart: 'Source 重启',
+    config_scale: '配置规模',
+    config_summary: '配置摘要',
+    recent_error: '最近错误',
+    last_updated: '最后更新',
+    sync_progress: '数据同步进度',
+    current_status: '当前状态',
+    current_table: '当前表',
+    read_sink: '总计读取 / 写入 Sink',
+    filtered_rows: '总计过滤条数',
+    raw_json: '原始状态 JSON',
+    no_column_in_hits: '暂无 ColumnIn 过滤命中',
+    no_table_sync: '暂无表级同步记录',
+    no_source_error: '暂无 source 错误',
+    table_name: '表名',
+    matched_column: '命中字段',
+    input_rows: '入条数',
+    output_rows: '出条数',
+    filtered_count: '过滤条数',
+    last_event_at: '最后更新时间',
+    phase: '阶段',
+    read: '读取',
+    sink_written: '写入 Sink',
+    filtered: '过滤',
+    last_pk: '最后主键',
+    source_type: 'Source 类型',
+    sink_type: 'Sink 类型',
+    split_mode: '数据库拆分模式',
+    split_task: '拆分任务',
+    source_count: 'Source 配置数量',
+    sink_count: 'Sink 配置数量',
+    plugin_count: '插件数量',
+    checkpoint_path: 'Checkpoint 路径',
+    auto_create_database: '自动建库',
+    auto_create_table: '自动建表',
+    auto_add_column: '自动加字段',
+    auto_modify_column: '自动改字段',
+    started: 'started',
+    last_flush: 'last flush',
+    last_restart: 'last restart',
+    plugins: 'plugins',
+    load_status_failed: '无法加载 status',
+  },
+  en: {
+    lang_toggle: '中文',
+    subtitle: 'Monitor CDC job status, source/sink config summary, flush status, and restart information in real time. This page refreshes every 5 seconds.',
+    refresh_now: 'Refresh',
+    json_status: 'JSON Status',
+    metrics: 'Prometheus Metrics',
+    health: 'Health Check',
+    database_split: 'Database Split',
+    auto_refresh: 'Auto Refresh',
+    plugin_filter: 'Plugin Filter',
+    filter_columns: 'Filter Columns',
+    filter_values: 'Allowed Values',
+    filtered_total: 'Filtered Total',
+    uptime: 'Uptime',
+    timer_flush: 'Timer Flush',
+    source_restart: 'Source Restarts',
+    config_scale: 'Config Scale',
+    config_summary: 'Config Summary',
+    recent_error: 'Recent Error',
+    last_updated: 'Last Updated',
+    sync_progress: 'Data Sync Progress',
+    current_status: 'Current Status',
+    current_table: 'Current Table',
+    read_sink: 'Total Read / Written to Sink',
+    filtered_rows: 'Total Filtered Rows',
+    raw_json: 'Raw Status JSON',
+    no_column_in_hits: 'No ColumnIn filter hits',
+    no_table_sync: 'No table-level sync records',
+    no_source_error: 'No source errors',
+    table_name: 'Table',
+    matched_column: 'Matched Column',
+    input_rows: 'Input Rows',
+    output_rows: 'Output Rows',
+    filtered_count: 'Filtered Rows',
+    last_event_at: 'Last Updated',
+    phase: 'Phase',
+    read: 'Read',
+    sink_written: 'Written to Sink',
+    filtered: 'Filtered',
+    last_pk: 'Last PK',
+    source_type: 'Source Type',
+    sink_type: 'Sink Type',
+    split_mode: 'Database Split Mode',
+    split_task: 'Split Task',
+    source_count: 'Source Config Count',
+    sink_count: 'Sink Config Count',
+    plugin_count: 'Plugin Count',
+    checkpoint_path: 'Checkpoint Path',
+    auto_create_database: 'Auto Create Database',
+    auto_create_table: 'Auto Create Table',
+    auto_add_column: 'Auto Add Column',
+    auto_modify_column: 'Auto Modify Column',
+    started: 'started',
+    last_flush: 'last flush',
+    last_restart: 'last restart',
+    plugins: 'plugins',
+    load_status_failed: 'Failed to load status',
+  },
+};
+let currentLang = localStorage.getItem('rustCdcHubLang') || 'zh';
+let latestStatus = null;
+function t(key) {
+  return translations[currentLang]?.[key] || translations.zh[key] || key;
+}
+function applyLanguage() {
+  document.documentElement.lang = currentLang === 'en' ? 'en' : 'zh-CN';
+  document.querySelectorAll('[data-i18n]').forEach((node) => {
+    node.textContent = t(node.dataset.i18n);
+  });
+  const langToggle = el('langToggle');
+  if (langToggle) langToggle.textContent = t('lang_toggle');
+}
 function fmtTs(ts) {
   if (!ts) return '-';
   return new Date(ts * 1000).toLocaleString();
@@ -653,12 +863,57 @@ function kvRow(key, value) {
   const safe = value === null || value === undefined || value === '' ? '-' : value;
   return `<div class="kv-row"><span class="kv-key">${escapeHtml(key)}</span><span class="kv-value">${escapeHtml(safe)}</span></div>`;
 }
-async function loadStatus() {
-  try {
-    // Modified By Codex 20260508 ITOPS-130877 使用相对路径以兼容 Nginx 子路径代理
-    const response = await fetch('status', { cache: 'no-store' });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const data = await response.json();
+function renderColumnInFilters(cfg, progress) {
+  const section = el('pluginFilterSection');
+  if (!section) return;
+  const plugins = Array.isArray(cfg.plugins) ? cfg.plugins : [];
+  const columnIn = plugins.find((plugin) => plugin.plugin_type === 'ColumnIn') || {};
+  const columns = Array.isArray(columnIn.columns) ? columnIn.columns : [];
+  const values = Array.isArray(columnIn.values) ? columnIn.values : [];
+  const filters = Object.values(progress.plugin_filters || {})
+    .filter((item) => item.plugin_name === 'ColumnIn')
+    .sort((a, b) => `${a.table_name}|${a.column_name}`.localeCompare(`${b.table_name}|${b.column_name}`));
+  const total = filters.reduce((sum, item) => sum + Number(item.filtered_total || 0), 0);
+  setText('columnInColumns', columns.join(', ') || '-');
+  setText('columnInValues', values.join(', ') || '-');
+  setText('columnInFilteredTotal', total);
+  if (!filters.length) {
+    el('columnInFilterTable').innerHTML = `<div class="empty">${escapeHtml(t('no_column_in_hits'))}</div>`;
+    return;
+  }
+  const body = filters.map((item) => `<tr>
+    <td>${escapeHtml(item.table_name || '-')}</td>
+    <td>${escapeHtml(item.column_name || '-')}</td>
+    <td>${escapeHtml(item.input_total ?? 0)}</td>
+    <td>${escapeHtml(item.output_total ?? 0)}</td>
+    <td>${escapeHtml(item.filtered_total ?? 0)}</td>
+    <td>${escapeHtml(fmtTs(item.last_event_at))}</td>
+  </tr>`).join('');
+  el('columnInFilterTable').innerHTML = `<table><thead><tr><th>${escapeHtml(t('table_name'))}</th><th>${escapeHtml(t('matched_column'))}</th><th>${escapeHtml(t('input_rows'))}</th><th>${escapeHtml(t('output_rows'))}</th><th>${escapeHtml(t('filtered_count'))}</th><th>${escapeHtml(t('last_event_at'))}</th></tr></thead><tbody>${body}</tbody></table>`;
+}
+function renderSyncProgressTable(tables) {
+  const target = el('syncProgressTable');
+  if (!target) return;
+  if (!tables.length) {
+    target.innerHTML = `<div class="empty">${escapeHtml(t('no_table_sync'))}</div>`;
+    return;
+  }
+  const rows = [...tables]
+    .sort((a, b) => String(a.table_name || '').localeCompare(String(b.table_name || '')))
+    .map((table) => `<tr>
+      <td>${escapeHtml(table.table_name || '-')}</td>
+      <td>${escapeHtml(table.phase || '-')}</td>
+      <td>${escapeHtml(table.read_total ?? 0)}</td>
+      <td>${escapeHtml(table.synced_total ?? 0)}</td>
+      <td>${escapeHtml(table.filtered_total ?? 0)}</td>
+      <td>${escapeHtml(table.last_pk || '-')}</td>
+      <td>${escapeHtml(fmtTs(table.last_event_at))}</td>
+    </tr>`)
+    .join('');
+  target.innerHTML = `<table><thead><tr><th>${escapeHtml(t('table_name'))}</th><th>${escapeHtml(t('phase'))}</th><th>${escapeHtml(t('read'))}</th><th>${escapeHtml(t('sink_written'))}</th><th>${escapeHtml(t('filtered'))}</th><th>${escapeHtml(t('last_pk'))}</th><th>${escapeHtml(t('last_event_at'))}</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+function renderStatusData(data) {
+    latestStatus = data;
     const cfg = data.config || {};
     const progress = data.runtime_progress || {};
     const progressTables = Object.values(progress.tables || {});
@@ -673,47 +928,64 @@ async function loadStatus() {
     setText('sourceType', cfg.source_type);
     setText('sinkType', cfg.sink_type);
     setText('uptime', fmtDuration(data.uptime_seconds));
-    setText('startedAt', `started: ${fmtTs(data.started_at)}`);
+    setText('startedAt', `${t('started')}: ${fmtTs(data.started_at)}`);
     setText('flushCount', data.timer_flush_count ?? 0);
-    setText('lastFlush', `last flush: ${fmtTs(data.last_timer_flush_at)}`);
+    setText('lastFlush', `${t('last_flush')}: ${fmtTs(data.last_timer_flush_at)}`);
     setText('restartCount', data.source_restart_count ?? 0);
-    setText('lastRestart', `last restart: ${fmtTs(data.last_source_restart_at)}`);
+    setText('lastRestart', `${t('last_restart')}: ${fmtTs(data.last_source_restart_at)}`);
     setText('configScale', `${cfg.source_count ?? 0} → ${cfg.sink_count ?? 0}`);
-    setText('pluginCount', `plugins: ${cfg.plugin_count ?? 0}`);
+    setText('pluginCount', `${t('plugins')}: ${cfg.plugin_count ?? 0}`);
     setText('progressState', progress.initializing ? 'initializing' : (progressTables.length > 0 ? 'cdc' : 'running'));
     setText('progressTable', progress.current_table || '-');
     setText('progressReadSynced', `${progressRead} / ${progressSynced}`);
     setText('progressFiltered', progressFiltered);
+    renderColumnInFilters(cfg, progress);
+    renderSyncProgressTable(progressTables);
     el('configKv').innerHTML = [
-      kvRow('Source 类型', cfg.source_type),
-      kvRow('Sink 类型', cfg.sink_type),
-      kvRow('数据库拆分模式', data.database_split?.enabled ? 'enabled' : 'disabled'),
-      kvRow('拆分任务', data.database_split?.task_name),
-      kvRow('Source 配置数量', cfg.source_count),
-      kvRow('Sink 配置数量', cfg.sink_count),
-      kvRow('插件数量', cfg.plugin_count),
+      kvRow(t('source_type'), cfg.source_type),
+      kvRow(t('sink_type'), cfg.sink_type),
+      kvRow(t('split_mode'), data.database_split?.enabled ? 'enabled' : 'disabled'),
+      kvRow(t('split_task'), data.database_split?.task_name),
+      kvRow(t('source_count'), cfg.source_count),
+      kvRow(t('sink_count'), cfg.sink_count),
+      kvRow(t('plugin_count'), cfg.plugin_count),
       kvRow('Source batch size', cfg.source_batch_size),
       kvRow('Sink batch size', cfg.sink_batch_size),
-      kvRow('Checkpoint 路径', cfg.checkpoint_file_path),
-      kvRow('自动建库', cfg.auto_create_database),
-      kvRow('自动建表', cfg.auto_create_table),
-      kvRow('自动加字段', cfg.auto_add_column),
-      kvRow('自动改字段', cfg.auto_modify_column),
+      kvRow(t('checkpoint_path'), cfg.checkpoint_file_path),
+      kvRow(t('auto_create_database'), cfg.auto_create_database),
+      kvRow(t('auto_create_table'), cfg.auto_create_table),
+      kvRow(t('auto_add_column'), cfg.auto_add_column),
+      kvRow(t('auto_modify_column'), cfg.auto_modify_column),
       kvRow('UI bind', cfg.ui_bind),
       kvRow('UI port', cfg.ui_port),
     ].join('');
     const errBox = el('errorBox');
-    errBox.textContent = data.last_source_error || '暂无 source 错误';
+    errBox.textContent = data.last_source_error || t('no_source_error');
     errBox.classList.toggle('empty', !data.last_source_error);
     setText('lastUpdated', fmtTs(data.now));
     el('rawJson').textContent = JSON.stringify(data, null, 2);
+}
+async function loadStatus() {
+  try {
+    // Use relative paths so the UI works behind a subpath reverse proxy.
+    const response = await fetch('status', { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    renderStatusData(data);
   } catch (err) {
     el('statusPill').classList.add('degraded');
     setText('statusText', 'ui-error');
-    el('errorBox').textContent = `无法加载 status: ${err.message}`;
+    el('errorBox').textContent = `${t('load_status_failed')}: ${err.message}`;
     el('errorBox').classList.remove('empty');
   }
 }
+applyLanguage();
+el('langToggle').addEventListener('click', () => {
+  currentLang = currentLang === 'zh' ? 'en' : 'zh';
+  localStorage.setItem('rustCdcHubLang', currentLang);
+  applyLanguage();
+  if (latestStatus) renderStatusData(latestStatus);
+});
 loadStatus();
 setInterval(loadStatus, 5000);
 </script>
@@ -862,7 +1134,7 @@ async fn add_plugin(config: &CdcConfig, source: &Arc<Mutex<dyn Source>>) {
             .iter()
         {
             info!("正在加载插件 {}", plugin.plugin_type);
-            // Modified By Codex 20260508 ITOPS-130877 控制插件只驱动 UI/模式状态，不能进入 CDC 事件处理链
+            // Control plugins drive UI/mode state and must not enter the CDC event chain.
             if matches!(plugin.plugin_type, PluginType::DatabaseSplit) {
                 info!("DatabaseSplit 是控制插件，跳过事件处理链加载");
                 continue;
@@ -1042,6 +1314,20 @@ plugins:
         assert_eq!(split["enabled"].as_bool().unwrap(), false);
     }
 
+    #[test]
+    fn test_plugin_summary_contains_column_in_safe_config() {
+        let cfg = test_split_config();
+        let plugins = plugin_summary(&cfg);
+        let column_in = plugins
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|plugin| plugin["plugin_type"].as_str().unwrap() == "ColumnIn")
+            .unwrap();
+        assert_eq!(column_in["columns"].as_array().unwrap().len(), 2);
+        assert_eq!(column_in["values"].as_array().unwrap().len(), 2);
+    }
+
     #[actix_web::test]
     async fn test_ui_health_ok() {
         let cfg = test_config();
@@ -1086,6 +1372,12 @@ plugins:
         assert!(v.get("source_restart_count").is_some());
         assert!(v.get("last_source_error").is_some());
         assert!(v.get("runtime_progress").is_some());
+        assert!(
+            v.get("runtime_progress")
+                .unwrap()
+                .get("plugin_filters")
+                .is_some()
+        );
         assert_eq!(
             v.get("database_split")
                 .unwrap()
@@ -1126,6 +1418,16 @@ plugins:
                 .unwrap()
                 .len(),
             2
+        );
+        assert_eq!(
+            v.get("runtime_progress")
+                .unwrap()
+                .get("plugin_filters")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            0
         );
     }
 
@@ -1173,8 +1475,12 @@ plugins:
         assert!(s.contains("fetch('status'"));
         assert!(!s.contains("fetch('/status'"));
         assert!(s.contains("Prometheus 指标"));
-        assert!(s.contains("初始化进度"));
+        assert!(s.contains("数据同步进度"));
+        assert!(s.contains("syncProgressTable"));
+        assert!(s.contains("langToggle"));
+        assert!(s.contains("Data Sync Progress"));
         assert!(s.contains("rawJson"));
+        assert!(!s.contains("id=\"pluginFilterSection\""));
         assert!(!s.contains("数据库拆分</a>"));
     }
 
@@ -1196,6 +1502,12 @@ plugins:
         let body = to_bytes(resp.into_body()).await.unwrap();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(s.contains("数据库拆分</a>"));
+        assert!(s.contains("插件过滤"));
+        assert!(s.contains("id=\"pluginFilterSection\""));
+        assert!(s.contains("columnInFilterTable"));
+        assert!(s.contains("input_total"));
+        assert!(s.contains("output_total"));
+        assert!(s.contains("Input Rows"));
 
         let req = actix_test::TestRequest::get().uri("/split").to_request();
         let resp = actix_test::call_service(&app, req).await;

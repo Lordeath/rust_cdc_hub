@@ -14,6 +14,7 @@ pub struct RuntimeProgress {
     pub initialization_started_at: i64,
     pub initialization_finished_at: i64,
     pub tables: BTreeMap<String, TableProgress>,
+    pub plugin_filters: BTreeMap<String, PluginFilterProgress>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -27,6 +28,17 @@ pub struct TableProgress {
     pub last_event_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginFilterProgress {
+    pub plugin_name: String,
+    pub table_name: String,
+    pub column_name: String,
+    pub input_total: u64,
+    pub output_total: u64,
+    pub filtered_total: u64,
+    pub last_event_at: i64,
+}
+
 impl RuntimeProgress {
     pub fn new() -> Self {
         RuntimeProgress {
@@ -35,6 +47,7 @@ impl RuntimeProgress {
             initialization_started_at: 0,
             initialization_finished_at: 0,
             tables: BTreeMap::new(),
+            plugin_filters: BTreeMap::new(),
         }
     }
 
@@ -94,6 +107,36 @@ impl RuntimeProgress {
         table.last_event_at = now;
     }
 
+    pub fn record_plugin_filter_result(
+        &mut self,
+        plugin_name: &str,
+        table_name: &str,
+        column_name: &str,
+        passed: bool,
+        now: i64,
+    ) {
+        let key = format!("{}|{}|{}", plugin_name, table_name, column_name);
+        let filter = self
+            .plugin_filters
+            .entry(key)
+            .or_insert_with(|| PluginFilterProgress {
+                plugin_name: plugin_name.to_string(),
+                table_name: table_name.to_string(),
+                column_name: column_name.to_string(),
+                input_total: 0,
+                output_total: 0,
+                filtered_total: 0,
+                last_event_at: 0,
+            });
+        filter.input_total += 1;
+        if passed {
+            filter.output_total += 1;
+        } else {
+            filter.filtered_total += 1;
+        }
+        filter.last_event_at = now;
+    }
+
     fn table_mut(&mut self, table_name: &str) -> &mut TableProgress {
         self.tables
             .entry(table_name.to_string())
@@ -116,7 +159,7 @@ impl Default for RuntimeProgress {
 }
 
 pub async fn begin_table_initialization(table_name: &str) {
-    // Modified By Codex 20260508 ITOPS-130877 记录初始化表进度供 Actix UI 展示
+    // Record initialization progress for the Actix UI runtime status.
     RUNTIME_PROGRESS
         .lock()
         .await
@@ -160,6 +203,22 @@ pub async fn record_filtered(table_name: &str) {
         .record_filtered(table_name, chrono::Utc::now().timestamp());
 }
 
+pub async fn record_plugin_filter_result(
+    plugin_name: &str,
+    table_name: &str,
+    column_name: &str,
+    passed: bool,
+) {
+    // Record the actual plugin filter field so the Dashboard can explain filter sources.
+    RUNTIME_PROGRESS.lock().await.record_plugin_filter_result(
+        plugin_name,
+        table_name,
+        column_name,
+        passed,
+        chrono::Utc::now().timestamp(),
+    );
+}
+
 pub async fn snapshot() -> RuntimeProgress {
     RUNTIME_PROGRESS.lock().await.clone()
 }
@@ -174,6 +233,7 @@ mod tests {
         assert!(!progress.initializing);
         assert!(progress.current_table.is_empty());
         assert!(progress.tables.is_empty());
+        assert!(progress.plugin_filters.is_empty());
     }
 
     #[test]
@@ -192,5 +252,30 @@ mod tests {
         assert_eq!(table.synced_total, 1);
         assert_eq!(table.filtered_total, 1);
         assert_eq!(table.last_pk, "1");
+    }
+
+    #[test]
+    fn runtime_progress_counts_plugin_filters_by_table_and_column() {
+        let mut progress = RuntimeProgress::new();
+        progress.record_plugin_filter_result("ColumnIn", "orders", "project_id", true, 10);
+        progress.record_plugin_filter_result("ColumnIn", "orders", "project_id", false, 11);
+        progress.record_plugin_filter_result("ColumnIn", "charges", "tenant_id", false, 12);
+
+        let orders = progress
+            .plugin_filters
+            .get("ColumnIn|orders|project_id")
+            .unwrap();
+        let charges = progress
+            .plugin_filters
+            .get("ColumnIn|charges|tenant_id")
+            .unwrap();
+        assert_eq!(orders.input_total, 2);
+        assert_eq!(orders.output_total, 1);
+        assert_eq!(orders.filtered_total, 1);
+        assert_eq!(orders.column_name, "project_id");
+        assert_eq!(charges.input_total, 1);
+        assert_eq!(charges.output_total, 0);
+        assert_eq!(charges.filtered_total, 1);
+        assert_eq!(charges.table_name, "charges");
     }
 }

@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 common = { path = "../../common" }
 async-trait = "0.1.89"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
