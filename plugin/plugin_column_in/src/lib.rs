@@ -2,6 +2,8 @@ use async_trait::async_trait;
 use common::runtime_progress;
 use common::{DataBuffer, Operation, Plugin, PluginConfig, Value};
 
+const NO_MATCHED_FILTER_COLUMN: &str = "__no_matched_filter_column__";
+
 pub struct PluginColumnIn {
     pub columns: Vec<String>,
     pub values: Vec<String>,
@@ -50,6 +52,13 @@ impl Plugin for PluginColumnIn {
             }
         }
         if contains_some_column.is_none() {
+            runtime_progress::record_plugin_filter_result(
+                "ColumnIn",
+                &data_buffer.table_name,
+                NO_MATCHED_FILTER_COLUMN,
+                true,
+            )
+            .await;
             return Ok(data_buffer.clone());
         }
         let to_compare: String = contains_some_column.resolve_string();
@@ -151,7 +160,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn column_in_keeps_existing_pass_when_no_configured_column_exists() {
+    async fn column_in_records_output_when_no_configured_column_exists() {
         let mut plugin = PluginColumnIn::new(&config());
         let table_name = "column_in_missing_column_orders";
         let data = buffer(
@@ -163,11 +172,15 @@ mod tests {
 
         assert!(result.is_ok());
         let snapshot = runtime_progress::snapshot().await;
-        assert!(
-            snapshot
-                .plugin_filters
-                .keys()
-                .all(|key| !key.contains(table_name))
-        );
+        let filter = snapshot
+            .plugin_filters
+            .get(&format!(
+                "ColumnIn|{}|{}",
+                table_name, NO_MATCHED_FILTER_COLUMN
+            ))
+            .unwrap();
+        assert_eq!(filter.input_total, 1);
+        assert_eq!(filter.output_total, 1);
+        assert_eq!(filter.filtered_total, 0);
     }
 }

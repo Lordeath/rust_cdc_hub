@@ -32,6 +32,7 @@ COPY source ./source
 # ---------- 正式编译 ----------
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,id=rust-cdc-hub-target,target=/app/target,sharing=locked \
     cargo build --release \
     && cp /app/target/release/rust_cdc_hub /tmp/rust_cdc_hub \
     && strip /tmp/rust_cdc_hub

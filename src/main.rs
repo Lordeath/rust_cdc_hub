@@ -610,11 +610,13 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     .progress-box .label { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
     .progress-box .value { font-size: 22px; font-weight: 800; overflow-wrap: anywhere; }
     .progress-box .value.compact { font-size: 16px; line-height: 1.45; letter-spacing: 0; }
-    .table-wrap { margin-top: 14px; overflow: auto; border: 1px solid rgba(148, 163, 184, 0.18); border-radius: 14px; }
+    .table-wrap { margin-top: 14px; overflow: auto; max-height: 560px; border: 1px solid rgba(148, 163, 184, 0.18); border-radius: 14px; }
     table { width: 100%; border-collapse: collapse; min-width: 620px; }
     th, td { padding: 12px 14px; border-bottom: 1px solid rgba(148, 163, 184, 0.13); text-align: left; font-size: 13px; }
-    th { color: var(--muted); font-weight: 700; background: rgba(2, 6, 23, 0.28); }
+    th { position: sticky; top: 0; z-index: 2; color: var(--muted); font-weight: 700; background: #101a2c; box-shadow: 0 1px 0 rgba(148, 163, 184, 0.18); }
     tr:last-child td { border-bottom: 0; }
+    tr.phase-initializing td { background: rgba(14, 165, 233, 0.26); color: #e0f2fe; font-weight: 800; }
+    tr.phase-initializing td:first-child { border-left: 4px solid #38bdf8; }
     .empty { color: var(--muted); padding: 14px; }
     .section { padding: 22px; }
     .section h2 { margin: 0 0 16px; font-size: 18px; }
@@ -733,6 +735,7 @@ const translations = {
     no_column_in_hits: '暂无 ColumnIn 过滤命中',
     no_table_sync: '暂无表级同步记录',
     no_source_error: '暂无 source 错误',
+    no_matched_filter_column: '未命中过滤字段',
     table_name: '表名',
     matched_column: '命中字段',
     input_rows: '入条数',
@@ -791,6 +794,7 @@ const translations = {
     no_column_in_hits: 'No ColumnIn filter hits',
     no_table_sync: 'No table-level sync records',
     no_source_error: 'No source errors',
+    no_matched_filter_column: 'No matched filter column',
     table_name: 'Table',
     matched_column: 'Matched Column',
     input_rows: 'Input Rows',
@@ -863,6 +867,33 @@ function kvRow(key, value) {
   const safe = value === null || value === undefined || value === '' ? '-' : value;
   return `<div class="kv-row"><span class="kv-key">${escapeHtml(key)}</span><span class="kv-value">${escapeHtml(safe)}</span></div>`;
 }
+function displayFilterColumn(columnName) {
+  return columnName === '__no_matched_filter_column__' ? t('no_matched_filter_column') : (columnName || '-');
+}
+function groupPluginFiltersByTableAndColumn(filters) {
+  const grouped = new Map();
+  for (const item of filters) {
+    const tableName = item.table_name || '-';
+    const columnName = item.column_name || '-';
+    const key = `${tableName}\u0000${columnName}`;
+    const current = grouped.get(key) || {
+      plugin_name: item.plugin_name || 'ColumnIn',
+      table_name: tableName,
+      column_name: columnName,
+      input_total: 0,
+      output_total: 0,
+      filtered_total: 0,
+      last_event_at: 0,
+    };
+    current.input_total += Number(item.input_total || 0);
+    current.output_total += Number(item.output_total || 0);
+    current.filtered_total += Number(item.filtered_total || 0);
+    current.last_event_at = Math.max(Number(current.last_event_at || 0), Number(item.last_event_at || 0));
+    grouped.set(key, current);
+  }
+  return Array.from(grouped.values())
+    .sort((a, b) => `${a.table_name}|${displayFilterColumn(a.column_name)}`.localeCompare(`${b.table_name}|${displayFilterColumn(b.column_name)}`));
+}
 function renderColumnInFilters(cfg, progress) {
   const section = el('pluginFilterSection');
   if (!section) return;
@@ -870,9 +901,10 @@ function renderColumnInFilters(cfg, progress) {
   const columnIn = plugins.find((plugin) => plugin.plugin_type === 'ColumnIn') || {};
   const columns = Array.isArray(columnIn.columns) ? columnIn.columns : [];
   const values = Array.isArray(columnIn.values) ? columnIn.values : [];
-  const filters = Object.values(progress.plugin_filters || {})
-    .filter((item) => item.plugin_name === 'ColumnIn')
-    .sort((a, b) => `${a.table_name}|${a.column_name}`.localeCompare(`${b.table_name}|${b.column_name}`));
+  const filters = groupPluginFiltersByTableAndColumn(
+    Object.values(progress.plugin_filters || {})
+      .filter((item) => item.plugin_name === 'ColumnIn')
+  );
   const total = filters.reduce((sum, item) => sum + Number(item.filtered_total || 0), 0);
   setText('columnInColumns', columns.join(', ') || '-');
   setText('columnInValues', values.join(', ') || '-');
@@ -883,7 +915,7 @@ function renderColumnInFilters(cfg, progress) {
   }
   const body = filters.map((item) => `<tr>
     <td>${escapeHtml(item.table_name || '-')}</td>
-    <td>${escapeHtml(item.column_name || '-')}</td>
+    <td>${escapeHtml(displayFilterColumn(item.column_name))}</td>
     <td>${escapeHtml(item.input_total ?? 0)}</td>
     <td>${escapeHtml(item.output_total ?? 0)}</td>
     <td>${escapeHtml(item.filtered_total ?? 0)}</td>
@@ -900,7 +932,7 @@ function renderSyncProgressTable(tables) {
   }
   const rows = [...tables]
     .sort((a, b) => String(a.table_name || '').localeCompare(String(b.table_name || '')))
-    .map((table) => `<tr>
+    .map((table) => `<tr class="${table.phase === 'initializing' ? 'phase-initializing' : ''}">
       <td>${escapeHtml(table.table_name || '-')}</td>
       <td>${escapeHtml(table.phase || '-')}</td>
       <td>${escapeHtml(table.read_total ?? 0)}</td>
@@ -1479,6 +1511,8 @@ plugins:
         assert!(s.contains("syncProgressTable"));
         assert!(s.contains("langToggle"));
         assert!(s.contains("Data Sync Progress"));
+        assert!(s.contains("position: sticky"));
+        assert!(s.contains("phase-initializing"));
         assert!(s.contains("rawJson"));
         assert!(!s.contains("id=\"pluginFilterSection\""));
         assert!(!s.contains("数据库拆分</a>"));
@@ -1508,6 +1542,8 @@ plugins:
         assert!(s.contains("input_total"));
         assert!(s.contains("output_total"));
         assert!(s.contains("Input Rows"));
+        assert!(s.contains("未命中过滤字段"));
+        assert!(s.contains("No matched filter column"));
 
         let req = actix_test::TestRequest::get().uri("/split").to_request();
         let resp = actix_test::call_service(&app, req).await;
