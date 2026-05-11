@@ -15,6 +15,7 @@ use sqlx::{MySql, Pool, Row};
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use sysinfo::{CpuRefreshKind, MemoryRefreshKind, Pid, ProcessRefreshKind, RefreshKind, System};
 use tokio::sync::Mutex;
 
 use chrono::Local;
@@ -80,6 +81,8 @@ struct UiState {
     last_source_error: Arc<Mutex<Option<String>>>,
     last_source_restart_at: Arc<AtomicI64>,
     source_restart_count: Arc<AtomicI64>,
+    system_monitor: Arc<Mutex<System>>,
+    process_pid: u32,
 }
 
 impl UiState {
@@ -119,11 +122,53 @@ impl UiState {
             last_source_error: Arc::new(Mutex::new(None)),
             last_source_restart_at: Arc::new(AtomicI64::new(0)),
             source_restart_count: Arc::new(AtomicI64::new(0)),
+            system_monitor: Arc::new(Mutex::new(System::new_with_specifics(
+                RefreshKind::new()
+                    .with_memory(MemoryRefreshKind::everything())
+                    .with_cpu(CpuRefreshKind::everything()),
+            ))),
+            process_pid: process::id(),
         }
     }
 
     async fn set_table_info_list(&self, table_info_list: Vec<TableInfoVo>) {
         *self.table_info_list.lock().await = table_info_list;
+    }
+
+    async fn resource_snapshot(&self) -> serde_json::Value {
+        let mut system = self.system_monitor.lock().await;
+        system.refresh_memory();
+        system.refresh_cpu();
+        let pid = Pid::from_u32(self.process_pid);
+        system.refresh_process_specifics(pid, ProcessRefreshKind::new().with_cpu().with_memory());
+        let process = system.process(pid);
+        let total_memory_bytes = system.total_memory();
+        let used_memory_bytes = system.used_memory();
+        let total_swap_bytes = system.total_swap();
+        let used_swap_bytes = system.used_swap();
+        let system_cpu_percent = system.global_cpu_info().cpu_usage();
+        let memory_percent = if total_memory_bytes == 0 {
+            0.0
+        } else {
+            used_memory_bytes as f64 * 100.0 / total_memory_bytes as f64
+        };
+        json!({
+            "system": {
+                "cpu_percent": system_cpu_percent,
+                "memory_total_bytes": total_memory_bytes,
+                "memory_used_bytes": used_memory_bytes,
+                "memory_percent": memory_percent,
+                "swap_total_bytes": total_swap_bytes,
+                "swap_used_bytes": used_swap_bytes,
+            },
+            "process": {
+                "pid": self.process_pid,
+                "cpu_percent": process.map(|p| p.cpu_usage()).unwrap_or(0.0),
+                "memory_bytes": process.map(|p| p.memory()).unwrap_or(0),
+                "virtual_memory_bytes": process.map(|p| p.virtual_memory()).unwrap_or(0),
+                "run_time_seconds": process.map(|p| p.run_time()).unwrap_or(0),
+            }
+        })
     }
 }
 
@@ -140,6 +185,7 @@ impl UiState {
         let timer_flush_count = self.timer_flush_count.load(Ordering::Relaxed);
         let last_source_restart_at = self.last_source_restart_at.load(Ordering::Relaxed);
         let runtime_progress = runtime_progress::snapshot().await;
+        let resources = self.resource_snapshot().await;
         let health_status = if last_source_error.is_some() {
             "degraded"
         } else if runtime_progress.initializing {
@@ -163,6 +209,7 @@ impl UiState {
             "source_restart_count": source_restart_count,
             "last_source_error": last_source_error,
             "runtime_progress": runtime_progress,
+            "resources": resources,
             "split_mode": split_snapshot.clone(),
             "database_split": split_snapshot.clone(),
             "links": {
@@ -194,6 +241,7 @@ impl UiState {
         let mut split = self.database_split.clone();
         if let Some(obj) = split.as_object_mut() {
             obj.insert("runtime_progress".to_string(), json!(runtime_progress));
+            obj.insert("resources".to_string(), self.resource_snapshot().await);
             obj.insert(
                 "cleanup".to_string(),
                 cleanup_summary_json(&self.config, &self.table_info_list.lock().await),
@@ -829,8 +877,9 @@ const SPLIT_HTML: &str = r#"<!doctype html>
     .summary-box { border: 1px solid rgba(148, 163, 184, 0.18); border-radius: 14px; padding: 12px; background: rgba(2, 6, 23, 0.26); }
     .summary-box .label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
     .summary-box .value { font-size: 22px; font-weight: 800; color: var(--text); }
+    .resource-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
     pre { margin: 16px 0 0; max-height: 360px; overflow: auto; padding: 14px; border-radius: 14px; background: #020617; border: 1px solid var(--line); color: #bae6fd; font-size: 12px; line-height: 1.6; }
-    @media (max-width: 780px) { .grid, .topbar { grid-template-columns: 1fr; display: grid; } .topbar { align-items: start; } }
+    @media (max-width: 780px) { .grid, .topbar { grid-template-columns: 1fr; display: grid; } .resource-grid { grid-template-columns: repeat(2, 1fr); } .topbar { align-items: start; } }
   </style>
 </head>
 <body>
@@ -865,6 +914,15 @@ const SPLIT_HTML: &str = r#"<!doctype html>
         <div id="progressTableWrap" style="margin-top:14px"></div>
       </div>
       <div class="card wide">
+        <h2>资源占用</h2>
+        <div class="resource-grid">
+          <div class="summary-box"><div class="label">机器 CPU</div><div class="value" id="splitSystemCpu">-</div></div>
+          <div class="summary-box"><div class="label">机器内存</div><div class="value" id="splitSystemMemory">-</div></div>
+          <div class="summary-box"><div class="label">进程 CPU</div><div class="value" id="splitProcessCpu">-</div></div>
+          <div class="summary-box"><div class="label">进程内存</div><div class="value" id="splitProcessMemory">-</div></div>
+        </div>
+      </div>
+      <div class="card wide">
         <h2>清理 SQL</h2>
         <div class="notice">
           工具只生成 SQL，不执行删除。SQL 基于 sink 中已同步数据的主键生成，请下载后人工检查，并在业务低峰执行。数据库拆分模式不允许和会修改数据的插件混用。
@@ -893,6 +951,20 @@ function row(key, value) {
 }
 function rows(obj, keys) {
   return keys.map(([label, key]) => row(label, obj?.[key])).join('');
+}
+function fmtPercent(value) {
+  const n = Number(value || 0);
+  return `${n.toFixed(1)}%`;
+}
+function fmtBytes(bytes) {
+  let value = Number(bytes || 0);
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index += 1;
+  }
+  return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 function renderProgressTable(tables) {
   if (!tables.length) return '<div class="empty">暂无运行态统计</div>';
@@ -946,6 +1018,14 @@ function renderDryRunResult(data) {
     <div style="margin-top:14px">${tableHtml}</div>
     ${renderInvalidCleanupTables(data.invalid_tables || [])}
   `;
+}
+function renderSplitResources(resources) {
+  const system = resources?.system || {};
+  const processInfo = resources?.process || {};
+  el('splitSystemCpu').textContent = fmtPercent(system.cpu_percent);
+  el('splitSystemMemory').textContent = `${fmtBytes(system.memory_used_bytes)} / ${fmtBytes(system.memory_total_bytes)}`;
+  el('splitProcessCpu').textContent = fmtPercent(processInfo.cpu_percent);
+  el('splitProcessMemory').textContent = `${fmtBytes(processInfo.memory_bytes)} · pid ${processInfo.pid ?? '-'}`;
 }
 function cleanupRequestBody() {
   return JSON.stringify({ tables: [] });
@@ -1020,6 +1100,7 @@ async function loadSplitStatus() {
     row('过滤', filteredTotal),
   ].join('');
   el('progressTableWrap').innerHTML = renderProgressTable(tables);
+  renderSplitResources(data.resources);
   el('cleanupTableWrap').innerHTML = renderCleanupTables(data.cleanup?.tables || []);
   el('cleanupInvalidWrap').innerHTML = renderInvalidCleanupTables(data.cleanup?.invalid_tables || []);
   el('rawJson').textContent = JSON.stringify(data, null, 2);
@@ -1120,6 +1201,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     .metric .label { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
     .metric .value { font-size: 30px; font-weight: 800; letter-spacing: -0.04em; }
     .metric .hint { margin-top: 8px; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .resource-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
     .content-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
     .plugin-filter-section { margin-bottom: 16px; }
     .section-title-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
@@ -1160,8 +1242,8 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     .footer { margin-top: 16px; color: var(--muted); text-align: center; font-size: 12px; }
     .top-actions { display: flex; justify-content: flex-end; margin-bottom: 12px; }
     .lang-toggle { border: 1px solid rgba(56, 189, 248, 0.42); color: #bae6fd; background: rgba(15, 23, 42, 0.86); border-radius: 999px; padding: 8px 12px; font-weight: 800; cursor: pointer; }
-    @media (max-width: 900px) { .hero, .content-grid { grid-template-columns: 1fr; } .metrics-grid, .progress-grid, .plugin-filter-grid { grid-template-columns: repeat(2, 1fr); } }
-    @media (max-width: 560px) { .shell { width: min(100% - 20px, 1180px); padding-top: 18px; } .metrics-grid, .progress-grid, .plugin-filter-grid { grid-template-columns: 1fr; } .hero-main, .hero-side, .section, .metric { padding: 16px; } }
+    @media (max-width: 900px) { .hero, .content-grid { grid-template-columns: 1fr; } .metrics-grid, .progress-grid, .plugin-filter-grid, .resource-grid { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 560px) { .shell { width: min(100% - 20px, 1180px); padding-top: 18px; } .metrics-grid, .progress-grid, .plugin-filter-grid, .resource-grid { grid-template-columns: 1fr; } .hero-main, .hero-side, .section, .metric { padding: 16px; } }
   </style>
 </head>
 <body>
@@ -1212,6 +1294,16 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     </section>
 
     <section class="card section" style="margin-top:16px">
+      <h2 data-i18n="resource_usage">资源占用</h2>
+      <div class="resource-grid">
+        <div class="progress-box"><div class="label" data-i18n="system_cpu">机器 CPU</div><div class="value" id="systemCpu">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="system_memory">机器内存</div><div class="value compact" id="systemMemory">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="process_cpu">进程 CPU</div><div class="value" id="processCpu">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="process_memory">进程内存</div><div class="value compact" id="processMemory">-</div><div class="hint" id="processPid">pid: -</div></div>
+      </div>
+    </section>
+
+    <section class="card section" style="margin-top:16px">
       <h2 data-i18n="sync_progress">数据同步进度</h2>
       <div class="progress-grid">
         <div class="progress-box"><div class="label" data-i18n="current_status">当前状态</div><div class="value" id="progressState">-</div></div>
@@ -1257,6 +1349,11 @@ const translations = {
     config_summary: '配置摘要',
     recent_error: '最近错误',
     last_updated: '最后更新',
+    resource_usage: '资源占用',
+    system_cpu: '机器 CPU',
+    system_memory: '机器内存',
+    process_cpu: '进程 CPU',
+    process_memory: '进程内存',
     sync_progress: '数据同步进度',
     current_status: '当前状态',
     current_table: '当前表',
@@ -1320,6 +1417,11 @@ const translations = {
     config_summary: 'Config Summary',
     recent_error: 'Recent Error',
     last_updated: 'Last Updated',
+    resource_usage: 'Resource Usage',
+    system_cpu: 'System CPU',
+    system_memory: 'System Memory',
+    process_cpu: 'Process CPU',
+    process_memory: 'Process Memory',
     sync_progress: 'Data Sync Progress',
     current_status: 'Current Status',
     current_table: 'Current Table',
@@ -1395,6 +1497,20 @@ function fmtDuration(seconds) {
   if (h > 0) return `${h}h ${m}m ${s}s`;
   if (m > 0) return `${m}m ${s}s`;
   return `${s}s`;
+}
+function fmtPercent(value) {
+  const n = Number(value || 0);
+  return `${n.toFixed(1)}%`;
+}
+function fmtBytes(bytes) {
+  let value = Number(bytes || 0);
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index += 1;
+  }
+  return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 function setText(id, value) { el(id).textContent = value ?? '-'; }
 function escapeHtml(value) {
@@ -1543,6 +1659,15 @@ function renderInitializationTiming(progress, now) {
   setText('initializationFinishedAt', finishedAt > 0 ? fmtTs(finishedAt) : t('initializing_running'));
   setText('initializationDuration', fmtDuration(duration));
 }
+function renderResources(resources) {
+  const system = resources?.system || {};
+  const processInfo = resources?.process || {};
+  setText('systemCpu', fmtPercent(system.cpu_percent));
+  setText('systemMemory', `${fmtBytes(system.memory_used_bytes)} / ${fmtBytes(system.memory_total_bytes)} (${fmtPercent(system.memory_percent)})`);
+  setText('processCpu', fmtPercent(processInfo.cpu_percent));
+  setText('processMemory', fmtBytes(processInfo.memory_bytes));
+  setText('processPid', `pid: ${processInfo.pid ?? '-'}`);
+}
 function renderStatusData(data) {
     latestStatus = data;
     const cfg = data.config || {};
@@ -1570,6 +1695,7 @@ function renderStatusData(data) {
     setText('progressTable', progress.current_table || '-');
     setText('progressReadSynced', `${progressRead} / ${progressSynced}`);
     setText('progressFiltered', progressFiltered);
+    renderResources(data.resources);
     renderInitializationTiming(progress, data.now);
     renderColumnInFilters(cfg, progress);
     renderSyncProgressTable(progressTables);
@@ -2103,6 +2229,35 @@ plugins:
         assert!(v.get("source_restart_count").is_some());
         assert!(v.get("last_source_error").is_some());
         assert!(v.get("runtime_progress").is_some());
+        let resources = v.get("resources").unwrap();
+        assert!(resources.get("system").is_some());
+        assert!(resources.get("process").is_some());
+        assert!(
+            resources
+                .get("system")
+                .unwrap()
+                .get("cpu_percent")
+                .unwrap()
+                .is_number()
+        );
+        assert!(
+            resources
+                .get("system")
+                .unwrap()
+                .get("memory_total_bytes")
+                .unwrap()
+                .is_number()
+        );
+        assert_eq!(
+            resources
+                .get("process")
+                .unwrap()
+                .get("pid")
+                .unwrap()
+                .as_u64()
+                .unwrap(),
+            process::id() as u64
+        );
         assert!(
             v.get("runtime_progress")
                 .unwrap()
@@ -2153,6 +2308,8 @@ plugins:
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v.get("enabled").unwrap().as_bool().unwrap(), true);
         assert!(v.get("runtime_progress").is_some());
+        assert!(v.get("resources").unwrap().get("system").is_some());
+        assert!(v.get("resources").unwrap().get("process").is_some());
         assert_eq!(
             v.get("cleanup")
                 .unwrap()
@@ -2247,6 +2404,11 @@ plugins:
         assert!(s.contains("Initialization Duration"));
         assert!(s.contains("langToggle"));
         assert!(s.contains("Data Sync Progress"));
+        assert!(s.contains("资源占用"));
+        assert!(s.contains("机器 CPU"));
+        assert!(s.contains("进程内存"));
+        assert!(s.contains("Resource Usage"));
+        assert!(s.contains("function renderResources"));
         assert!(s.contains("tableSortState"));
         assert!(s.contains("syncProgress: { key: 'last_event_at', dir: 'desc' }"));
         assert!(s.contains("function setTableSort"));
@@ -2302,5 +2464,9 @@ plugins:
         assert!(s.contains("api/split/cleanup/sql"));
         assert!(s.contains("fetch('api/split/status'"));
         assert!(!s.contains("fetch('/api/split/status'"));
+        assert!(s.contains("资源占用"));
+        assert!(s.contains("splitSystemCpu"));
+        assert!(s.contains("splitProcessMemory"));
+        assert!(s.contains("function renderSplitResources"));
     }
 }
