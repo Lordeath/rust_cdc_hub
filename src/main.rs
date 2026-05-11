@@ -616,6 +616,9 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     table { width: 100%; border-collapse: collapse; min-width: 620px; }
     th, td { padding: 12px 14px; border-bottom: 1px solid rgba(148, 163, 184, 0.13); text-align: left; font-size: 13px; }
     th { position: sticky; top: 0; z-index: 2; color: var(--muted); font-weight: 700; background: #101a2c; box-shadow: 0 1px 0 rgba(148, 163, 184, 0.18); }
+    th.sortable { cursor: pointer; user-select: none; }
+    th.sortable:hover { color: var(--text); background: #14213a; }
+    .sort-indicator { margin-left: 6px; color: var(--accent); font-size: 11px; }
     tr:last-child td { border-bottom: 0; }
     tr.phase-initializing td { background: rgba(14, 165, 233, 0.26); color: #e0f2fe; font-weight: 800; }
     tr.phase-initializing td:first-child { border-left: 4px solid #38bdf8; }
@@ -842,6 +845,10 @@ const translations = {
 };
 let currentLang = localStorage.getItem('rustCdcHubLang') || 'zh';
 let latestStatus = null;
+const tableSortState = {
+  pluginFilters: { key: 'last_event_at', dir: 'desc' },
+  syncProgress: { key: 'last_event_at', dir: 'desc' },
+};
 function t(key) {
   return translations[currentLang]?.[key] || translations.zh[key] || key;
 }
@@ -885,6 +892,45 @@ function kvRow(key, value) {
 function displayFilterColumn(columnName) {
   return columnName === '__no_matched_filter_column__' ? t('no_matched_filter_column') : (columnName || '-');
 }
+function sortValue(item, key) {
+  if (key === 'column_name') return displayFilterColumn(item.column_name);
+  const value = item?.[key];
+  if (typeof value === 'number') return value;
+  if (value === null || value === undefined) return '';
+  return String(value);
+}
+function compareRows(a, b, key, dir) {
+  const av = sortValue(a, key);
+  const bv = sortValue(b, key);
+  let result;
+  if (typeof av === 'number' && typeof bv === 'number') {
+    result = av - bv;
+  } else {
+    result = String(av).localeCompare(String(bv), undefined, { numeric: true, sensitivity: 'base' });
+  }
+  if (result === 0 && key !== 'table_name') {
+    result = String(a.table_name || '').localeCompare(String(b.table_name || ''), undefined, { numeric: true, sensitivity: 'base' });
+  }
+  return dir === 'asc' ? result : -result;
+}
+function sortRows(rows, tableKey) {
+  const state = tableSortState[tableKey] || { key: 'last_event_at', dir: 'desc' };
+  return [...rows].sort((a, b) => compareRows(a, b, state.key, state.dir));
+}
+function sortHeader(tableKey, columnKey, label) {
+  const state = tableSortState[tableKey] || {};
+  const active = state.key === columnKey;
+  const indicator = active ? `<span class="sort-indicator">${state.dir === 'asc' ? '▲' : '▼'}</span>` : '';
+  return `<th class="sortable" onclick="setTableSort('${tableKey}', '${columnKey}')">${escapeHtml(label)}${indicator}</th>`;
+}
+function setTableSort(tableKey, columnKey) {
+  const state = tableSortState[tableKey] || { key: 'last_event_at', dir: 'desc' };
+  tableSortState[tableKey] = {
+    key: columnKey,
+    dir: state.key === columnKey && state.dir === 'desc' ? 'asc' : 'desc',
+  };
+  if (latestStatus) renderStatusData(latestStatus);
+}
 function groupPluginFiltersByTableAndColumn(filters) {
   const grouped = new Map();
   for (const item of filters) {
@@ -906,8 +952,7 @@ function groupPluginFiltersByTableAndColumn(filters) {
     current.last_event_at = Math.max(Number(current.last_event_at || 0), Number(item.last_event_at || 0));
     grouped.set(key, current);
   }
-  return Array.from(grouped.values())
-    .sort((a, b) => `${a.table_name}|${displayFilterColumn(a.column_name)}`.localeCompare(`${b.table_name}|${displayFilterColumn(b.column_name)}`));
+  return Array.from(grouped.values());
 }
 function renderColumnInFilters(cfg, progress) {
   const section = el('pluginFilterSection');
@@ -928,7 +973,8 @@ function renderColumnInFilters(cfg, progress) {
     el('columnInFilterTable').innerHTML = `<div class="empty">${escapeHtml(t('no_column_in_hits'))}</div>`;
     return;
   }
-  const body = filters.map((item) => `<tr>
+  const sortedFilters = sortRows(filters, 'pluginFilters');
+  const body = sortedFilters.map((item) => `<tr>
     <td>${escapeHtml(item.table_name || '-')}</td>
     <td>${escapeHtml(displayFilterColumn(item.column_name))}</td>
     <td>${escapeHtml(item.input_total ?? 0)}</td>
@@ -936,7 +982,7 @@ function renderColumnInFilters(cfg, progress) {
     <td>${escapeHtml(item.filtered_total ?? 0)}</td>
     <td>${escapeHtml(fmtTs(item.last_event_at))}</td>
   </tr>`).join('');
-  el('columnInFilterTable').innerHTML = `<table><thead><tr><th>${escapeHtml(t('table_name'))}</th><th>${escapeHtml(t('matched_column'))}</th><th>${escapeHtml(t('input_rows'))}</th><th>${escapeHtml(t('output_rows'))}</th><th>${escapeHtml(t('filtered_count'))}</th><th>${escapeHtml(t('last_event_at'))}</th></tr></thead><tbody>${body}</tbody></table>`;
+  el('columnInFilterTable').innerHTML = `<table><thead><tr>${sortHeader('pluginFilters', 'table_name', t('table_name'))}${sortHeader('pluginFilters', 'column_name', t('matched_column'))}${sortHeader('pluginFilters', 'input_total', t('input_rows'))}${sortHeader('pluginFilters', 'output_total', t('output_rows'))}${sortHeader('pluginFilters', 'filtered_total', t('filtered_count'))}${sortHeader('pluginFilters', 'last_event_at', t('last_event_at'))}</tr></thead><tbody>${body}</tbody></table>`;
 }
 function renderSyncProgressTable(tables) {
   const target = el('syncProgressTable');
@@ -945,8 +991,7 @@ function renderSyncProgressTable(tables) {
     target.innerHTML = `<div class="empty">${escapeHtml(t('no_table_sync'))}</div>`;
     return;
   }
-  const rows = [...tables]
-    .sort((a, b) => String(a.table_name || '').localeCompare(String(b.table_name || '')))
+  const rows = sortRows(tables, 'syncProgress')
     .map((table) => `<tr class="${table.phase === 'initializing' ? 'phase-initializing' : ''}">
       <td>${escapeHtml(table.table_name || '-')}</td>
       <td>${escapeHtml(table.phase || '-')}</td>
@@ -957,7 +1002,7 @@ function renderSyncProgressTable(tables) {
       <td>${escapeHtml(fmtTs(table.last_event_at))}</td>
     </tr>`)
     .join('');
-  target.innerHTML = `<table><thead><tr><th>${escapeHtml(t('table_name'))}</th><th>${escapeHtml(t('phase'))}</th><th>${escapeHtml(t('read'))}</th><th>${escapeHtml(t('sink_written'))}</th><th>${escapeHtml(t('filtered'))}</th><th>${escapeHtml(t('last_pk'))}</th><th>${escapeHtml(t('last_event_at'))}</th></tr></thead><tbody>${rows}</tbody></table>`;
+  target.innerHTML = `<table><thead><tr>${sortHeader('syncProgress', 'table_name', t('table_name'))}${sortHeader('syncProgress', 'phase', t('phase'))}${sortHeader('syncProgress', 'read_total', t('read'))}${sortHeader('syncProgress', 'synced_total', t('sink_written'))}${sortHeader('syncProgress', 'filtered_total', t('filtered'))}${sortHeader('syncProgress', 'last_pk', t('last_pk'))}${sortHeader('syncProgress', 'last_event_at', t('last_event_at'))}</tr></thead><tbody>${rows}</tbody></table>`;
 }
 function renderInitializationTiming(progress, now) {
   const timingGrid = el('initializationTimingGrid');
@@ -1560,6 +1605,10 @@ plugins:
         assert!(s.contains("Initialization Duration"));
         assert!(s.contains("langToggle"));
         assert!(s.contains("Data Sync Progress"));
+        assert!(s.contains("tableSortState"));
+        assert!(s.contains("syncProgress: { key: 'last_event_at', dir: 'desc' }"));
+        assert!(s.contains("function setTableSort"));
+        assert!(s.contains("onclick=\"setTableSort"));
         assert!(s.contains("position: sticky"));
         assert!(s.contains("phase-initializing"));
         assert!(s.contains("rawJson"));
@@ -1588,6 +1637,8 @@ plugins:
         assert!(s.contains("插件过滤"));
         assert!(s.contains("id=\"pluginFilterSection\""));
         assert!(s.contains("columnInFilterTable"));
+        assert!(s.contains("pluginFilters: { key: 'last_event_at', dir: 'desc' }"));
+        assert!(s.contains("sortHeader('pluginFilters'"));
         assert!(s.contains("input_total"));
         assert!(s.contains("output_total"));
         assert!(s.contains("Input Rows"));
