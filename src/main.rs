@@ -1,13 +1,17 @@
 extern crate core;
 
-use actix_web::{App, HttpResponse, HttpServer, Responder, web};
+use actix_web::{App, HttpResponse, HttpServer, Responder, http::header, web};
 use common::metrics::APP_RESTART_COUNT;
 use common::runtime_progress;
-use common::{CdcConfig, FlushByOperation, Plugin, PluginConfig, PluginType, Sink, Source};
+use common::{
+    CdcConfig, FlushByOperation, Plugin, PluginConfig, PluginType, Sink, Source, TableInfoVo,
+    get_mysql_pool_by_url,
+};
 use prometheus::{Encoder, TextEncoder, gather};
 use serde_json::json;
 use sink::SinkFactory;
 use source::SourceFactory;
+use sqlx::{MySql, Pool, Row};
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -66,6 +70,8 @@ fn ensure_default_backtrace() {
 #[derive(Clone)]
 struct UiState {
     started_at: i64,
+    config: CdcConfig,
+    table_info_list: Arc<Mutex<Vec<TableInfoVo>>>,
     config_summary: serde_json::Value,
     database_split: serde_json::Value,
     column_in_enabled: bool,
@@ -103,6 +109,8 @@ impl UiState {
         });
         UiState {
             started_at,
+            config: config.clone(),
+            table_info_list: Arc::new(Mutex::new(Vec::new())),
             config_summary,
             database_split,
             column_in_enabled,
@@ -112,6 +120,10 @@ impl UiState {
             last_source_restart_at: Arc::new(AtomicI64::new(0)),
             source_restart_count: Arc::new(AtomicI64::new(0)),
         }
+    }
+
+    async fn set_table_info_list(&self, table_info_list: Vec<TableInfoVo>) {
+        *self.table_info_list.lock().await = table_info_list;
     }
 }
 
@@ -135,7 +147,9 @@ impl UiState {
         } else {
             "running"
         };
-        let split_snapshot = self.split_snapshot_with_progress(runtime_progress.clone());
+        let split_snapshot = self
+            .split_snapshot_with_progress(runtime_progress.clone())
+            .await;
 
         json!({
             "status": health_status,
@@ -170,15 +184,20 @@ impl UiState {
 
     async fn split_snapshot(&self) -> serde_json::Value {
         self.split_snapshot_with_progress(runtime_progress::snapshot().await)
+            .await
     }
 
-    fn split_snapshot_with_progress(
+    async fn split_snapshot_with_progress(
         &self,
         runtime_progress: runtime_progress::RuntimeProgress,
     ) -> serde_json::Value {
         let mut split = self.database_split.clone();
         if let Some(obj) = split.as_object_mut() {
             obj.insert("runtime_progress".to_string(), json!(runtime_progress));
+            obj.insert(
+                "cleanup".to_string(),
+                cleanup_summary_json(&self.config, &self.table_info_list.lock().await),
+            );
         }
         split
     }
@@ -196,6 +215,195 @@ async fn ui_split_status(state: web::Data<UiState>) -> impl Responder {
         }));
     }
     HttpResponse::Ok().json(state.split_snapshot().await)
+}
+
+async fn mysql_pool_for_cleanup(config: &CdcConfig, source: bool) -> Result<Pool<MySql>, String> {
+    get_mysql_pool_by_url(
+        &mysql_connection_url(config, source),
+        if source {
+            "database split cleanup source"
+        } else {
+            "database split cleanup sink"
+        },
+    )
+    .await
+}
+
+async fn cleanup_count(pool: &Pool<MySql>, target: &CleanupTarget) -> Result<i64, String> {
+    let placeholders = vec!["?"; target.filter_values.len()].join(", ");
+    let sql = format!(
+        "SELECT COUNT(*) AS cnt FROM {} WHERE {} IN ({})",
+        quoted_identifier(&target.table_name),
+        quoted_identifier(&target.filter_column),
+        placeholders
+    );
+    let mut query = sqlx::query(&sql);
+    for value in &target.filter_values {
+        query = query.bind(value);
+    }
+    let row = query.fetch_one(pool).await.map_err(|e| e.to_string())?;
+    row.try_get::<i64, _>("cnt").map_err(|e| e.to_string())
+}
+
+async fn cleanup_pk_values(
+    pool: &Pool<MySql>,
+    target: &CleanupTarget,
+) -> Result<Vec<String>, String> {
+    let placeholders = vec!["?"; target.filter_values.len()].join(", ");
+    let sql = format!(
+        "SELECT {} AS pk_value FROM {} WHERE {} IN ({}) ORDER BY {}",
+        quoted_identifier(&target.pk_column),
+        quoted_identifier(&target.table_name),
+        quoted_identifier(&target.filter_column),
+        placeholders,
+        quoted_identifier(&target.pk_column)
+    );
+    let mut query = sqlx::query(&sql);
+    for value in &target.filter_values {
+        query = query.bind(value);
+    }
+    let rows = query.fetch_all(pool).await.map_err(|e| e.to_string())?;
+    rows.into_iter()
+        .map(|row| {
+            row.try_get::<String, _>("pk_value")
+                .or_else(|_| row.try_get::<i64, _>("pk_value").map(|v| v.to_string()))
+                .or_else(|_| row.try_get::<u64, _>("pk_value").map(|v| v.to_string()))
+                .or_else(|_| row.try_get::<i32, _>("pk_value").map(|v| v.to_string()))
+                .or_else(|_| row.try_get::<u32, _>("pk_value").map(|v| v.to_string()))
+                .map_err(|e| e.to_string())
+        })
+        .collect()
+}
+
+async fn ui_split_cleanup_dry_run(
+    state: web::Data<UiState>,
+    body: web::Json<serde_json::Value>,
+) -> impl Responder {
+    if !state.database_split_enabled() {
+        return HttpResponse::NotFound().json(json!({
+            "enabled": false,
+            "message": "DatabaseSplit plugin is not enabled"
+        }));
+    }
+    let (targets, invalid_tables) =
+        cleanup_targets(&state.config, &state.table_info_list.lock().await);
+    let targets = filter_targets_by_request(targets, &request_tables(&body));
+    if targets.is_empty() {
+        return HttpResponse::BadRequest().json(json!({
+            "message": "no cleanup tables available",
+            "invalid_tables": invalid_tables.iter().map(|item| json!({
+                "table_name": item.table_name,
+                "reason": item.reason,
+                "matched_columns": item.matched_columns,
+            })).collect::<Vec<_>>()
+        }));
+    }
+    let pool = match mysql_pool_for_cleanup(&state.config, true).await {
+        Ok(pool) => pool,
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(json!({ "message": e }));
+        }
+    };
+    let mut results = Vec::new();
+    let mut total_count = 0i64;
+    for target in targets {
+        match cleanup_count(&pool, &target).await {
+            Ok(count) => {
+                total_count += count;
+                results.push(json!({
+                    "table_name": target.table_name,
+                    "pk_column": target.pk_column,
+                    "filter_column": target.filter_column,
+                    "filter_values": target.filter_values,
+                    "count": count,
+                }));
+            }
+            Err(e) => {
+                return HttpResponse::InternalServerError().json(json!({
+                    "message": e,
+                    "table_name": target.table_name
+                }));
+            }
+        }
+    }
+    HttpResponse::Ok().json(json!({
+        "total_count": total_count,
+        "tables": results,
+        "invalid_tables": invalid_tables.iter().map(|item| json!({
+            "table_name": item.table_name,
+            "reason": item.reason,
+            "matched_columns": item.matched_columns,
+        })).collect::<Vec<_>>()
+    }))
+}
+
+async fn ui_split_cleanup_sql(
+    state: web::Data<UiState>,
+    body: web::Json<serde_json::Value>,
+) -> impl Responder {
+    if !state.database_split_enabled() {
+        return HttpResponse::NotFound().json(json!({
+            "enabled": false,
+            "message": "DatabaseSplit plugin is not enabled"
+        }));
+    }
+    if state.config.sink_type.to_string() != "MySQL" {
+        return HttpResponse::BadRequest().json(json!({
+            "message": "cleanup SQL generation only supports MySQL sink"
+        }));
+    }
+    let (targets, invalid_tables) =
+        cleanup_targets(&state.config, &state.table_info_list.lock().await);
+    let targets = filter_targets_by_request(targets, &request_tables(&body));
+    if targets.is_empty() {
+        return HttpResponse::BadRequest().json(json!({
+            "message": "no cleanup tables available",
+            "invalid_tables": invalid_tables.iter().map(|item| json!({
+                "table_name": item.table_name,
+                "reason": item.reason,
+                "matched_columns": item.matched_columns,
+            })).collect::<Vec<_>>()
+        }));
+    }
+    let pool = match mysql_pool_for_cleanup(&state.config, false).await {
+        Ok(pool) => pool,
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(json!({ "message": e }));
+        }
+    };
+    let batch_size = request_batch_size(&body);
+    let mut sql = String::from(
+        "-- Generated by rust_cdc_hub DatabaseSplit.\n-- Review before execution. This tool does not execute DELETE.\n\n",
+    );
+    let mut total_rows = 0usize;
+    for target in targets {
+        match cleanup_pk_values(&pool, &target).await {
+            Ok(pk_values) => {
+                total_rows += pk_values.len();
+                sql.push_str(&build_delete_sql_batches(&target, &pk_values, batch_size));
+            }
+            Err(e) => {
+                return HttpResponse::InternalServerError().json(json!({
+                    "message": e,
+                    "table_name": target.table_name
+                }));
+            }
+        }
+    }
+    if total_rows == 0 {
+        sql.push_str("-- No rows matched cleanup filters in sink.\n");
+    }
+    let filename = format!(
+        "database_split_cleanup_{}.sql",
+        Local::now().format("%Y%m%d_%H%M%S")
+    );
+    HttpResponse::Ok()
+        .insert_header((header::CONTENT_TYPE, "text/sql; charset=utf-8"))
+        .insert_header((
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", filename),
+        ))
+        .body(sql)
 }
 
 async fn ui_metrics() -> impl Responder {
@@ -237,6 +445,18 @@ fn plugin_config<'a>(config: &'a CdcConfig, plugin_type: PluginType) -> Option<&
         .find(|plugin| plugin.plugin_type.to_string() == plugin_type.to_string())
 }
 
+fn validate_database_split_plugins(config: &CdcConfig) -> Result<(), String> {
+    if plugin_config(config, PluginType::DatabaseSplit).is_some()
+        && plugin_config(config, PluginType::Plus).is_some()
+    {
+        return Err(
+            "DatabaseSplit cannot be used with Plus because cleanup SQL depends on original primary keys and filter columns"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn configured_plugin_values(config: &CdcConfig, plugin_type: PluginType, key: &str) -> Vec<String> {
     plugin_config(config, plugin_type)
         .map(|plugin| {
@@ -248,6 +468,199 @@ fn configured_plugin_values(config: &CdcConfig, plugin_type: PluginType, key: &s
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct CleanupTarget {
+    table_name: String,
+    pk_column: String,
+    filter_column: String,
+    filter_values: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct InvalidCleanupTarget {
+    table_name: String,
+    reason: String,
+    matched_columns: Vec<String>,
+}
+
+fn cleanup_targets(
+    config: &CdcConfig,
+    table_info_list: &[TableInfoVo],
+) -> (Vec<CleanupTarget>, Vec<InvalidCleanupTarget>) {
+    let filter_columns = configured_plugin_values(config, PluginType::ColumnIn, "columns");
+    let filter_values = configured_plugin_values(config, PluginType::ColumnIn, "values");
+    if filter_columns.is_empty() || filter_values.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut targets = Vec::new();
+    let mut invalid = Vec::new();
+    for table_info in table_info_list {
+        let matched_columns: Vec<String> = filter_columns
+            .iter()
+            .filter(|filter_column| {
+                table_info
+                    .columns
+                    .iter()
+                    .any(|column| column.eq_ignore_ascii_case(filter_column))
+            })
+            .cloned()
+            .collect();
+        if matched_columns.is_empty() {
+            continue;
+        }
+        if table_info.pk_column.trim().is_empty() {
+            invalid.push(InvalidCleanupTarget {
+                table_name: table_info.table_name.clone(),
+                reason: "missing primary key".to_string(),
+                matched_columns,
+            });
+            continue;
+        }
+        if matched_columns.len() > 1 {
+            invalid.push(InvalidCleanupTarget {
+                table_name: table_info.table_name.clone(),
+                reason: "matched multiple ColumnIn columns".to_string(),
+                matched_columns,
+            });
+            continue;
+        }
+        targets.push(CleanupTarget {
+            table_name: table_info.table_name.clone(),
+            pk_column: table_info.pk_column.clone(),
+            filter_column: matched_columns[0].clone(),
+            filter_values: filter_values.clone(),
+        });
+    }
+    targets.sort_by(|a, b| a.table_name.cmp(&b.table_name));
+    invalid.sort_by(|a, b| a.table_name.cmp(&b.table_name));
+    (targets, invalid)
+}
+
+fn cleanup_summary_json(config: &CdcConfig, table_info_list: &[TableInfoVo]) -> serde_json::Value {
+    let (targets, invalid) = cleanup_targets(config, table_info_list);
+    json!({
+        "supported": config.sink_type.to_string() == "MySQL",
+        "tables": targets.iter().map(|target| json!({
+            "table_name": target.table_name,
+            "pk_column": target.pk_column,
+            "filter_column": target.filter_column,
+            "filter_values": target.filter_values,
+        })).collect::<Vec<_>>(),
+        "invalid_tables": invalid.iter().map(|item| json!({
+            "table_name": item.table_name,
+            "reason": item.reason,
+            "matched_columns": item.matched_columns,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn mysql_connection_url(config: &CdcConfig, source: bool) -> String {
+    let (username, password, host, port, database) = if source {
+        (
+            config.source("username", 0),
+            config.source("password", 0),
+            config.source("host", 0),
+            config.source("port", 0),
+            config.source("database", 0),
+        )
+    } else {
+        (
+            config.first_sink("username"),
+            config.first_sink("password"),
+            config.first_sink("host"),
+            config.first_sink("port"),
+            config.first_sink("database"),
+        )
+    };
+    format!(
+        "mysql://{}:{}@{}:{}/{}",
+        username, password, host, port, database
+    )
+}
+
+fn quoted_identifier(identifier: &str) -> String {
+    format!("`{}`", identifier.replace('`', "``"))
+}
+
+fn mysql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+fn filter_targets_by_request(
+    targets: Vec<CleanupTarget>,
+    requested_tables: &[String],
+) -> Vec<CleanupTarget> {
+    if requested_tables.is_empty() {
+        return targets;
+    }
+    targets
+        .into_iter()
+        .filter(|target| {
+            requested_tables
+                .iter()
+                .any(|table| table.eq_ignore_ascii_case(&target.table_name))
+        })
+        .collect()
+}
+
+fn request_tables(body: &serde_json::Value) -> Vec<String> {
+    body.get("tables")
+        .and_then(|v| v.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn request_batch_size(body: &serde_json::Value) -> usize {
+    body.get("batch_size")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.clamp(1, 10000) as usize)
+        .unwrap_or(1000)
+}
+
+fn build_delete_sql_batches(
+    target: &CleanupTarget,
+    pk_values: &[String],
+    batch_size: usize,
+) -> String {
+    let mut sql = String::new();
+    if pk_values.is_empty() {
+        return sql;
+    }
+    let filter_values = target
+        .filter_values
+        .iter()
+        .map(|value| mysql_string_literal(value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sql.push_str(&format!(
+        "-- table: {}, filter: {} IN ({})\n",
+        target.table_name, target.filter_column, filter_values
+    ));
+    for chunk in pk_values.chunks(batch_size.max(1)) {
+        let pk_list = chunk
+            .iter()
+            .map(|value| mysql_string_literal(value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&format!(
+            "DELETE FROM {} WHERE {} IN ({});\n",
+            quoted_identifier(&target.table_name),
+            quoted_identifier(&target.pk_column),
+            pk_list
+        ));
+    }
+    sql.push('\n');
+    sql
 }
 
 fn plugin_summary(config: &CdcConfig) -> serde_json::Value {
@@ -391,7 +804,10 @@ const SPLIT_HTML: &str = r#"<!doctype html>
     .topbar { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 18px; }
     h1 { margin: 0; font-size: 30px; line-height: 1.15; }
     .subtitle { margin: 8px 0 0; color: var(--muted); line-height: 1.7; }
-    .btn { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 999px; padding: 10px 14px; background: rgba(15, 23, 42, 0.84); font-weight: 700; }
+    .btn { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 999px; padding: 10px 14px; background: rgba(15, 23, 42, 0.84); color: var(--text); font-weight: 700; cursor: pointer; }
+    .btn.primary { border-color: rgba(56, 189, 248, 0.56); color: #bae6fd; }
+    .btn.danger { border-color: rgba(248, 113, 113, 0.5); color: #fecaca; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
     .card { border: 1px solid var(--line); background: var(--panel); border-radius: 18px; padding: 20px; }
     .card h2 { margin: 0 0 14px; font-size: 17px; }
@@ -407,6 +823,12 @@ const SPLIT_HTML: &str = r#"<!doctype html>
     th { color: var(--muted); font-size: 12px; font-weight: 700; }
     td { font-size: 13px; font-weight: 700; }
     .empty { color: var(--muted); padding: 16px 0; }
+    .notice { color: #fde68a; background: rgba(234, 179, 8, 0.1); border: 1px solid rgba(234, 179, 8, 0.28); border-radius: 14px; padding: 12px 14px; line-height: 1.65; }
+    .result { margin-top: 14px; color: var(--muted); }
+    .summary-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 14px; }
+    .summary-box { border: 1px solid rgba(148, 163, 184, 0.18); border-radius: 14px; padding: 12px; background: rgba(2, 6, 23, 0.26); }
+    .summary-box .label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+    .summary-box .value { font-size: 22px; font-weight: 800; color: var(--text); }
     pre { margin: 16px 0 0; max-height: 360px; overflow: auto; padding: 14px; border-radius: 14px; background: #020617; border: 1px solid var(--line); color: #bae6fd; font-size: 12px; line-height: 1.6; }
     @media (max-width: 780px) { .grid, .topbar { grid-template-columns: 1fr; display: grid; } .topbar { align-items: start; } }
   </style>
@@ -442,6 +864,19 @@ const SPLIT_HTML: &str = r#"<!doctype html>
         <div id="progressSummary" class="kv"></div>
         <div id="progressTableWrap" style="margin-top:14px"></div>
       </div>
+      <div class="card wide">
+        <h2>清理 SQL</h2>
+        <div class="notice">
+          工具只生成 SQL，不执行删除。SQL 基于 sink 中已同步数据的主键生成，请下载后人工检查，并在业务低峰执行。数据库拆分模式不允许和会修改数据的插件混用。
+        </div>
+        <div id="cleanupTableWrap" style="margin-top:14px"></div>
+        <div id="cleanupInvalidWrap" class="result"></div>
+        <div class="actions">
+          <button class="btn primary" type="button" onclick="runCleanupDryRun()">Dry-run 统计</button>
+          <button class="btn danger" type="button" onclick="downloadCleanupSql()">下载删除 SQL</button>
+        </div>
+        <div id="cleanupResult" class="result"></div>
+      </div>
     </section>
     <pre id="rawJson">loading...</pre>
   </main>
@@ -470,6 +905,90 @@ function renderProgressTable(tables) {
     <td>${escapeHtml(table.last_pk)}</td>
   </tr>`).join('');
   return `<table><thead><tr><th>表名</th><th>阶段</th><th>读取</th><th>同步</th><th>过滤</th><th>最后主键</th></tr></thead><tbody>${body}</tbody></table>`;
+}
+function renderCleanupTables(tables) {
+  if (!tables.length) return '<div class="empty">暂无可生成清理 SQL 的表。等待初始化表结构加载，或检查 ColumnIn 配置。</div>';
+  const body = tables.map((table) => `<tr>
+    <td>${escapeHtml(table.table_name)}</td>
+    <td>${escapeHtml(table.pk_column)}</td>
+    <td>${escapeHtml(table.filter_column)}</td>
+    <td>${escapeHtml((table.filter_values || []).join(', '))}</td>
+  </tr>`).join('');
+  return `<table><thead><tr><th>表名</th><th>主键</th><th>过滤字段</th><th>过滤值</th></tr></thead><tbody>${body}</tbody></table>`;
+}
+function renderInvalidCleanupTables(tables) {
+  if (!tables.length) return '';
+  const body = tables.map((table) => `<tr>
+    <td>${escapeHtml(table.table_name)}</td>
+    <td>${escapeHtml(table.reason)}</td>
+    <td>${escapeHtml((table.matched_columns || []).join(', '))}</td>
+  </tr>`).join('');
+  return `<div style="margin-top:14px"><strong>不能生成 SQL 的表</strong><table><thead><tr><th>表名</th><th>原因</th><th>命中字段</th></tr></thead><tbody>${body}</tbody></table></div>`;
+}
+function renderDryRunResult(data) {
+  const tables = data.tables || [];
+  const body = tables.map((table) => `<tr>
+    <td>${escapeHtml(table.table_name)}</td>
+    <td>${escapeHtml(table.pk_column)}</td>
+    <td>${escapeHtml(table.filter_column)}</td>
+    <td>${escapeHtml((table.filter_values || []).join(', '))}</td>
+    <td>${escapeHtml(table.count ?? 0)}</td>
+  </tr>`).join('');
+  const tableHtml = tables.length
+    ? `<table><thead><tr><th>表名</th><th>主键</th><th>过滤字段</th><th>过滤值</th><th>待删除条数</th></tr></thead><tbody>${body}</tbody></table>`
+    : '<div class="empty">Dry-run 未返回表级统计</div>';
+  return `
+    <div class="summary-grid">
+      <div class="summary-box"><div class="label">待删除总数</div><div class="value">${escapeHtml(data.total_count ?? 0)}</div></div>
+      <div class="summary-box"><div class="label">统计表数量</div><div class="value">${escapeHtml(tables.length)}</div></div>
+      <div class="summary-box"><div class="label">异常表数量</div><div class="value">${escapeHtml((data.invalid_tables || []).length)}</div></div>
+    </div>
+    <div style="margin-top:14px">${tableHtml}</div>
+    ${renderInvalidCleanupTables(data.invalid_tables || [])}
+  `;
+}
+function cleanupRequestBody() {
+  return JSON.stringify({ tables: [] });
+}
+async function runCleanupDryRun() {
+  el('cleanupResult').innerHTML = '<div class="empty">Dry-run 统计中...</div>';
+  const response = await fetch('api/split/cleanup/dry-run', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: cleanupRequestBody(),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    el('cleanupResult').textContent = text;
+    return;
+  }
+  const data = JSON.parse(text);
+  el('cleanupResult').innerHTML = renderDryRunResult(data);
+}
+async function downloadCleanupSql() {
+  el('cleanupResult').textContent = '正在生成 SQL...';
+  const response = await fetch('api/split/cleanup/sql', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tables: [], batch_size: 1000 }),
+  });
+  const blob = await response.blob();
+  if (!response.ok) {
+    el('cleanupResult').textContent = await blob.text();
+    return;
+  }
+  const disposition = response.headers.get('Content-Disposition') || '';
+  const match = disposition.match(/filename="([^"]+)"/);
+  const filename = match ? match[1] : 'database_split_cleanup.sql';
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  el('cleanupResult').textContent = `SQL 已生成: ${filename}`;
 }
 async function loadSplitStatus() {
   const response = await fetch('api/split/status', { cache: 'no-store' });
@@ -501,6 +1020,8 @@ async function loadSplitStatus() {
     row('过滤', filteredTotal),
   ].join('');
   el('progressTableWrap').innerHTML = renderProgressTable(tables);
+  el('cleanupTableWrap').innerHTML = renderCleanupTables(data.cleanup?.tables || []);
+  el('cleanupInvalidWrap').innerHTML = renderInvalidCleanupTables(data.cleanup?.invalid_tables || []);
   el('rawJson').textContent = JSON.stringify(data, null, 2);
 }
 loadSplitStatus().catch((err) => { el('rawJson').textContent = `无法加载拆分状态: ${err.message}`; });
@@ -1122,6 +1643,14 @@ async fn start_ui(ui_state: UiState, bind: String, port: u16) -> Result<(), Box<
             .route("/api/status", web::get().to(ui_status))
             .route("/split", web::get().to(ui_split))
             .route("/api/split/status", web::get().to(ui_split_status))
+            .route(
+                "/api/split/cleanup/dry-run",
+                web::post().to(ui_split_cleanup_dry_run),
+            )
+            .route(
+                "/api/split/cleanup/sql",
+                web::post().to(ui_split_cleanup_sql),
+            )
             .route("/metrics", web::get().to(ui_metrics))
     })
     .listen(listener)?
@@ -1157,6 +1686,10 @@ async fn main() {
     error!("App 启动");
 
     info!("Config Loaded");
+    if let Err(e) = validate_database_split_plugins(&config) {
+        error!("{}", e);
+        panic!("{}", e);
+    }
     let ui_state = UiState::new(&config);
     if config.enable_ui.unwrap_or(true) {
         let bind = config.ui_bind.clone().unwrap_or("0.0.0.0".to_string());
@@ -1177,6 +1710,7 @@ async fn main() {
     add_plugin(&config, &source).await;
     info!("成功创建source");
     let table_info_list = source.lock().await.get_table_info().await;
+    ui_state.set_table_info_list(table_info_list.clone()).await;
     let mut sink = SinkFactory::create_sink(&config, table_info_list).await;
     info!("成功创建sink");
     if let Err(e) = sink.lock().await.connect().await {
@@ -1214,6 +1748,7 @@ async fn main() {
             source = SourceFactory::create_source(&config).await;
             add_plugin(&config, &source).await;
             let table_info_list = source.lock().await.get_table_info().await;
+            ui_state.set_table_info_list(table_info_list.clone()).await;
             // 重新创建sink并连接
             sink = SinkFactory::create_sink(&config, table_info_list).await;
             if let Err(e) = sink.lock().await.connect().await {
@@ -1378,6 +1913,53 @@ plugins:
         .unwrap()
     }
 
+    fn test_split_plus_config() -> CdcConfig {
+        serde_yaml::from_str(
+            r#"
+source_type: MySQL
+sink_type: MySQL
+source_config:
+  - {}
+sink_config:
+  - {}
+plugins:
+  - plugin_type: ColumnIn
+    config:
+      columns: project_id
+      values: 10001
+  - plugin_type: Plus
+    config:
+      columns: orders.id
+      plus: 1
+  - plugin_type: DatabaseSplit
+    config:
+      task_name: split-project
+"#,
+        )
+        .unwrap()
+    }
+
+    fn test_table_info_list() -> Vec<TableInfoVo> {
+        vec![
+            TableInfoVo {
+                table_name: "orders".to_string(),
+                pk_column: "id".to_string(),
+                create_table_sql: "".to_string(),
+                columns: vec!["id".to_string(), "project_id".to_string()],
+            },
+            TableInfoVo {
+                table_name: "tenant_map".to_string(),
+                pk_column: "id".to_string(),
+                create_table_sql: "".to_string(),
+                columns: vec![
+                    "id".to_string(),
+                    "project_id".to_string(),
+                    "tenant_id".to_string(),
+                ],
+            },
+        ]
+    }
+
     #[test]
     fn test_resolve_ui_port_env_overrides() {
         let cfg = test_config();
@@ -1437,6 +2019,44 @@ plugins:
             .unwrap();
         assert_eq!(column_in["columns"].as_array().unwrap().len(), 2);
         assert_eq!(column_in["values"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_cleanup_targets_identify_tables_and_invalid_multiple_columns() {
+        let cfg = test_split_config();
+        let (targets, invalid) = cleanup_targets(&cfg, &test_table_info_list());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].table_name, "orders");
+        assert_eq!(targets[0].pk_column, "id");
+        assert_eq!(targets[0].filter_column, "project_id");
+        assert_eq!(targets[0].filter_values, vec!["10001", "10002"]);
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid[0].table_name, "tenant_map");
+        assert_eq!(invalid[0].reason, "matched multiple ColumnIn columns");
+    }
+
+    #[test]
+    fn test_build_delete_sql_batches_escapes_values() {
+        let target = CleanupTarget {
+            table_name: "orders".to_string(),
+            pk_column: "id".to_string(),
+            filter_column: "project_id".to_string(),
+            filter_values: vec!["10001".to_string(), "x'y".to_string()],
+        };
+        let sql = build_delete_sql_batches(
+            &target,
+            &["1".to_string(), "2".to_string(), "3".to_string()],
+            2,
+        );
+        assert!(sql.contains("-- table: orders, filter: project_id IN ('10001', 'x\\'y')"));
+        assert!(sql.contains("DELETE FROM `orders` WHERE `id` IN ('1', '2');"));
+        assert!(sql.contains("DELETE FROM `orders` WHERE `id` IN ('3');"));
+    }
+
+    #[test]
+    fn test_database_split_plus_is_rejected() {
+        let cfg = test_split_plus_config();
+        assert!(validate_database_split_plugins(&cfg).is_err());
     }
 
     #[actix_web::test]
@@ -1516,6 +2136,7 @@ plugins:
     async fn test_ui_split_status_enabled() {
         let cfg = test_split_config();
         let state = UiState::new_with_started_at(&cfg, 123);
+        state.set_table_info_list(test_table_info_list()).await;
         let app = actix_test::init_service(
             App::new()
                 .app_data(web::Data::new(state))
@@ -1532,6 +2153,16 @@ plugins:
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v.get("enabled").unwrap().as_bool().unwrap(), true);
         assert!(v.get("runtime_progress").is_some());
+        assert_eq!(
+            v.get("cleanup")
+                .unwrap()
+                .get("tables")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(
             v.get("filter")
                 .unwrap()
@@ -1562,6 +2193,10 @@ plugins:
             App::new()
                 .app_data(web::Data::new(state))
                 .route("/api/split/status", web::get().to(ui_split_status))
+                .route(
+                    "/api/split/cleanup/dry-run",
+                    web::post().to(ui_split_cleanup_dry_run),
+                )
                 .route("/split", web::get().to(ui_split)),
         )
         .await;
@@ -1573,6 +2208,13 @@ plugins:
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         let req = actix_test::TestRequest::get().uri("/split").to_request();
+        let resp = actix_test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let req = actix_test::TestRequest::post()
+            .uri("/api/split/cleanup/dry-run")
+            .set_json(json!({}))
+            .to_request();
         let resp = actix_test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -1651,6 +2293,13 @@ plugins:
         let body = to_bytes(resp.into_body()).await.unwrap();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(s.contains("progressTableWrap"));
+        assert!(s.contains("清理 SQL"));
+        assert!(s.contains("Dry-run 统计"));
+        assert!(s.contains("下载删除 SQL"));
+        assert!(s.contains("renderDryRunResult"));
+        assert!(s.contains("待删除条数"));
+        assert!(s.contains("api/split/cleanup/dry-run"));
+        assert!(s.contains("api/split/cleanup/sql"));
         assert!(s.contains("fetch('api/split/status'"));
         assert!(!s.contains("fetch('/api/split/status'"));
     }
