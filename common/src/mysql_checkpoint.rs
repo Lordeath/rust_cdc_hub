@@ -5,7 +5,8 @@ use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
-use tracing::warn;
+use tokio::time::{Duration, timeout};
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MysqlCheckPointDetailEntity {
@@ -47,7 +48,8 @@ impl MysqlCheckPointDetailEntity {
         .unwrap_or_else(|_| panic!("获取mysql连接池失败: {}", &connection_url));
 
         // 4. 获取当前 MySQL binlog 起点
-        let (last_binlog_filename, last_binlog_position) = fetch_mysql_start_position(&pool).await;
+        let (last_binlog_filename, last_binlog_position) =
+            fetch_mysql_start_position(&pool, &table).await;
 
         // 获取这个文件，如果没有，就新增这个文件
         let checkpoint_file = Path::new(&checkpoint_filepath);
@@ -115,11 +117,15 @@ impl MysqlCheckPointDetailEntity {
     }
 }
 
-pub async fn fetch_mysql_start_position(pool: &Pool<MySql>) -> (String, u32) {
-    let row = sqlx::query("SHOW MASTER STATUS")
-        .fetch_one(pool)
-        .await
-        .expect("获取mysql binlog文件位置失败");
+pub async fn fetch_mysql_start_position(pool: &Pool<MySql>, table: &str) -> (String, u32) {
+    info!("fetch mysql start position for checkpoint table {}", table);
+    let row = timeout(
+        Duration::from_secs(10),
+        sqlx::query("SHOW MASTER STATUS").fetch_one(pool),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("获取mysql binlog文件位置超时: {}", table))
+    .expect("获取mysql binlog文件位置失败");
 
     let columns: Vec<&str> = row.columns().iter().map(|c| c.name()).collect();
     let binlog_file: String = row
@@ -143,6 +149,10 @@ pub async fn fetch_mysql_start_position(pool: &Pool<MySql>) -> (String, u32) {
             position_u64, columns
         )
     });
+    info!(
+        "fetched mysql start position for checkpoint table {}: {}/{}",
+        table, binlog_file, position_u32
+    );
     (binlog_file, position_u32)
 }
 

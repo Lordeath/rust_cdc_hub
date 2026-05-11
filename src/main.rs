@@ -606,6 +606,8 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     .tag { display: inline-flex; align-items: center; border: 1px solid rgba(56, 189, 248, 0.4); color: #bae6fd; background: rgba(56, 189, 248, 0.1); border-radius: 999px; padding: 6px 10px; font-size: 12px; font-weight: 800; }
     .plugin-filter-grid { display: grid; grid-template-columns: 1.2fr 1.2fr 0.7fr; gap: 12px; }
     .progress-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+    .progress-grid[hidden] { display: none; }
+    .progress-timing-grid { grid-template-columns: repeat(3, 1fr); margin-top: 12px; }
     .progress-box { border: 1px solid rgba(148, 163, 184, 0.18); border-radius: 14px; padding: 14px; background: rgba(2, 6, 23, 0.26); }
     .progress-box .label { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
     .progress-box .value { font-size: 22px; font-weight: 800; overflow-wrap: anywhere; }
@@ -693,6 +695,11 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         <div class="progress-box"><div class="label" data-i18n="read_sink">读取 / 写入 Sink</div><div class="value" id="progressReadSynced">-</div></div>
         <div class="progress-box"><div class="label" data-i18n="filtered_rows">过滤条数</div><div class="value" id="progressFiltered">-</div></div>
       </div>
+      <div id="initializationTimingGrid" class="progress-grid progress-timing-grid" hidden>
+        <div class="progress-box"><div class="label" data-i18n="initialization_started_at">初始化开始时间</div><div class="value compact" id="initializationStartedAt">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="initialization_finished_at">初始化结束时间</div><div class="value compact" id="initializationFinishedAt">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="initialization_duration">初始化耗时</div><div class="value compact" id="initializationDuration">-</div></div>
+      </div>
       <div id="syncProgressTable" class="table-wrap"></div>
     </section>
 
@@ -731,6 +738,10 @@ const translations = {
     current_table: '当前表',
     read_sink: '总计读取 / 写入 Sink',
     filtered_rows: '总计过滤条数',
+    initialization_started_at: '初始化开始时间',
+    initialization_finished_at: '初始化结束时间',
+    initialization_duration: '初始化耗时',
+    initializing_running: '进行中',
     raw_json: '原始状态 JSON',
     no_column_in_hits: '暂无 ColumnIn 过滤命中',
     no_table_sync: '暂无表级同步记录',
@@ -790,6 +801,10 @@ const translations = {
     current_table: 'Current Table',
     read_sink: 'Total Read / Written to Sink',
     filtered_rows: 'Total Filtered Rows',
+    initialization_started_at: 'Initialization Started',
+    initialization_finished_at: 'Initialization Finished',
+    initialization_duration: 'Initialization Duration',
+    initializing_running: 'Running',
     raw_json: 'Raw Status JSON',
     no_column_in_hits: 'No ColumnIn filter hits',
     no_table_sync: 'No table-level sync records',
@@ -944,6 +959,24 @@ function renderSyncProgressTable(tables) {
     .join('');
   target.innerHTML = `<table><thead><tr><th>${escapeHtml(t('table_name'))}</th><th>${escapeHtml(t('phase'))}</th><th>${escapeHtml(t('read'))}</th><th>${escapeHtml(t('sink_written'))}</th><th>${escapeHtml(t('filtered'))}</th><th>${escapeHtml(t('last_pk'))}</th><th>${escapeHtml(t('last_event_at'))}</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
+function renderInitializationTiming(progress, now) {
+  const timingGrid = el('initializationTimingGrid');
+  if (!timingGrid) return;
+  const startedAt = Number(progress.initialization_started_at || 0);
+  const finishedAt = Number(progress.initialization_finished_at || 0);
+  timingGrid.hidden = startedAt <= 0;
+  if (startedAt <= 0) {
+    setText('initializationStartedAt', '-');
+    setText('initializationFinishedAt', '-');
+    setText('initializationDuration', '-');
+    return;
+  }
+  const effectiveEnd = finishedAt > 0 ? finishedAt : Number(now || 0);
+  const duration = Math.max(0, effectiveEnd - startedAt);
+  setText('initializationStartedAt', fmtTs(startedAt));
+  setText('initializationFinishedAt', finishedAt > 0 ? fmtTs(finishedAt) : t('initializing_running'));
+  setText('initializationDuration', fmtDuration(duration));
+}
 function renderStatusData(data) {
     latestStatus = data;
     const cfg = data.config || {};
@@ -971,6 +1004,7 @@ function renderStatusData(data) {
     setText('progressTable', progress.current_table || '-');
     setText('progressReadSynced', `${progressRead} / ${progressSynced}`);
     setText('progressFiltered', progressFiltered);
+    renderInitializationTiming(progress, data.now);
     renderColumnInFilters(cfg, progress);
     renderSyncProgressTable(progressTables);
     el('configKv').innerHTML = [
@@ -1410,6 +1444,18 @@ plugins:
                 .get("plugin_filters")
                 .is_some()
         );
+        assert!(
+            v.get("runtime_progress")
+                .unwrap()
+                .get("initialization_started_at")
+                .is_some()
+        );
+        assert!(
+            v.get("runtime_progress")
+                .unwrap()
+                .get("initialization_finished_at")
+                .is_some()
+        );
         assert_eq!(
             v.get("database_split")
                 .unwrap()
@@ -1509,6 +1555,9 @@ plugins:
         assert!(s.contains("Prometheus 指标"));
         assert!(s.contains("数据同步进度"));
         assert!(s.contains("syncProgressTable"));
+        assert!(s.contains("initializationTimingGrid"));
+        assert!(s.contains("初始化开始时间"));
+        assert!(s.contains("Initialization Duration"));
         assert!(s.contains("langToggle"));
         assert!(s.contains("Data Sync Progress"));
         assert!(s.contains("position: sticky"));
