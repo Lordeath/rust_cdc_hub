@@ -49,7 +49,6 @@ impl PluginPlus {
 #[async_trait]
 impl Plugin for PluginPlus {
     async fn collect(&mut self, data_buffer: DataBuffer) -> Result<DataBuffer, ()> {
-        let data_original = data_buffer.clone();
         let is_delete = matches!(data_buffer.op, Operation::DELETE);
         let mut data: CaseInsensitiveHashMap = if is_delete {
             data_buffer.before.clone()
@@ -74,16 +73,16 @@ impl Plugin for PluginPlus {
             }
         }
         if contains_some_column.is_empty() {
-            return Ok(data_original);
+            return Ok(data_buffer);
         }
         for (column_name, value) in contains_some_column {
             let int_64: i64 = value.resolve_string().parse().unwrap();
             data.insert(column_name, Value::Int64(int_64 + self.plus));
         }
         if data_buffer.op == Operation::DELETE {
-            return Ok(data_original.new_before(data));
+            return Ok(data_buffer.new_before(data));
         }
 
-        Ok(data_original.new_after(data))
+        Ok(data_buffer.new_after(data))
     }
 }

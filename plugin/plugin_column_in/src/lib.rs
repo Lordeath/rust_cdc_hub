@@ -59,7 +59,7 @@ impl Plugin for PluginColumnIn {
                 true,
             )
             .await;
-            return Ok(data_buffer.clone());
+            return Ok(data_buffer);
         }
         let to_compare: String = contains_some_column.resolve_string();
         let mut result = false;
@@ -77,7 +77,7 @@ impl Plugin for PluginColumnIn {
         )
         .await;
         if result {
-            Ok(data_buffer.clone())
+            Ok(data_buffer)
         } else {
             Err(())
         }

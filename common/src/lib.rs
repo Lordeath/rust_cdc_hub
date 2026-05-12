@@ -216,8 +216,8 @@ impl DataBuffer {
     ) -> DataBuffer {
         DataBuffer {
             table_name,
-            before: before.clone(),
-            after: after.clone(),
+            before,
+            after,
             op,
             binlog_filename,
             timestamp,

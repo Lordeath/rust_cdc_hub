@@ -579,7 +579,7 @@ async fn detail_with_plugin(
     }
     let mut data_buffer = data_buffer;
     for p in plugins {
-        let after_plugin = p.lock().await.collect(data_buffer.clone()).await;
+        let after_plugin = p.lock().await.collect(data_buffer).await;
         if after_plugin.is_err() {
             return Err(());
         }
@@ -736,30 +736,29 @@ impl Source for MySQLSource {
                                 .extract_init_data(&table_name, &pk_column, id, &mut tx)
                                 .await;
                             let len = data_buffer_list.len();
-                            for data_buffer in data_buffer_list.iter().take(len) {
+                            for data_buffer in data_buffer_list {
                                 runtime_progress::record_read(
                                     &table_name,
                                     "initializing",
-                                    pk_value_for_progress(data_buffer, &pk_column),
+                                    pk_value_for_progress(&data_buffer, &pk_column),
                                 )
                                 .await;
-                                let plugin_data =
-                                    detail_with_plugin(plugins, data_buffer.clone()).await;
+                                let this_id = data_buffer.after.get(&pk_column);
+                                let next_id = match this_id {
+                                    Value::Int64(x) => *x,
+                                    _ => {
+                                        panic!("pk_column not found");
+                                    }
+                                };
+                                let plugin_data = detail_with_plugin(plugins, data_buffer).await;
                                 if let Ok(item) = plugin_data {
                                     Self::write_record_with_retry(&mut sink, &item, None).await;
                                     runtime_progress::record_synced(&table_name).await;
                                 } else {
                                     runtime_progress::record_filtered(&table_name).await;
                                 }
-                                let this_id = data_buffer.after.get(&pk_column);
-                                let this_id = match this_id {
-                                    Value::Int64(x) => x,
-                                    _ => {
-                                        panic!("pk_column not found");
-                                    }
-                                };
-                                if this_id > &id {
-                                    id = *this_id;
+                                if next_id > id {
+                                    id = next_id;
                                 }
                             }
                             count += len;
