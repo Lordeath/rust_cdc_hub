@@ -32,6 +32,11 @@ use tracing_subscriber::fmt::time::FormatTime;
 
 const DEFAULT_UI_PORT: u16 = 18088;
 
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn malloc_trim(pad: usize) -> i32;
+}
+
 fn parse_port(s: &str) -> Option<u16> {
     let t = s.trim();
     if t.is_empty() {
@@ -172,6 +177,27 @@ impl UiState {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn trim_allocator_memory() -> serde_json::Value {
+    let result = unsafe { malloc_trim(0) };
+    json!({
+        "supported": true,
+        "allocator": "glibc",
+        "result": result,
+        "trimmed": result == 1,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn trim_allocator_memory() -> serde_json::Value {
+    json!({
+        "supported": false,
+        "allocator": "unsupported",
+        "result": 0,
+        "trimmed": false,
+    })
+}
+
 async fn ui_health() -> impl Responder {
     HttpResponse::Ok().body("ok")
 }
@@ -253,6 +279,18 @@ impl UiState {
 
 async fn ui_status(state: web::Data<UiState>) -> impl Responder {
     HttpResponse::Ok().json(state.snapshot().await)
+}
+
+async fn ui_memory_trim(state: web::Data<UiState>) -> impl Responder {
+    let before = state.resource_snapshot().await;
+    let trim = trim_allocator_memory();
+    let after = state.resource_snapshot().await;
+    HttpResponse::Ok().json(json!({
+        "status": "ok",
+        "allocator_trim": trim,
+        "before": before,
+        "after": after,
+    }))
 }
 
 async fn ui_split_status(state: web::Data<UiState>) -> impl Responder {
@@ -1301,6 +1339,10 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         <div class="progress-box"><div class="label" data-i18n="process_cpu">进程 CPU</div><div class="value" id="processCpu">-</div></div>
         <div class="progress-box"><div class="label" data-i18n="process_memory">进程内存</div><div class="value compact" id="processMemory">-</div><div class="hint" id="processPid">pid: -</div></div>
       </div>
+      <div class="actions">
+        <button class="btn primary" type="button" id="memoryTrimButton" onclick="trimMemory()" data-i18n="trim_memory">触发内存回收</button>
+        <span class="btn" id="memoryTrimResult" data-i18n="trim_memory_idle">等待手动触发</span>
+      </div>
     </section>
 
     <section class="card section" style="margin-top:16px">
@@ -1354,6 +1396,12 @@ const translations = {
     system_memory: '机器内存',
     process_cpu: '进程 CPU',
     process_memory: '进程内存',
+    trim_memory: '触发内存回收',
+    trim_memory_idle: '等待手动触发',
+    trim_memory_running: '正在尝试回收...',
+    trim_memory_done: '回收完成',
+    trim_memory_unsupported: '当前平台不支持',
+    trim_memory_failed: '内存回收失败',
     sync_progress: '数据同步进度',
     current_status: '当前状态',
     current_table: '当前表',
@@ -1422,6 +1470,12 @@ const translations = {
     system_memory: 'System Memory',
     process_cpu: 'Process CPU',
     process_memory: 'Process Memory',
+    trim_memory: 'Trim Memory',
+    trim_memory_idle: 'Waiting for manual trigger',
+    trim_memory_running: 'Trimming...',
+    trim_memory_done: 'Trim completed',
+    trim_memory_unsupported: 'Unsupported on this platform',
+    trim_memory_failed: 'Memory trim failed',
     sync_progress: 'Data Sync Progress',
     current_status: 'Current Status',
     current_table: 'Current Table',
@@ -1668,6 +1722,32 @@ function renderResources(resources) {
   setText('processMemory', fmtBytes(processInfo.memory_bytes));
   setText('processPid', `pid: ${processInfo.pid ?? '-'}`);
 }
+async function trimMemory() {
+  const button = el('memoryTrimButton');
+  const resultBox = el('memoryTrimResult');
+  button.disabled = true;
+  resultBox.textContent = t('trim_memory_running');
+  try {
+    const response = await fetch('api/admin/memory/trim', { method: 'POST', cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const before = Number(data.before?.process?.memory_bytes || 0);
+    const after = Number(data.after?.process?.memory_bytes || 0);
+    const diff = before - after;
+    if (data.allocator_trim?.supported === false) {
+      resultBox.textContent = t('trim_memory_unsupported');
+    } else {
+      const delta = diff >= 0 ? `-${fmtBytes(diff)}` : `+${fmtBytes(Math.abs(diff))}`;
+      resultBox.textContent = `${t('trim_memory_done')}: ${fmtBytes(before)} → ${fmtBytes(after)} (${delta})`;
+    }
+    renderResources(data.after);
+    await loadStatus();
+  } catch (err) {
+    resultBox.textContent = `${t('trim_memory_failed')}: ${err.message}`;
+  } finally {
+    button.disabled = false;
+  }
+}
 function renderStatusData(data) {
     latestStatus = data;
     const cfg = data.config || {};
@@ -1767,6 +1847,7 @@ async fn start_ui(ui_state: UiState, bind: String, port: u16) -> Result<(), Box<
             .route("/health", web::get().to(ui_health))
             .route("/status", web::get().to(ui_status))
             .route("/api/status", web::get().to(ui_status))
+            .route("/api/admin/memory/trim", web::post().to(ui_memory_trim))
             .route("/split", web::get().to(ui_split))
             .route("/api/split/status", web::get().to(ui_split_status))
             .route(
@@ -2288,6 +2369,30 @@ plugins:
     }
 
     #[actix_web::test]
+    async fn test_ui_memory_trim_returns_resource_snapshots() {
+        let cfg = test_config();
+        let state = UiState::new_with_started_at(&cfg, 123);
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .route("/api/admin/memory/trim", web::post().to(ui_memory_trim)),
+        )
+        .await;
+
+        let req = actix_test::TestRequest::post()
+            .uri("/api/admin/memory/trim")
+            .to_request();
+        let resp = actix_test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v.get("status").unwrap().as_str().unwrap(), "ok");
+        assert!(v.get("allocator_trim").is_some());
+        assert!(v.get("before").unwrap().get("process").is_some());
+        assert!(v.get("after").unwrap().get("process").is_some());
+    }
+
+    #[actix_web::test]
     async fn test_ui_split_status_enabled() {
         let cfg = test_split_config();
         let state = UiState::new_with_started_at(&cfg, 123);
@@ -2409,6 +2514,10 @@ plugins:
         assert!(s.contains("进程内存"));
         assert!(s.contains("Resource Usage"));
         assert!(s.contains("function renderResources"));
+        assert!(s.contains("触发内存回收"));
+        assert!(s.contains("memoryTrimButton"));
+        assert!(s.contains("function trimMemory"));
+        assert!(s.contains("api/admin/memory/trim"));
         assert!(s.contains("tableSortState"));
         assert!(s.contains("syncProgress: { key: 'last_event_at', dir: 'desc' }"));
         assert!(s.contains("function setTableSort"));
