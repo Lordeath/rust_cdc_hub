@@ -364,9 +364,9 @@ To add a new Source or Sink:
 - [x] plugin system
 - [x] built-in UI and Prometheus metrics
 - [x] table/database include and exclude support
-- [ ] Database split plugin: enable split mode through a plugin and load split-task management pages in Actix Web
-- [ ] Split task status and operation records: record sync checks, dry-runs, SQL generation, confirmations, and operator notes
-- [ ] Cleanup dry-run and delete SQL generation: count by default, generate reviewable SQL after confirmation, do not delete by default
+- [x] Database split plugin: enable split mode through a plugin and provide split-task management pages in Actix Web (V1)
+- [x] Cleanup dry-run and reviewable SQL generation: count by default, generate reviewable SQL by download, do not delete by default
+- [ ] Split task operation records: persist sync checks, dry-runs, SQL generation events, confirmations, and operator notes
 - [ ] Generic command plugin for optional config cutover, service restart, notifications, and other external actions
 - [ ] More complete DDL synchronization: MODIFY/DROP/RENAME and more
 - [ ] Multi-target fan-out or table-based routing
