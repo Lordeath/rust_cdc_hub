@@ -368,6 +368,7 @@ To add a new Source or Sink:
 - [x] Cleanup dry-run and reviewable SQL generation: count by default, generate reviewable SQL by download, do not delete by default
 - [ ] Split task operation records: persist sync checks, dry-runs, SQL generation events, confirmations, and operator notes
 - [ ] Generic command plugin for optional config cutover, service restart, notifications, and other external actions
+- [ ] Dameng database support: research and implement Dameng as a Source/Sink, including connectivity, type mapping, DDL compatibility, and sync validation
 - [ ] More complete DDL synchronization: MODIFY/DROP/RENAME and more
 - [ ] Multi-target fan-out or table-based routing
 - [ ] Failure bypass and replay: DLQ, error classification, exponential backoff
