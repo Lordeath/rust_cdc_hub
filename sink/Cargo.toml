@@ -9,5 +9,6 @@ sink_print = { path = "sink_print" }
 sink_meilisearch = { path = "sink_meilisearch" }
 sink_mysql = { path = "sink_mysql" }
 sink_starrocks = { path = "sink_starrocks" }
+sink_dameng = { path = "sink_dameng" }
 tokio = { version = "1", features = ["full"] }
 log = "0.4.29"

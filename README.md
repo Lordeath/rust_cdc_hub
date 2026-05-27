@@ -7,7 +7,7 @@
 ## 功能特性
 
 - **MySQL Binlog 数据源**：支持单表、多表和全库表同步。
-- **多种 Sink 目标端**：已支持 MySQL、StarRocks、MeiliSearch、Print。
+- **多种 Sink 目标端**：已支持 MySQL、StarRocks、MeiliSearch、Dameng、Print。
 - **断点续传**：基于 checkpoint 文件记录位点，进程重启后从上次位点继续消费。
 - **自动 Schema 迁移**：支持自动建库、自动建表、自动加字段等能力（按 Sink 能力生效）。
 - **插件系统**：内置列值过滤插件 `ColumnIn` 和数值偏移插件 `Plus`。
@@ -18,7 +18,7 @@
 ## 架构概览
 
 ```text
-MySQL Binlog → MySQLSource → [Plugins] → Sink → MySQL / StarRocks / MeiliSearch / Print
+MySQL Binlog → MySQLSource → [Plugins] → Sink → MySQL / StarRocks / MeiliSearch / Dameng / Print
                     ↓
              Checkpoint Manager
 ```
@@ -91,6 +91,7 @@ cargo build -r
 
 - `config_examples/config_example_mysql.yaml`：MySQL → MySQL
 - `config_examples/config_example_meili.yaml`：MySQL → MeiliSearch
+- `config_examples/config_example_dameng.yaml`：MySQL → 达梦
 - `config_examples/config_example_print.yaml`：MySQL → 控制台打印
 
 也可以参考下方配置章节自行创建，例如 `/path/to/config.yaml`。
@@ -120,7 +121,7 @@ export CONFIG_PATH=/path/to/config.yaml
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `source_type` | 是 | Source 类型，目前支持 `MySQL`。 |
-| `sink_type` | 是 | Sink 类型：`MySQL`、`Starrocks`、`MeiliSearch`、`Print`。 |
+| `sink_type` | 是 | Sink 类型：`MySQL`、`Starrocks`、`MeiliSearch`、`Dameng`、`Print`。 |
 | `source_config` | 是 | Source 连接与同步配置列表。 |
 | `sink_config` | 是 | Sink 连接与写入配置列表。 |
 | `auto_create_database` | 否 | 是否自动建库，默认 `true`。 |
@@ -200,6 +201,33 @@ sink_config:
     meili_master_key: your_master_key
     table_name: articles
     meili_table_pk: id
+```
+
+### MySQL → 达梦示例
+
+```yaml
+source_type: MySQL
+sink_type: Dameng
+source_config:
+  - host: 127.0.0.1
+    port: 3306
+    username: cdc_user
+    password: cdc_password
+    database: source_db
+    table_name: "*"
+    server_id: 10003
+    pk_column: id
+
+sink_config:
+  - host: 127.0.0.1
+    port: 5236
+    username: SYSDBA
+    password: SYSDBA
+    database: TARGET_SCHEMA
+    pk_column: id
+
+auto_create_table: true
+auto_add_column: true
 ```
 
 ### MySQL → Print 示例
@@ -406,7 +434,7 @@ cargo test -p common --verbose
 - [x] 清理 dry-run 与删除 SQL 生成：默认只统计数量，生成可审查 SQL，不默认执行删除
 - [ ] 拆分任务状态与操作记录：记录同步检查、dry-run、SQL 生成、确认信息和人工备注（未持久化）
 - [ ] 通用命令插件：登记或触发外部命令，用于配置切换、服务重启、通知等可选流程
-- [ ] 达梦数据库支持：调研并实现达梦作为 Source/Sink 的连接、类型映射、DDL 兼容和同步验证
+- [ ] 达梦数据库 Sink 支持：优先实现 MySQL CDC 写入达梦，覆盖连接、类型映射、DDL 兼容和同步验证
 - [ ] 更完整的 DDL 同步（MODIFY/DROP/RENAME 等）
 - [ ] 多目标 fan-out 或按表路由
 - [ ] 失败旁路与重放（DLQ、错误分类、指数退避）

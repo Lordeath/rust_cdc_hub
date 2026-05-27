@@ -7,6 +7,7 @@ members = [
     "sink/sink_print",
     "sink/sink_meilisearch",
     "sink/sink_starrocks",
+    "sink/sink_dameng",
     "common",
     "plugin"
 ]

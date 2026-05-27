@@ -1,5 +1,6 @@
 use common::{CdcConfig, Sink, SinkType, TableInfoVo};
 use log::info;
+use sink_dameng::DamengSink;
 use sink_meilisearch::MeiliSearchSink;
 use sink_mysql::MySqlSink;
 use sink_print::PrintSink;
@@ -24,6 +25,9 @@ impl SinkFactory {
             SinkType::Starrocks => Arc::new(Mutex::new(
                 StarrocksSink::new(config, table_info_list).await,
             )),
+            SinkType::Dameng => {
+                Arc::new(Mutex::new(DamengSink::new(config, table_info_list).await))
+            }
         }
     }
 }

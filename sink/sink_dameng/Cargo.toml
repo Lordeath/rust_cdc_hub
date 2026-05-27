@@ -1,0 +1,12 @@
+[package]
+name = "sink_dameng"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common = { path = "../../common" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+async-trait = "0.1.89"
+dameng = "0.1.0"
+dameng-types = "0.1.0"

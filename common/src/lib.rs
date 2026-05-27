@@ -108,6 +108,7 @@ pub enum SinkType {
     MeiliSearch,
     MySQL,
     Starrocks,
+    Dameng,
     // 未来可扩展：Postgres, Kafka, Mongo, 等
 }
 

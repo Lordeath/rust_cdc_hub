@@ -1,0 +1,24 @@
+source_type: MySQL
+sink_type: Dameng
+
+source_config:
+  - host: 127.0.0.1
+    port: 3306
+    username: cdc_user
+    password: cdc_password
+    database: source_db
+    table_name: "*"
+    server_id: 10003
+    pk_column: id
+
+sink_config:
+  - host: 127.0.0.1
+    port: 5236
+    username: SYSDBA
+    password: SYSDBA
+    database: TARGET_SCHEMA
+    pk_column: id
+
+auto_create_table: true
+auto_add_column: true
+log_level: info

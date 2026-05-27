@@ -7,7 +7,7 @@ English | [简体中文](README.md)
 ## Features
 
 - **MySQL binlog source**: sync a single table, multiple tables, or all tables in a database.
-- **Multiple sink targets**: MySQL, StarRocks, MeiliSearch, and Print are supported.
+- **Multiple sink targets**: MySQL, StarRocks, MeiliSearch, Dameng, and Print are supported.
 - **Checkpoint resume**: persist binlog positions to a checkpoint file and continue from the previous position after restart.
 - **Automatic schema migration**: create databases, create tables, and add columns automatically where supported by the sink.
 - **Plugin system**: built-in `ColumnIn` filtering plugin and `Plus` numeric-offset plugin.
@@ -18,7 +18,7 @@ English | [简体中文](README.md)
 ## Architecture
 
 ```text
-MySQL Binlog → MySQLSource → [Plugins] → Sink → MySQL / StarRocks / MeiliSearch / Print
+MySQL Binlog → MySQLSource → [Plugins] → Sink → MySQL / StarRocks / MeiliSearch / Dameng / Print
                     ↓
              Checkpoint Manager
 ```
@@ -91,6 +91,7 @@ Example configurations are available in this repository:
 
 - `config_examples/config_example_mysql.yaml`: MySQL → MySQL
 - `config_examples/config_example_meili.yaml`: MySQL → MeiliSearch
+- `config_examples/config_example_dameng.yaml`: MySQL → Dameng
 - `config_examples/config_example_print.yaml`: MySQL → console output
 
 You can also create your own `/path/to/config.yaml` using the examples below.
@@ -120,7 +121,7 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 | Field | Required | Description |
 | --- | --- | --- |
 | `source_type` | Yes | Source type. Currently supports `MySQL`. |
-| `sink_type` | Yes | Sink type: `MySQL`, `Starrocks`, `MeiliSearch`, or `Print`. |
+| `sink_type` | Yes | Sink type: `MySQL`, `Starrocks`, `MeiliSearch`, `Dameng`, or `Print`. |
 | `source_config` | Yes | Source connection and sync settings. |
 | `sink_config` | Yes | Sink connection and write settings. |
 | `auto_create_database` | No | Create target databases automatically. Defaults to `true`. |
@@ -200,6 +201,33 @@ sink_config:
     meili_master_key: your_master_key
     table_name: articles
     meili_table_pk: id
+```
+
+### MySQL → Dameng example
+
+```yaml
+source_type: MySQL
+sink_type: Dameng
+source_config:
+  - host: 127.0.0.1
+    port: 3306
+    username: cdc_user
+    password: cdc_password
+    database: source_db
+    table_name: "*"
+    server_id: 10003
+    pk_column: id
+
+sink_config:
+  - host: 127.0.0.1
+    port: 5236
+    username: SYSDBA
+    password: SYSDBA
+    database: TARGET_SCHEMA
+    pk_column: id
+
+auto_create_table: true
+auto_add_column: true
 ```
 
 ### MySQL → Print example
@@ -368,7 +396,7 @@ To add a new Source or Sink:
 - [x] Cleanup dry-run and reviewable SQL generation: count by default, generate reviewable SQL by download, do not delete by default
 - [ ] Split task operation records: persist sync checks, dry-runs, SQL generation events, confirmations, and operator notes
 - [ ] Generic command plugin for optional config cutover, service restart, notifications, and other external actions
-- [ ] Dameng database support: research and implement Dameng as a Source/Sink, including connectivity, type mapping, DDL compatibility, and sync validation
+- [ ] Dameng Sink support: prioritize writing MySQL CDC events into Dameng, including connectivity, type mapping, DDL compatibility, and sync validation
 - [ ] More complete DDL synchronization: MODIFY/DROP/RENAME and more
 - [ ] Multi-target fan-out or table-based routing
 - [ ] Failure bypass and replay: DLQ, error classification, exponential backoff
