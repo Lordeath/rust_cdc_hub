@@ -136,11 +136,18 @@ impl DamengSink {
 
     async fn ensure_schema(&self) {
         for table_info in &self.table_info_list {
-            if let Err(e) = self.ensure_table(table_info).await {
-                error!(
-                    "Dameng ensure table failed: {} {}",
-                    table_info.table_name, e
-                );
+            let table_created = match self.ensure_table(table_info).await {
+                Ok(created) => created,
+                Err(e) => {
+                    error!(
+                        "Dameng ensure table failed: {} {}",
+                        table_info.table_name, e
+                    );
+                    false
+                }
+            };
+            if table_created {
+                continue;
             }
             if let Err(e) = self.ensure_columns(table_info).await {
                 error!(
@@ -187,12 +194,12 @@ impl DamengSink {
         }
     }
 
-    async fn ensure_table(&self, table_info: &TableInfoVo) -> Result<(), String> {
+    async fn ensure_table(&self, table_info: &TableInfoVo) -> Result<bool, String> {
         if !self.auto_create_table {
-            return Ok(());
+            return Ok(false);
         }
         if self.table_exists(table_info.table_name.as_str()).await? {
-            return Ok(());
+            return Ok(false);
         }
 
         let defs =
@@ -237,7 +244,7 @@ impl DamengSink {
             "Dameng auto create table success: {}",
             table_info.table_name
         );
-        Ok(())
+        Ok(true)
     }
 
     async fn ensure_columns(&self, table_info: &TableInfoVo) -> Result<(), String> {
