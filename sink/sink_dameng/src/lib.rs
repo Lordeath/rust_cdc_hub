@@ -12,7 +12,7 @@ use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfo
 use dameng::Client;
 use dameng::ToDmValue;
 use dameng_types::DmValue;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, trace};
@@ -44,6 +44,13 @@ impl ToDmValue for DamengParam {
             DamengParam::Text(v) => DmValue::Text(v.clone()),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct DamengColumnInfo {
+    data_type: String,
+    data_length: u32,
+    char_length: u32,
 }
 
 pub struct DamengSink {
@@ -136,18 +143,11 @@ impl DamengSink {
 
     async fn ensure_schema(&self) {
         for table_info in &self.table_info_list {
-            let table_created = match self.ensure_table(table_info).await {
-                Ok(created) => created,
-                Err(e) => {
-                    error!(
-                        "Dameng ensure table failed: {} {}",
-                        table_info.table_name, e
-                    );
-                    false
-                }
-            };
-            if table_created {
-                continue;
+            if let Err(e) = self.ensure_table(table_info).await {
+                error!(
+                    "Dameng ensure table failed: {} {}",
+                    table_info.table_name, e
+                );
             }
             if let Err(e) = self.ensure_columns(table_info).await {
                 error!(
@@ -194,12 +194,12 @@ impl DamengSink {
         }
     }
 
-    async fn ensure_table(&self, table_info: &TableInfoVo) -> Result<bool, String> {
+    async fn ensure_table(&self, table_info: &TableInfoVo) -> Result<(), String> {
         if !self.auto_create_table {
-            return Ok(false);
+            return Ok(());
         }
         if self.table_exists(table_info.table_name.as_str()).await? {
-            return Ok(false);
+            return Ok(());
         }
 
         let defs =
@@ -244,7 +244,7 @@ impl DamengSink {
             "Dameng auto create table success: {}",
             table_info.table_name
         );
-        Ok(true)
+        Ok(())
     }
 
     async fn ensure_columns(&self, table_info: &TableInfoVo) -> Result<(), String> {
@@ -271,8 +271,10 @@ impl DamengSink {
             };
             let nullable = mysql_column_allows_null_from_definition(def.as_str());
             let nullable_sql = if nullable { "NULL" } else { "NOT NULL" };
-            if existing_cols.contains(&src_col.to_ascii_lowercase()) {
-                if self.auto_modify_column && Self::should_modify_existing_column(&mysql_type) {
+            if let Some(existing_col) = existing_cols.get(key.as_str()) {
+                if self.auto_modify_column
+                    && Self::should_modify_existing_column(&mysql_type, existing_col)
+                {
                     let sql = format!(
                         "ALTER TABLE {} MODIFY {} {} {}",
                         self.qualified_table(table_info.table_name.as_str()),
@@ -345,12 +347,15 @@ impl DamengSink {
         Ok(count > 0)
     }
 
-    async fn existing_columns(&self, table_name: &str) -> Result<HashSet<String>, String> {
+    async fn existing_columns(
+        &self,
+        table_name: &str,
+    ) -> Result<HashMap<String, DamengColumnInfo>, String> {
         let table_upper = table_name.to_ascii_uppercase();
         let sql = if self.schema.is_empty() {
-            "SELECT COLUMN_NAME FROM USER_TAB_COLUMNS WHERE TABLE_NAME = ? OR TABLE_NAME = ?"
+            "SELECT COLUMN_NAME, DATA_TYPE, DATA_LENGTH, CHAR_LENGTH FROM USER_TAB_COLUMNS WHERE TABLE_NAME = ? OR TABLE_NAME = ?"
         } else {
-            "SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE (OWNER = ? OR OWNER = ?) AND (TABLE_NAME = ? OR TABLE_NAME = ?)"
+            "SELECT COLUMN_NAME, DATA_TYPE, DATA_LENGTH, CHAR_LENGTH FROM ALL_TAB_COLUMNS WHERE (OWNER = ? OR OWNER = ?) AND (TABLE_NAME = ? OR TABLE_NAME = ?)"
         };
         let params = if self.schema.is_empty() {
             vec![
@@ -366,10 +371,17 @@ impl DamengSink {
             ]
         };
         let rows = self.query(sql, &params).await?;
-        let mut cols = HashSet::new();
+        let mut cols = HashMap::new();
         for row in rows.iter() {
-            if let Ok(name) = row.get::<String>(0) {
-                cols.insert(name.to_ascii_lowercase());
+            if let (Ok(name), Ok(data_type)) = (row.get::<String>(0), row.get::<String>(1)) {
+                cols.insert(
+                    name.to_ascii_lowercase(),
+                    DamengColumnInfo {
+                        data_type,
+                        data_length: row.get::<i32>(2).unwrap_or(0).max(0) as u32,
+                        char_length: row.get::<i32>(3).unwrap_or(0).max(0) as u32,
+                    },
+                );
             }
         }
         Ok(cols)
@@ -578,9 +590,40 @@ impl DamengSink {
             .ok()
     }
 
-    fn should_modify_existing_column(mysql_type_token: &str) -> bool {
+    fn should_modify_existing_column(
+        mysql_type_token: &str,
+        existing_col: &DamengColumnInfo,
+    ) -> bool {
         let t = mysql_type_token.to_ascii_lowercase();
-        t.starts_with("varchar") || t.starts_with("char")
+        if !t.starts_with("varchar") && !t.starts_with("char") {
+            return false;
+        }
+
+        let expected_type = Self::map_mysql_type_to_dameng(mysql_type_token);
+        if expected_type == "CLOB" {
+            return !existing_col.data_type.eq_ignore_ascii_case("CLOB");
+        }
+
+        let expected_prefix = if t.starts_with("varchar") {
+            "VARCHAR"
+        } else {
+            "CHAR"
+        };
+        if !existing_col
+            .data_type
+            .to_ascii_uppercase()
+            .starts_with(expected_prefix)
+        {
+            return true;
+        }
+
+        match Self::mysql_type_length(mysql_type_token) {
+            Some(expected_chars) => {
+                existing_col.char_length < expected_chars
+                    || existing_col.data_length <= existing_col.char_length
+            }
+            None => existing_col.data_length <= existing_col.char_length,
+        }
     }
 }
 
@@ -835,5 +878,27 @@ mod tests {
             DamengSink::map_mysql_type_to_dameng("varchar(9000)"),
             "CLOB"
         );
+    }
+
+    #[test]
+    fn existing_char_columns_only_modify_when_needed() {
+        let byte_semantics = super::DamengColumnInfo {
+            data_type: "VARCHAR".to_string(),
+            data_length: 50,
+            char_length: 50,
+        };
+        let char_semantics = super::DamengColumnInfo {
+            data_type: "VARCHAR".to_string(),
+            data_length: 200,
+            char_length: 50,
+        };
+        assert!(DamengSink::should_modify_existing_column(
+            "varchar(50)",
+            &byte_semantics
+        ));
+        assert!(!DamengSink::should_modify_existing_column(
+            "varchar(50)",
+            &char_semantics
+        ));
     }
 }
