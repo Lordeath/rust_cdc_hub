@@ -226,9 +226,12 @@ sink_config:
     database: TARGET_SCHEMA
     pk_column: id
 
+auto_create_database: true  # 达梦：自动创建目标 schema，不是物理数据库
 auto_create_table: true
 auto_add_column: true
 ```
+
+达梦是单库多模式模型，`sink_config.database`/`sink_config.schema` 会作为目标 schema 使用；开启 `auto_create_database` 时会执行 `CREATE SCHEMA`，然后切换到该 schema 再自动建表/补列。
 
 ### MySQL → Print 示例
 

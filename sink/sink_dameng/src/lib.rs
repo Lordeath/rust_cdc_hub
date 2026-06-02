@@ -57,6 +57,7 @@ pub struct DamengSink {
     buffer: Mutex<Vec<DataBuffer>>,
     initialized: RwLock<bool>,
     sink_batch_size: usize,
+    auto_create_database: bool,
     auto_create_table: bool,
     auto_add_column: bool,
     table_info_cache: Mutex<CaseInsensitiveHashMapTableInfoVo>,
@@ -79,11 +80,8 @@ impl DamengSink {
             }
         };
 
-        let mut client = Self::connect_client(&host, port, &username, &password)
+        let client = Self::connect_client(&host, port, &username, &password)
             .unwrap_or_else(|e| panic!("Failed to connect to Dameng: {}", e));
-        if !schema.is_empty() {
-            let _ = client.execute(format!("SET SCHEMA {}", Self::quote_ident(&schema)).as_str());
-        }
 
         let sink_batch_size = config.sink_batch_size.unwrap_or(256);
         let sink = DamengSink {
@@ -97,12 +95,16 @@ impl DamengSink {
             buffer: Mutex::new(Vec::with_capacity(sink_batch_size)),
             initialized: RwLock::new(false),
             sink_batch_size,
+            auto_create_database: config.auto_create_database.unwrap_or(true),
             auto_create_table: config.auto_create_table.unwrap_or(true),
             auto_add_column: config.auto_add_column.unwrap_or(true),
             table_info_cache: Mutex::new(CaseInsensitiveHashMapTableInfoVo::new_with_no_arg()),
             columns_cache: Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg()),
             checkpoint: Mutex::new(HashMap::new()),
         };
+        sink.ensure_database()
+            .await
+            .unwrap_or_else(|e| panic!("Dameng ensure database failed: {}", e));
         sink.ensure_schema().await;
         sink
     }
@@ -143,6 +145,42 @@ impl DamengSink {
                     "Dameng ensure columns failed: {} {}",
                     table_info.table_name, e
                 );
+            }
+        }
+    }
+
+    async fn ensure_database(&self) -> Result<(), String> {
+        if self.schema.is_empty() {
+            return Ok(());
+        }
+
+        let set_schema_sql = Self::set_schema_sql(self.schema.as_str());
+        match self.execute(set_schema_sql.as_str()).await {
+            Ok(_) => return Ok(()),
+            Err(e) if !self.auto_create_database => {
+                return Err(format!(
+                    "target schema {} is unavailable and auto_create_database is false: {}",
+                    self.schema, e
+                ));
+            }
+            Err(set_schema_error) => {
+                let create_schema_sql = Self::create_schema_sql(self.schema.as_str());
+                match self.execute(create_schema_sql.as_str()).await {
+                    Ok(_) => {
+                        info!("Dameng auto create schema success: {}", self.schema);
+                    }
+                    Err(create_schema_error) => match self.execute(set_schema_sql.as_str()).await {
+                        Ok(_) => return Ok(()),
+                        Err(retry_set_schema_error) => {
+                            return Err(format!(
+                                "set schema failed: {}; create schema failed: {}; retry set schema failed: {}",
+                                set_schema_error, create_schema_error, retry_set_schema_error
+                            ));
+                        }
+                    },
+                }
+                self.execute(set_schema_sql.as_str()).await?;
+                Ok(())
             }
         }
     }
@@ -253,7 +291,7 @@ impl DamengSink {
         let sql = if self.schema.is_empty() {
             "SELECT COUNT(*) FROM USER_TABLES WHERE TABLE_NAME = ? OR TABLE_NAME = ?"
         } else {
-            "SELECT COUNT(*) FROM ALL_TABLES WHERE OWNER = ? AND (TABLE_NAME = ? OR TABLE_NAME = ?)"
+            "SELECT COUNT(*) FROM ALL_TABLES WHERE (OWNER = ? OR OWNER = ?) AND (TABLE_NAME = ? OR TABLE_NAME = ?)"
         };
         let params = if self.schema.is_empty() {
             vec![
@@ -262,6 +300,7 @@ impl DamengSink {
             ]
         } else {
             vec![
+                DamengParam::Text(self.schema.to_string()),
                 DamengParam::Text(self.schema.to_ascii_uppercase()),
                 DamengParam::Text(table_name.to_string()),
                 DamengParam::Text(table_upper),
@@ -280,7 +319,7 @@ impl DamengSink {
         let sql = if self.schema.is_empty() {
             "SELECT COLUMN_NAME FROM USER_TAB_COLUMNS WHERE TABLE_NAME = ? OR TABLE_NAME = ?"
         } else {
-            "SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE OWNER = ? AND (TABLE_NAME = ? OR TABLE_NAME = ?)"
+            "SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE (OWNER = ? OR OWNER = ?) AND (TABLE_NAME = ? OR TABLE_NAME = ?)"
         };
         let params = if self.schema.is_empty() {
             vec![
@@ -289,6 +328,7 @@ impl DamengSink {
             ]
         } else {
             vec![
+                DamengParam::Text(self.schema.to_string()),
                 DamengParam::Text(self.schema.to_ascii_uppercase()),
                 DamengParam::Text(table_name.to_string()),
                 DamengParam::Text(table_upper),
@@ -305,7 +345,11 @@ impl DamengSink {
     }
 
     async fn execute(&self, sql: &str) -> Result<u64, String> {
-        match self.client.lock().await.execute(sql) {
+        let first_result = {
+            let mut client = self.client.lock().await;
+            client.execute(sql)
+        };
+        match first_result {
             Ok(v) => Ok(v),
             Err(e) => {
                 error!("Dameng execute failed, retrying: {} sql: {}", e, sql);
@@ -362,6 +406,14 @@ impl DamengSink {
 
     fn quote_ident(identifier: &str) -> String {
         format!("\"{}\"", identifier.replace('"', "\"\""))
+    }
+
+    fn create_schema_sql(schema: &str) -> String {
+        format!("CREATE SCHEMA {}", Self::quote_ident(schema))
+    }
+
+    fn set_schema_sql(schema: &str) -> String {
+        format!("SET SCHEMA {}", Self::quote_ident(schema))
     }
 
     fn qualified_table(&self, table_name: &str) -> String {
@@ -684,5 +736,26 @@ impl DamengSink {
         debug!("Dameng DELETE: {}", sql);
         self.execute_with_params(sql.as_str(), &params).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DamengSink;
+
+    #[test]
+    fn schema_sql_quotes_identifiers() {
+        assert_eq!(
+            DamengSink::create_schema_sql("TARGET_SCHEMA"),
+            "CREATE SCHEMA \"TARGET_SCHEMA\""
+        );
+        assert_eq!(
+            DamengSink::set_schema_sql("TARGET_SCHEMA"),
+            "SET SCHEMA \"TARGET_SCHEMA\""
+        );
+        assert_eq!(
+            DamengSink::create_schema_sql("target\"schema"),
+            "CREATE SCHEMA \"target\"\"schema\""
+        );
     }
 }

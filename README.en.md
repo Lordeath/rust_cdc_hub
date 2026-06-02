@@ -226,9 +226,12 @@ sink_config:
     database: TARGET_SCHEMA
     pk_column: id
 
+auto_create_database: true  # Dameng: creates the target schema, not a physical database
 auto_create_table: true
 auto_add_column: true
 ```
+
+Dameng uses a single-database, multi-schema model. `sink_config.database`/`sink_config.schema` is treated as the target schema; when `auto_create_database` is enabled, the sink runs `CREATE SCHEMA`, switches to that schema, and then creates tables/adds columns as needed.
 
 ### MySQL → Print example
 
