@@ -29,6 +29,12 @@ cargo test test_name -- --nocapture
 cargo test -p common --verbose
 ```
 
+## Git Workflow
+
+- After code changes, run the relevant formatting/check/test commands before reporting the work as done.
+- When the user asks to commit and push (for example, "git commit and push"), stage only the intended files, create a concise commit, and push the current branch after the checks/tests pass.
+- If required checks/tests fail or cannot be run, do not commit/push unless the user explicitly approves that state; report the failure and what remains.
+
 ## Architecture
 
 ### Crate Structure (Workspace)

@@ -60,6 +60,7 @@ pub struct DamengSink {
     auto_create_database: bool,
     auto_create_table: bool,
     auto_add_column: bool,
+    auto_modify_column: bool,
     table_info_cache: Mutex<CaseInsensitiveHashMapTableInfoVo>,
     columns_cache: Mutex<CaseInsensitiveHashMapVecString>,
     checkpoint: Mutex<HashMap<String, MysqlCheckPointDetailEntity>>,
@@ -98,6 +99,7 @@ impl DamengSink {
             auto_create_database: config.auto_create_database.unwrap_or(true),
             auto_create_table: config.auto_create_table.unwrap_or(true),
             auto_add_column: config.auto_add_column.unwrap_or(true),
+            auto_modify_column: config.auto_modify_column.unwrap_or(true),
             table_info_cache: Mutex::new(CaseInsensitiveHashMapTableInfoVo::new_with_no_arg()),
             columns_cache: Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg()),
             checkpoint: Mutex::new(HashMap::new()),
@@ -239,7 +241,7 @@ impl DamengSink {
     }
 
     async fn ensure_columns(&self, table_info: &TableInfoVo) -> Result<(), String> {
-        if !self.auto_add_column {
+        if !self.auto_add_column && !self.auto_modify_column {
             return Ok(());
         }
         let existing_cols = self
@@ -251,9 +253,6 @@ impl DamengSink {
         let defs =
             extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
         for src_col in &table_info.columns {
-            if existing_cols.contains(&src_col.to_ascii_lowercase()) {
-                continue;
-            }
             let key = src_col.to_ascii_lowercase();
             let def = match defs.get(&key) {
                 None => continue,
@@ -265,6 +264,31 @@ impl DamengSink {
             };
             let nullable = mysql_column_allows_null_from_definition(def.as_str());
             let nullable_sql = if nullable { "NULL" } else { "NOT NULL" };
+            if existing_cols.contains(&src_col.to_ascii_lowercase()) {
+                if self.auto_modify_column && Self::should_modify_existing_column(&mysql_type) {
+                    let sql = format!(
+                        "ALTER TABLE {} MODIFY {} {} {}",
+                        self.qualified_table(table_info.table_name.as_str()),
+                        Self::quote_ident(src_col),
+                        Self::map_mysql_type_to_dameng(mysql_type.as_str()),
+                        nullable_sql
+                    );
+                    match self.execute(sql.as_str()).await {
+                        Ok(_) => info!(
+                            "Dameng auto modify column success: {} {}",
+                            table_info.table_name, src_col
+                        ),
+                        Err(e) => error!(
+                            "Dameng auto modify column failed: {} {} {}",
+                            table_info.table_name, src_col, e
+                        ),
+                    }
+                }
+                continue;
+            }
+            if !self.auto_add_column {
+                continue;
+            }
             let sql = format!(
                 "ALTER TABLE {} ADD {} {} {}",
                 self.qualified_table(table_info.table_name.as_str()),
@@ -505,8 +529,11 @@ impl DamengSink {
         if t.starts_with("time") {
             return "TIME".to_string();
         }
-        if t.starts_with("varchar") || t.starts_with("char") {
-            return mysql_type_token.to_ascii_uppercase();
+        if t.starts_with("varchar") {
+            return Self::map_mysql_char_type_to_dameng("VARCHAR", mysql_type_token, 8000);
+        }
+        if t.starts_with("char") {
+            return Self::map_mysql_char_type_to_dameng("CHAR", mysql_type_token, 2000);
         }
         if t.contains("text")
             || t.starts_with("json")
@@ -518,7 +545,35 @@ impl DamengSink {
         if t.contains("blob") || t.contains("binary") {
             return "BLOB".to_string();
         }
-        "VARCHAR(255)".to_string()
+        "VARCHAR(255 CHAR)".to_string()
+    }
+
+    fn map_mysql_char_type_to_dameng(
+        dameng_type: &str,
+        mysql_type_token: &str,
+        char_limit: u32,
+    ) -> String {
+        match Self::mysql_type_length(mysql_type_token) {
+            Some(len) if len > char_limit => "CLOB".to_string(),
+            Some(len) => format!("{}({} CHAR)", dameng_type, len),
+            None => format!("{}(255 CHAR)", dameng_type),
+        }
+    }
+
+    fn mysql_type_length(mysql_type_token: &str) -> Option<u32> {
+        let start = mysql_type_token.find('(')? + 1;
+        let end = mysql_type_token[start..].find(')')? + start;
+        mysql_type_token[start..end]
+            .split(',')
+            .next()?
+            .trim()
+            .parse::<u32>()
+            .ok()
+    }
+
+    fn should_modify_existing_column(mysql_type_token: &str) -> bool {
+        let t = mysql_type_token.to_ascii_lowercase();
+        t.starts_with("varchar") || t.starts_with("char")
     }
 }
 
@@ -756,6 +811,22 @@ mod tests {
         assert_eq!(
             DamengSink::create_schema_sql("target\"schema"),
             "CREATE SCHEMA \"target\"\"schema\""
+        );
+    }
+
+    #[test]
+    fn mysql_char_types_use_character_semantics() {
+        assert_eq!(
+            DamengSink::map_mysql_type_to_dameng("varchar(50)"),
+            "VARCHAR(50 CHAR)"
+        );
+        assert_eq!(
+            DamengSink::map_mysql_type_to_dameng("char(20)"),
+            "CHAR(20 CHAR)"
+        );
+        assert_eq!(
+            DamengSink::map_mysql_type_to_dameng("varchar(9000)"),
+            "CLOB"
         );
     }
 }
