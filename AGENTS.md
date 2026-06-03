@@ -17,7 +17,7 @@
 - 代码改动验证通过后，还要跑 `docker build --network host -t fangxiangmin/rust_cdc_hub:0.0.3 -f "debian.dockerfile" .`。
 - 文档-only 变更至少检查 diff 和 `git status`；如果同一批里包含代码改动，仍然按代码改动验证。
 - 检查失败、无法验证或工作区里有不确定的无关改动时，不要 commit/push；需要说明失败命令和原因。
-- commit message 要简短，说明具体变更。
+- commit message 要简短，说明具体变更，并尽量使用中文。
 
 ## 项目要点
 
