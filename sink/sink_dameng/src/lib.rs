@@ -116,7 +116,9 @@ impl DamengSink {
         sink.ensure_database()
             .await
             .unwrap_or_else(|e| panic!("Dameng ensure database failed: {}", e));
-        sink.ensure_schema().await;
+        sink.ensure_schema()
+            .await
+            .unwrap_or_else(|e| panic!("Dameng ensure schema failed: {}", e));
         sink
     }
 
@@ -143,21 +145,22 @@ impl DamengSink {
         Ok(())
     }
 
-    async fn ensure_schema(&self) {
+    async fn ensure_schema(&self) -> Result<(), String> {
         for table_info in &self.table_info_list {
-            if let Err(e) = self.ensure_table(table_info).await {
-                error!(
+            self.ensure_table(table_info).await.map_err(|e| {
+                format!(
                     "Dameng ensure table failed: {} {}",
                     table_info.table_name, e
-                );
-            }
-            if let Err(e) = self.ensure_columns(table_info).await {
-                error!(
+                )
+            })?;
+            self.ensure_columns(table_info).await.map_err(|e| {
+                format!(
                     "Dameng ensure columns failed: {} {}",
                     table_info.table_name, e
-                );
-            }
+                )
+            })?;
         }
+        Ok(())
     }
 
     async fn ensure_database(&self) -> Result<(), String> {
@@ -273,6 +276,7 @@ impl DamengSink {
             };
             let nullable = mysql_column_allows_null_from_definition(def.as_str());
             let nullable_sql = if nullable { "NULL" } else { "NOT NULL" };
+            let dameng_type = Self::map_mysql_type_to_dameng(mysql_type.as_str());
             if let Some(existing_col) = existing_cols.get(key.as_str()) {
                 if self.auto_modify_column
                     && Self::should_modify_existing_column(&mysql_type, existing_col)
@@ -281,7 +285,7 @@ impl DamengSink {
                         "ALTER TABLE {} MODIFY {} {} {}",
                         self.qualified_table(table_info.table_name.as_str()),
                         Self::quote_ident(src_col),
-                        Self::map_mysql_type_to_dameng(mysql_type.as_str()),
+                        dameng_type,
                         nullable_sql
                     );
                     match self.execute(sql.as_str()).await {
@@ -289,10 +293,14 @@ impl DamengSink {
                             "Dameng auto modify column success: {} {}",
                             table_info.table_name, src_col
                         ),
-                        Err(e) => error!(
-                            "Dameng auto modify column failed: {} {} {}",
-                            table_info.table_name, src_col, e
-                        ),
+                        Err(e) => {
+                            let msg = format!(
+                                "Dameng auto modify column failed: {} {} {}",
+                                table_info.table_name, src_col, e
+                            );
+                            error!("{}", msg);
+                            return Err(msg);
+                        }
                     }
                 }
                 continue;
@@ -304,7 +312,7 @@ impl DamengSink {
                 "ALTER TABLE {} ADD {} {} {}",
                 self.qualified_table(table_info.table_name.as_str()),
                 Self::quote_ident(src_col),
-                Self::map_mysql_type_to_dameng(mysql_type.as_str()),
+                dameng_type,
                 nullable_sql
             );
             match self.execute(sql.as_str()).await {
@@ -312,10 +320,14 @@ impl DamengSink {
                     "Dameng auto add column success: {} {}",
                     table_info.table_name, src_col
                 ),
-                Err(e) => error!(
-                    "Dameng auto add column failed: {} {} {}",
-                    table_info.table_name, src_col, e
-                ),
+                Err(e) => {
+                    let msg = format!(
+                        "Dameng auto add column failed: {} {} {}",
+                        table_info.table_name, src_col, e
+                    );
+                    error!("{}", msg);
+                    return Err(msg);
+                }
             }
         }
         Ok(())
@@ -577,6 +589,27 @@ impl DamengSink {
         "VARCHAR(255 CHAR)".to_string()
     }
 
+    fn source_column_dameng_type(table_info: &TableInfoVo, column_name: &str) -> Option<String> {
+        let defs =
+            extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
+        let def = defs.get(column_name.to_ascii_lowercase().as_str())?;
+        let mysql_type = mysql_type_token_from_column_definition(def.as_str())?;
+        Some(Self::map_mysql_type_to_dameng(mysql_type.as_str()))
+    }
+
+    fn is_source_clob_column(table_info: &TableInfoVo, column_name: &str) -> bool {
+        Self::source_column_dameng_type(table_info, column_name)
+            .is_some_and(|dameng_type| dameng_type.eq_ignore_ascii_case("CLOB"))
+    }
+
+    fn value_placeholder(table_info: &TableInfoVo, column_name: &str) -> &'static str {
+        if Self::is_source_clob_column(table_info, column_name) {
+            "CAST(? AS CLOB)"
+        } else {
+            "?"
+        }
+    }
+
     fn map_mysql_char_type_to_dameng(
         dameng_type: &str,
         mysql_type_token: &str,
@@ -785,10 +818,17 @@ impl DamengSink {
         if pk.is_none() {
             return Err(format!("pk is empty: {}.{}", table_name, pk_name));
         }
+        let table_info = self.table_info_cache.lock().await.get(table_name);
 
         let set_sql = columns
             .iter()
-            .map(|c| format!("{} = ?", Self::quote_ident(c)))
+            .map(|c| {
+                format!(
+                    "{} = {}",
+                    Self::quote_ident(c),
+                    Self::value_placeholder(&table_info, c)
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let update_sql = format!(
@@ -815,7 +855,11 @@ impl DamengSink {
             .map(|c| Self::quote_ident(c))
             .collect::<Vec<_>>()
             .join(", ");
-        let placeholders = vec!["?"; columns.len()].join(", ");
+        let placeholders = columns
+            .iter()
+            .map(|c| Self::value_placeholder(&table_info, c))
+            .collect::<Vec<_>>()
+            .join(", ");
         let insert_sql = format!(
             "INSERT INTO {} ({}) VALUES ({})",
             self.qualified_table(table_name),
@@ -856,6 +900,8 @@ impl DamengSink {
 
 #[cfg(test)]
 mod tests {
+    use common::TableInfoVo;
+
     use super::DamengSink;
 
     #[test]
@@ -914,5 +960,27 @@ mod tests {
             "varchar(50)",
             &char_semantics
         ));
+    }
+
+    #[test]
+    fn large_varchar_columns_use_clob_placeholder() {
+        let table_info = TableInfoVo {
+            table_name: "ns_system_log".to_string(),
+            pk_column: "id".to_string(),
+            create_table_sql: r#"CREATE TABLE `ns_system_log` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `param` varchar(4000) DEFAULT NULL,
+  `modul` varchar(100) DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3"#
+                .to_string(),
+            columns: vec!["id".to_string(), "param".to_string(), "modul".to_string()],
+        };
+
+        assert_eq!(
+            DamengSink::value_placeholder(&table_info, "param"),
+            "CAST(? AS CLOB)"
+        );
+        assert_eq!(DamengSink::value_placeholder(&table_info, "modul"), "?");
     }
 }
