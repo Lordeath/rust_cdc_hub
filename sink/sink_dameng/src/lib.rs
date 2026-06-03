@@ -363,26 +363,19 @@ impl DamengSink {
     }
 
     async fn table_exists(&self, table_name: &str) -> Result<bool, String> {
-        let table_upper = table_name.to_ascii_uppercase();
         let sql = if self.schema.is_empty() {
-            "SELECT COUNT(*) FROM USER_TABLES WHERE TABLE_NAME = ? OR TABLE_NAME = ?"
+            format!(
+                "SELECT COUNT(*) FROM USER_TABLES WHERE {}",
+                Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
+            )
         } else {
-            "SELECT COUNT(*) FROM ALL_TABLES WHERE (OWNER = ? OR OWNER = ?) AND (TABLE_NAME = ? OR TABLE_NAME = ?)"
+            format!(
+                "SELECT COUNT(*) FROM ALL_TABLES WHERE {} AND {}",
+                Self::eq_original_or_upper_sql("OWNER", &self.schema),
+                Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
+            )
         };
-        let params = if self.schema.is_empty() {
-            vec![
-                DamengParam::Text(table_name.to_string()),
-                DamengParam::Text(table_upper),
-            ]
-        } else {
-            vec![
-                DamengParam::Text(self.schema.to_string()),
-                DamengParam::Text(self.schema.to_ascii_uppercase()),
-                DamengParam::Text(table_name.to_string()),
-                DamengParam::Text(table_upper),
-            ]
-        };
-        let rows = self.query(sql, &params).await?;
+        let rows = self.query(sql.as_str(), &[]).await?;
         let count = rows
             .first()
             .and_then(|row| row.get::<i32>(0).ok())
@@ -394,26 +387,19 @@ impl DamengSink {
         &self,
         table_name: &str,
     ) -> Result<HashMap<String, DamengColumnInfo>, String> {
-        let table_upper = table_name.to_ascii_uppercase();
         let sql = if self.schema.is_empty() {
-            "SELECT COLUMN_NAME, DATA_TYPE, DATA_LENGTH, CHAR_LENGTH FROM USER_TAB_COLUMNS WHERE TABLE_NAME = ? OR TABLE_NAME = ?"
+            format!(
+                "SELECT COLUMN_NAME, DATA_TYPE, DATA_LENGTH, CHAR_LENGTH FROM USER_TAB_COLUMNS WHERE {}",
+                Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
+            )
         } else {
-            "SELECT COLUMN_NAME, DATA_TYPE, DATA_LENGTH, CHAR_LENGTH FROM ALL_TAB_COLUMNS WHERE (OWNER = ? OR OWNER = ?) AND (TABLE_NAME = ? OR TABLE_NAME = ?)"
+            format!(
+                "SELECT COLUMN_NAME, DATA_TYPE, DATA_LENGTH, CHAR_LENGTH FROM ALL_TAB_COLUMNS WHERE {} AND {}",
+                Self::eq_original_or_upper_sql("OWNER", &self.schema),
+                Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
+            )
         };
-        let params = if self.schema.is_empty() {
-            vec![
-                DamengParam::Text(table_name.to_string()),
-                DamengParam::Text(table_upper),
-            ]
-        } else {
-            vec![
-                DamengParam::Text(self.schema.to_string()),
-                DamengParam::Text(self.schema.to_ascii_uppercase()),
-                DamengParam::Text(table_name.to_string()),
-                DamengParam::Text(table_upper),
-            ]
-        };
-        let rows = self.query(sql, &params).await?;
+        let rows = self.query(sql.as_str(), &[]).await?;
         let mut cols = HashMap::new();
         for row in rows.iter() {
             if let (Ok(name), Ok(data_type)) = (row.get::<String>(0), row.get::<String>(1)) {
@@ -428,6 +414,20 @@ impl DamengSink {
             }
         }
         Ok(cols)
+    }
+
+    fn quote_literal(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    fn eq_original_or_upper_sql(column_name: &str, value: &str) -> String {
+        format!(
+            "({} = {} OR {} = {})",
+            column_name,
+            Self::quote_literal(value),
+            column_name,
+            Self::quote_literal(value.to_ascii_uppercase().as_str())
+        )
     }
 
     async fn execute(&self, sql: &str) -> Result<u64, String> {
@@ -946,6 +946,18 @@ mod tests {
         assert_eq!(
             DamengSink::create_schema_sql("target\"schema"),
             "CREATE SCHEMA \"target\"\"schema\""
+        );
+    }
+
+    #[test]
+    fn metadata_sql_quotes_literals() {
+        assert_eq!(
+            DamengSink::quote_literal("newsee'system"),
+            "'newsee''system'"
+        );
+        assert_eq!(
+            DamengSink::eq_original_or_upper_sql("OWNER", "newsee-system"),
+            "(OWNER = 'newsee-system' OR OWNER = 'NEWSEE-SYSTEM')"
         );
     }
 
