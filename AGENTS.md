@@ -14,6 +14,7 @@
 - 我完成任何改动后，包括文档改动，都要在验证通过后自动 commit 并 push，不要等用户再次要求。
 - 提交前必须看 `git status`，只暂存本次任务相关文件；不要把用户其他改动混进 commit。
 - 代码改动至少跑 `cargo check` 和相关 `cargo test`；触碰具体 crate 时优先跑对应 `cargo test -p <crate>`。
+- 代码改动验证通过后，还要跑 `docker build --network host -t fangxiangmin/rust_cdc_hub:0.0.3 -f "debian.dockerfile" .`。
 - 文档-only 变更至少检查 diff 和 `git status`；如果同一批里包含代码改动，仍然按代码改动验证。
 - 检查失败、无法验证或工作区里有不确定的无关改动时，不要 commit/push；需要说明失败命令和原因。
 - commit message 要简短，说明具体变更。
