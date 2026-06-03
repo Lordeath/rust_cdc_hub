@@ -17,6 +17,8 @@ use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, trace};
 
+const DAMENG_INLINE_STRING_CHAR_LIMIT: u32 = 2000;
+
 #[derive(Debug, Clone)]
 enum DamengParam {
     Null,
@@ -549,10 +551,18 @@ impl DamengSink {
             return "TIME".to_string();
         }
         if t.starts_with("varchar") {
-            return Self::map_mysql_char_type_to_dameng("VARCHAR", mysql_type_token, 8000);
+            return Self::map_mysql_char_type_to_dameng(
+                "VARCHAR",
+                mysql_type_token,
+                DAMENG_INLINE_STRING_CHAR_LIMIT,
+            );
         }
         if t.starts_with("char") {
-            return Self::map_mysql_char_type_to_dameng("CHAR", mysql_type_token, 2000);
+            return Self::map_mysql_char_type_to_dameng(
+                "CHAR",
+                mysql_type_token,
+                DAMENG_INLINE_STRING_CHAR_LIMIT,
+            );
         }
         if t.contains("text")
             || t.starts_with("json")
@@ -873,6 +883,10 @@ mod tests {
         assert_eq!(
             DamengSink::map_mysql_type_to_dameng("char(20)"),
             "CHAR(20 CHAR)"
+        );
+        assert_eq!(
+            DamengSink::map_mysql_type_to_dameng("varchar(4000)"),
+            "CLOB"
         );
         assert_eq!(
             DamengSink::map_mysql_type_to_dameng("varchar(9000)"),
