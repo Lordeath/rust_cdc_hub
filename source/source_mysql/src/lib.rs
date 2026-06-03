@@ -9,7 +9,7 @@ use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::runtime_progress;
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value,
-    get_mysql_pool_by_url, mysql_row_to_hashmap,
+    get_mysql_pool_by_url, mysql_row_to_hashmap, redact_connection_url_password,
 };
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
@@ -726,7 +726,12 @@ impl Source for MySQLSource {
                         }
 
                         let pk_column = table_info_vo.pk_column.clone();
-                        info!("开始初始化数据源: {}.{}", config.connection_url, table_name);
+                        let redacted_connection_url =
+                            redact_connection_url_password(&config.connection_url);
+                        info!(
+                            "开始初始化数据源: {}.{}",
+                            redacted_connection_url, table_name
+                        );
                         runtime_progress::begin_table_initialization(&table_name).await;
                         let start = Instant::now();
                         let mut count = 0;
@@ -773,7 +778,7 @@ impl Source for MySQLSource {
                             .await;
                         info!(
                             "MySQL数据源初始化完成 {}.{} count: {} cost: {:?}",
-                            config.connection_url,
+                            redacted_connection_url,
                             table_name,
                             count,
                             start.elapsed()
@@ -836,8 +841,9 @@ impl Source for MySQLSource {
                     StartPosition::Gtid(g) => format!("GTID:{}", g),
                 };
                 info!(
-                    "Connecting to Binlog: {:?} with start_position: {}",
-                    config.connection_url, start_pos_str
+                    "Connecting to Binlog: {} with start_position: {}",
+                    redact_connection_url_password(&config.connection_url),
+                    start_pos_str
                 );
                 let client =
                     BinlogClient::new(&config.connection_url, config.server_id, start_position)

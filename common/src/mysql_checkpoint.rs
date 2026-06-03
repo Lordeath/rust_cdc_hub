@@ -1,4 +1,4 @@
-use crate::get_mysql_pool_by_url;
+use crate::{get_mysql_pool_by_url, redact_connection_url_password};
 use serde::{Deserialize, Serialize};
 use sqlx::{Column, MySql, Pool, Row};
 use std::fs;
@@ -45,7 +45,12 @@ impl MysqlCheckPointDetailEntity {
             &format!("checkpoint 初始化建立连接 {}", &table),
         )
         .await
-        .unwrap_or_else(|_| panic!("获取mysql连接池失败: {}", &connection_url));
+        .unwrap_or_else(|_| {
+            panic!(
+                "获取mysql连接池失败: {}",
+                redact_connection_url_password(connection_url)
+            )
+        });
 
         // 4. 获取当前 MySQL binlog 起点
         let (last_binlog_filename, last_binlog_position) =

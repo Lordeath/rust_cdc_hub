@@ -664,7 +664,11 @@ pub async fn get_mysql_pool_by_url(
     connection_url: &str,
     from: &str,
 ) -> Result<Pool<MySql>, String> {
-    info!("Connecting to MySQL: {} from: {}", connection_url, from);
+    info!(
+        "Connecting to MySQL: {} from: {}",
+        redact_connection_url_password(connection_url),
+        from
+    );
     match MySqlPoolOptions::new()
         .max_connections(10)
         .acquire_timeout(Duration::from_secs(10))
@@ -685,6 +689,34 @@ pub async fn get_mysql_pool_by_url(
             Err(e.to_string())
         }
     }
+}
+
+pub fn redact_connection_url_password(connection_url: &str) -> String {
+    let Some(scheme_end) = connection_url.find("://") else {
+        return connection_url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let rest = &connection_url[authority_start..];
+    let authority_end = rest
+        .find(|c| matches!(c, '/' | '?' | '#'))
+        .map(|idx| authority_start + idx)
+        .unwrap_or(connection_url.len());
+    let authority = &connection_url[authority_start..authority_end];
+    let Some(at_pos_rel) = authority.rfind('@') else {
+        return connection_url.to_string();
+    };
+    let userinfo = &authority[..at_pos_rel];
+    let Some(colon_pos_rel) = userinfo.find(':') else {
+        return connection_url.to_string();
+    };
+
+    let password_start = authority_start + colon_pos_rel + 1;
+    let password_end = authority_start + at_pos_rel;
+    format!(
+        "{}******{}",
+        &connection_url[..password_start],
+        &connection_url[password_end..]
+    )
 }
 
 #[cfg(test)]
@@ -716,5 +748,35 @@ mod tests {
     fn test_resolve_string_none() {
         let v = Value::None;
         assert_eq!(v.resolve_string(), "null");
+    }
+
+    #[test]
+    fn test_redact_connection_url_password() {
+        assert_eq!(
+            redact_connection_url_password("mysql://user:secret@127.0.0.1:3306/demo"),
+            "mysql://user:******@127.0.0.1:3306/demo"
+        );
+    }
+
+    #[test]
+    fn test_redact_connection_url_password_preserves_suffix() {
+        assert_eq!(
+            redact_connection_url_password(
+                "mysql://user:secret@127.0.0.1:3306/demo?ssl-mode=required"
+            ),
+            "mysql://user:******@127.0.0.1:3306/demo?ssl-mode=required"
+        );
+    }
+
+    #[test]
+    fn test_redact_connection_url_password_without_password() {
+        assert_eq!(
+            redact_connection_url_password("mysql://user@127.0.0.1:3306/demo"),
+            "mysql://user@127.0.0.1:3306/demo"
+        );
+        assert_eq!(
+            redact_connection_url_password("mysql://127.0.0.1:3306/demo"),
+            "mysql://127.0.0.1:3306/demo"
+        );
     }
 }
