@@ -653,7 +653,15 @@ pub fn mysql_row_to_hashmap(row: &MySqlRow) -> CaseInsensitiveHashMap {
                         panic!("类型转换失败: {}", column.type_info().name());
                     }
                 },
-                "FLOAT" | "DOUBLE" => match row.try_get::<f64, _>(name.as_str()) {
+                "FLOAT" => match row.try_get::<f32, _>(name.as_str()) {
+                    Ok(v) => Value::Float(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "DOUBLE" => match row.try_get::<f64, _>(name.as_str()) {
                     Ok(v) => Value::Double(v),
                     Err(e) => {
                         error!("类型转换失败: {}", column.type_info().name());
