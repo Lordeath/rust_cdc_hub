@@ -54,6 +54,10 @@ pub fn mysql_column_allows_null_from_definition(definition: &str) -> bool {
     !s.contains("not null")
 }
 
+pub fn mysql_column_is_auto_increment_from_definition(definition: &str) -> bool {
+    definition.to_ascii_lowercase().contains("auto_increment")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +93,16 @@ mod tests {
         ));
         assert!(mysql_column_allows_null_from_definition(
             "`x` int(11) DEFAULT NULL"
+        ));
+    }
+
+    #[test]
+    fn mysql_auto_increment_parses_flag() {
+        assert!(mysql_column_is_auto_increment_from_definition(
+            "`id` bigint NOT NULL AUTO_INCREMENT"
+        ));
+        assert!(!mysql_column_is_auto_increment_from_definition(
+            "`id` bigint NOT NULL"
         ));
     }
 }

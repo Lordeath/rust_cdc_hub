@@ -6,7 +6,7 @@ use common::metrics::{SINK_EVENTS_TOTAL, SINK_FLUSH_DURATION_SECONDS, SINK_FLUSH
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::schema::{
     extract_mysql_create_table_column_definitions, mysql_column_allows_null_from_definition,
-    mysql_type_token_from_column_definition,
+    mysql_column_is_auto_increment_from_definition, mysql_type_token_from_column_definition,
 };
 use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value};
 use dameng::Client;
@@ -227,10 +227,12 @@ impl DamengSink {
                 nullable = false;
             }
             let nullable_sql = if nullable { "NULL" } else { "NOT NULL" };
+            let auto_increment = src_col.eq_ignore_ascii_case(table_info.pk_column.as_str())
+                && mysql_column_is_auto_increment_from_definition(def.as_str());
             cols_sql.push(format!(
                 "{} {} {}",
                 Self::quote_ident(src_col),
-                Self::map_mysql_type_to_dameng(mysql_type.as_str()),
+                Self::map_mysql_type_to_dameng_for_column(mysql_type.as_str(), auto_increment),
                 nullable_sql
             ));
         }
@@ -570,77 +572,91 @@ impl DamengSink {
     }
 
     fn map_mysql_type_to_dameng(mysql_type_token: &str) -> String {
+        Self::map_mysql_type_to_dameng_for_column(mysql_type_token, false)
+    }
+
+    fn map_mysql_type_to_dameng_for_column(mysql_type_token: &str, auto_increment: bool) -> String {
         let t = mysql_type_token.to_ascii_lowercase();
-        if t.starts_with("tinyint(1)") || t.starts_with("boolean") || t.starts_with("bool") {
+        if !auto_increment
+            && (t.starts_with("tinyint(1)") || t.starts_with("boolean") || t.starts_with("bool"))
+        {
             return "BIT".to_string();
         }
-        if t.starts_with("tinyint") {
+        let dameng_type = if t.starts_with("tinyint") {
             if t.contains("unsigned") {
-                return "SMALLINT".to_string();
+                "SMALLINT".to_string()
+            } else {
+                "TINYINT".to_string()
             }
-            return "TINYINT".to_string();
-        }
-        if t.starts_with("smallint") {
+        } else if t.starts_with("smallint") {
             if t.contains("unsigned") {
-                return "INT".to_string();
+                "INT".to_string()
+            } else {
+                "SMALLINT".to_string()
             }
-            return "SMALLINT".to_string();
-        }
-        if t.starts_with("mediumint") || t.starts_with("int") || t.starts_with("integer") {
+        } else if t.starts_with("mediumint") || t.starts_with("int") || t.starts_with("integer") {
             if t.contains("unsigned") {
-                return "BIGINT".to_string();
+                "BIGINT".to_string()
+            } else {
+                "INT".to_string()
             }
-            return "INT".to_string();
-        }
-        if t.starts_with("bigint") {
+        } else if t.starts_with("bigint") {
             if t.contains("unsigned") {
-                return "DECIMAL(20,0)".to_string();
+                "DECIMAL(20,0)".to_string()
+            } else {
+                "BIGINT".to_string()
             }
-            return "BIGINT".to_string();
-        }
-        if t.starts_with("float") {
-            return "FLOAT".to_string();
-        }
-        if t.starts_with("double") || t.starts_with("real") {
-            return "DOUBLE".to_string();
-        }
-        if t.starts_with("decimal") || t.starts_with("numeric") {
-            return mysql_type_token.to_ascii_uppercase();
-        }
-        if t.starts_with("datetime") || t.starts_with("timestamp") {
-            return "TIMESTAMP".to_string();
-        }
-        if t.starts_with("date") {
-            return "DATE".to_string();
-        }
-        if t.starts_with("time") {
-            return "TIME".to_string();
-        }
-        if t.starts_with("varchar") {
-            return Self::map_mysql_char_type_to_dameng(
+        } else if t.starts_with("float") {
+            "FLOAT".to_string()
+        } else if t.starts_with("double") || t.starts_with("real") {
+            "DOUBLE".to_string()
+        } else if t.starts_with("decimal") || t.starts_with("numeric") {
+            mysql_type_token.to_ascii_uppercase()
+        } else if t.starts_with("datetime") || t.starts_with("timestamp") {
+            "TIMESTAMP".to_string()
+        } else if t.starts_with("date") {
+            "DATE".to_string()
+        } else if t.starts_with("time") {
+            "TIME".to_string()
+        } else if t.starts_with("varchar") {
+            Self::map_mysql_char_type_to_dameng(
                 "VARCHAR",
                 mysql_type_token,
                 DAMENG_INLINE_STRING_CHAR_LIMIT,
-            );
-        }
-        if t.starts_with("char") {
-            return Self::map_mysql_char_type_to_dameng(
+            )
+        } else if t.starts_with("char") {
+            Self::map_mysql_char_type_to_dameng(
                 "CHAR",
                 mysql_type_token,
                 DAMENG_INLINE_STRING_CHAR_LIMIT,
-            );
-        }
-        if t.contains("text")
+            )
+        } else if t.contains("text")
             || t.starts_with("json")
             || t.starts_with("enum")
             || t.starts_with("set")
         {
-            return "CLOB".to_string();
+            "CLOB".to_string()
+        } else if t.contains("blob") || t.contains("binary") {
+            "BLOB".to_string()
+        } else {
+            "VARCHAR(255 CHAR)".to_string()
+        };
+
+        if auto_increment && Self::dameng_type_supports_identity(dameng_type.as_str()) {
+            format!("{} IDENTITY(1,1)", dameng_type)
+        } else {
+            dameng_type
         }
-        if t.contains("blob") || t.contains("binary") {
-            return "BLOB".to_string();
-        }
-        "VARCHAR(255 CHAR)".to_string()
+    }
+
+    fn dameng_type_supports_identity(dameng_type: &str) -> bool {
+        let t = dameng_type.to_ascii_uppercase();
+        t == "TINYINT"
+            || t == "SMALLINT"
+            || t == "INT"
+            || t == "BIGINT"
+            || t.starts_with("DECIMAL")
+            || t.starts_with("NUMERIC")
     }
 
     fn source_column_dameng_type(table_info: &TableInfoVo, column_name: &str) -> Option<String> {
@@ -1035,6 +1051,30 @@ mod tests {
         assert_eq!(
             DamengSink::map_mysql_type_to_dameng("varchar(9000)"),
             "CLOB"
+        );
+    }
+
+    #[test]
+    fn auto_increment_integer_columns_use_dameng_identity() {
+        assert_eq!(
+            DamengSink::map_mysql_type_to_dameng_for_column("bigint", false),
+            "BIGINT"
+        );
+        assert_eq!(
+            DamengSink::map_mysql_type_to_dameng_for_column("bigint", true),
+            "BIGINT IDENTITY(1,1)"
+        );
+        assert_eq!(
+            DamengSink::map_mysql_type_to_dameng_for_column("int(11) unsigned", true),
+            "BIGINT IDENTITY(1,1)"
+        );
+        assert_eq!(
+            DamengSink::map_mysql_type_to_dameng_for_column("bigint unsigned", true),
+            "DECIMAL(20,0) IDENTITY(1,1)"
+        );
+        assert_eq!(
+            DamengSink::map_mysql_type_to_dameng_for_column("tinyint(1)", true),
+            "TINYINT IDENTITY(1,1)"
         );
     }
 
