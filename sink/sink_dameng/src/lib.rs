@@ -544,6 +544,10 @@ impl DamengSink {
         error.contains("-2723") || error.to_ascii_uppercase().contains("IDENTITY_INSERT")
     }
 
+    fn is_duplicate_key_error(error: &str) -> bool {
+        error.contains("-6602") || error.to_ascii_lowercase().contains("unique constraint")
+    }
+
     fn identity_insert_cache_key(table_name: &str) -> String {
         table_name.to_ascii_lowercase()
     }
@@ -916,7 +920,17 @@ impl Sink for DamengSink {
                 .inc();
 
             let result = match record.op {
-                Operation::CREATE(_) | Operation::UPDATE => {
+                Operation::CREATE(true) => {
+                    let columns = columns_cache.get(table_name.as_str());
+                    self.insert_or_update_record(
+                        table_name.as_str(),
+                        pk_name.as_str(),
+                        &columns,
+                        &record,
+                    )
+                    .await
+                }
+                Operation::CREATE(false) | Operation::UPDATE => {
                     let columns = columns_cache.get(table_name.as_str());
                     self.upsert_record(table_name.as_str(), pk_name.as_str(), &columns, &record)
                         .await
@@ -989,6 +1003,52 @@ impl DamengSink {
         if columns.is_empty() {
             return Err(format!("columns is empty: {}", table_name));
         }
+        let affected = self
+            .update_record(table_name, pk_name, columns, record)
+            .await?;
+        if affected > 0 {
+            return Ok(());
+        }
+
+        self.insert_record(table_name, columns, record).await
+    }
+
+    async fn insert_or_update_record(
+        &self,
+        table_name: &str,
+        pk_name: &str,
+        columns: &[String],
+        record: &DataBuffer,
+    ) -> Result<(), String> {
+        if columns.is_empty() {
+            return Err(format!("columns is empty: {}", table_name));
+        }
+        match self.insert_record(table_name, columns, record).await {
+            Ok(_) => Ok(()),
+            Err(e) if Self::is_duplicate_key_error(e.as_str()) => {
+                let affected = self
+                    .update_record(table_name, pk_name, columns, record)
+                    .await?;
+                if affected > 0 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "Dameng insert duplicate fallback update affected 0 rows: {}",
+                        table_name
+                    ))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn update_record(
+        &self,
+        table_name: &str,
+        pk_name: &str,
+        columns: &[String],
+        record: &DataBuffer,
+    ) -> Result<u64, String> {
         let pk = record.get_pk(pk_name);
         if pk.is_none() {
             return Err(format!("pk is empty: {}.{}", table_name, pk_name));
@@ -1018,13 +1078,17 @@ impl DamengSink {
         }
         update_params.push(Self::value_to_param(pk));
         debug!("Dameng UPDATE: {}", update_sql);
-        let affected = self
-            .execute_with_params(update_sql.as_str(), &update_params)
-            .await?;
-        if affected > 0 {
-            return Ok(());
-        }
+        self.execute_with_params(update_sql.as_str(), &update_params)
+            .await
+    }
 
+    async fn insert_record(
+        &self,
+        table_name: &str,
+        columns: &[String],
+        record: &DataBuffer,
+    ) -> Result<(), String> {
+        let table_info = self.table_info_cache.lock().await.get(table_name);
         let cols_sql = columns
             .iter()
             .map(|c| Self::quote_ident(c))
@@ -1194,6 +1258,19 @@ mod tests {
         ));
         assert!(!DamengSink::is_identity_insert_required_error(
             "query failed: -6609: Violate not null constraint"
+        ));
+    }
+
+    #[test]
+    fn detects_duplicate_key_error() {
+        assert!(DamengSink::is_duplicate_key_error(
+            "query failed: -6602: Violate unique constraint"
+        ));
+        assert!(DamengSink::is_duplicate_key_error(
+            "Violate UNIQUE CONSTRAINT on primary key"
+        ));
+        assert!(!DamengSink::is_duplicate_key_error(
+            "query failed: -2723: SET IDENTITY_INSERT is ON"
         ));
     }
 
