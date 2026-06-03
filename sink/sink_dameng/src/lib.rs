@@ -17,7 +17,7 @@ use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, trace};
 
-const DAMENG_INLINE_STRING_CHAR_LIMIT: u32 = 2000;
+const DAMENG_INLINE_STRING_CHAR_LIMIT: u32 = 512;
 
 #[derive(Debug, Clone)]
 enum DamengParam {
@@ -260,7 +260,10 @@ impl DamengSink {
             .existing_columns(table_info.table_name.as_str())
             .await?;
         if existing_cols.is_empty() {
-            return Ok(());
+            return Err(format!(
+                "Dameng target table metadata is empty: {}",
+                table_info.table_name
+            ));
         }
         let defs =
             extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
@@ -278,9 +281,31 @@ impl DamengSink {
             let nullable_sql = if nullable { "NULL" } else { "NOT NULL" };
             let dameng_type = Self::map_mysql_type_to_dameng(mysql_type.as_str());
             if let Some(existing_col) = existing_cols.get(key.as_str()) {
-                if self.auto_modify_column
-                    && Self::should_modify_existing_column(&mysql_type, existing_col)
-                {
+                let should_modify = Self::should_modify_existing_column(&mysql_type, existing_col);
+                if dameng_type.eq_ignore_ascii_case("CLOB") || should_modify {
+                    info!(
+                        "Dameng column check: {}.{} existing={} data_length={} char_length={} expected={} auto_modify={}",
+                        table_info.table_name,
+                        src_col,
+                        existing_col.data_type,
+                        existing_col.data_length,
+                        existing_col.char_length,
+                        dameng_type,
+                        self.auto_modify_column
+                    );
+                }
+                if should_modify && !self.auto_modify_column {
+                    return Err(format!(
+                        "Dameng column type mismatch and auto_modify_column is false: {}.{} existing={} data_length={} char_length={} expected={}",
+                        table_info.table_name,
+                        src_col,
+                        existing_col.data_type,
+                        existing_col.data_length,
+                        existing_col.char_length,
+                        dameng_type
+                    ));
+                }
+                if should_modify {
                     let sql = format!(
                         "ALTER TABLE {} MODIFY {} {} {}",
                         self.qualified_table(table_info.table_name.as_str()),
@@ -931,6 +956,10 @@ mod tests {
             "CHAR(20 CHAR)"
         );
         assert_eq!(
+            DamengSink::map_mysql_type_to_dameng("varchar(1000)"),
+            "CLOB"
+        );
+        assert_eq!(
             DamengSink::map_mysql_type_to_dameng("varchar(4000)"),
             "CLOB"
         );
@@ -971,14 +1000,24 @@ mod tests {
   `id` bigint NOT NULL AUTO_INCREMENT,
   `param` varchar(4000) DEFAULT NULL,
   `modul` varchar(100) DEFAULT NULL,
+  `opration` varchar(1000) DEFAULT NULL,
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3"#
                 .to_string(),
-            columns: vec!["id".to_string(), "param".to_string(), "modul".to_string()],
+            columns: vec![
+                "id".to_string(),
+                "param".to_string(),
+                "modul".to_string(),
+                "opration".to_string(),
+            ],
         };
 
         assert_eq!(
             DamengSink::value_placeholder(&table_info, "param"),
+            "CAST(? AS CLOB)"
+        );
+        assert_eq!(
+            DamengSink::value_placeholder(&table_info, "opration"),
             "CAST(? AS CLOB)"
         );
         assert_eq!(DamengSink::value_placeholder(&table_info, "modul"), "?");
