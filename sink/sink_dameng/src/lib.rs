@@ -389,31 +389,54 @@ impl DamengSink {
     ) -> Result<HashMap<String, DamengColumnInfo>, String> {
         let sql = if self.schema.is_empty() {
             format!(
-                "SELECT COLUMN_NAME, DATA_TYPE, DATA_LENGTH, CHAR_LENGTH FROM USER_TAB_COLUMNS WHERE {}",
+                "SELECT LISTAGG(COLUMN_NAME || ':' || DATA_TYPE || ':' || DATA_LENGTH || ':' || CHAR_LENGTH, '|') WITHIN GROUP (ORDER BY COLUMN_ID) FROM USER_TAB_COLUMNS WHERE {}",
                 Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
             )
         } else {
             format!(
-                "SELECT COLUMN_NAME, DATA_TYPE, DATA_LENGTH, CHAR_LENGTH FROM ALL_TAB_COLUMNS WHERE {} AND {}",
+                "SELECT LISTAGG(COLUMN_NAME || ':' || DATA_TYPE || ':' || DATA_LENGTH || ':' || CHAR_LENGTH, '|') WITHIN GROUP (ORDER BY COLUMN_ID) FROM ALL_TAB_COLUMNS WHERE {} AND {}",
                 Self::eq_original_or_upper_sql("OWNER", &self.schema),
                 Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
             )
         };
         let rows = self.query(sql.as_str(), &[]).await?;
+        let metadata = rows
+            .first()
+            .and_then(|row| row.get::<String>(0).ok())
+            .unwrap_or_default();
+        Ok(Self::parse_columns_metadata(metadata.as_str()))
+    }
+
+    fn parse_columns_metadata(metadata: &str) -> HashMap<String, DamengColumnInfo> {
         let mut cols = HashMap::new();
-        for row in rows.iter() {
-            if let (Ok(name), Ok(data_type)) = (row.get::<String>(0), row.get::<String>(1)) {
-                cols.insert(
-                    name.to_ascii_lowercase(),
-                    DamengColumnInfo {
-                        data_type,
-                        data_length: row.get::<i32>(2).unwrap_or(0).max(0) as u32,
-                        char_length: row.get::<i32>(3).unwrap_or(0).max(0) as u32,
-                    },
-                );
-            }
+        for column in metadata.split('|').filter(|s| !s.is_empty()) {
+            let mut parts = column.splitn(4, ':');
+            let name = match parts.next() {
+                Some(v) if !v.is_empty() => v,
+                _ => continue,
+            };
+            let data_type = match parts.next() {
+                Some(v) if !v.is_empty() => v,
+                _ => continue,
+            };
+            let data_length = parts
+                .next()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0);
+            let char_length = parts
+                .next()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0);
+            cols.insert(
+                name.to_ascii_lowercase(),
+                DamengColumnInfo {
+                    data_type: data_type.to_string(),
+                    data_length,
+                    char_length,
+                },
+            );
         }
-        Ok(cols)
+        cols
     }
 
     fn quote_literal(value: &str) -> String {
@@ -959,6 +982,23 @@ mod tests {
             DamengSink::eq_original_or_upper_sql("OWNER", "newsee-system"),
             "(OWNER = 'newsee-system' OR OWNER = 'NEWSEE-SYSTEM')"
         );
+    }
+
+    #[test]
+    fn parses_dameng_columns_metadata() {
+        let cols = DamengSink::parse_columns_metadata(
+            "id:BIGINT:8:0|param:VARCHAR:16000:4000|opration:VARCHAR:4000:1000",
+        );
+
+        let param = cols.get("param").unwrap();
+        assert_eq!(param.data_type, "VARCHAR");
+        assert_eq!(param.data_length, 16000);
+        assert_eq!(param.char_length, 4000);
+
+        let opration = cols.get("opration").unwrap();
+        assert_eq!(opration.data_type, "VARCHAR");
+        assert_eq!(opration.data_length, 4000);
+        assert_eq!(opration.char_length, 1000);
     }
 
     #[test]
