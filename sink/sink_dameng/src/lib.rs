@@ -514,7 +514,7 @@ impl DamengSink {
             Ok(v) => Ok(v),
             Err(e) => {
                 let msg = e.to_string();
-                if Self::is_identity_insert_required_error(msg.as_str()) {
+                if Self::is_insert_control_flow_error(msg.as_str()) {
                     return Err(msg);
                 }
                 error!("Dameng execute failed, retrying: {} sql: {}", msg, sql);
@@ -546,6 +546,10 @@ impl DamengSink {
 
     fn is_duplicate_key_error(error: &str) -> bool {
         error.contains("-6602") || error.to_ascii_lowercase().contains("unique constraint")
+    }
+
+    fn is_insert_control_flow_error(error: &str) -> bool {
+        Self::is_identity_insert_required_error(error) || Self::is_duplicate_key_error(error)
     }
 
     fn identity_insert_cache_key(table_name: &str) -> String {
@@ -1055,7 +1059,15 @@ impl DamengSink {
         }
         let table_info = self.table_info_cache.lock().await.get(table_name);
 
-        let set_sql = columns
+        let update_columns = columns
+            .iter()
+            .filter(|c| !c.eq_ignore_ascii_case(pk_name))
+            .collect::<Vec<_>>();
+        if update_columns.is_empty() {
+            return Ok(0);
+        }
+
+        let set_sql = update_columns
             .iter()
             .map(|c| {
                 format!(
@@ -1072,8 +1084,8 @@ impl DamengSink {
             set_sql,
             Self::quote_ident(pk_name)
         );
-        let mut update_params = Vec::with_capacity(columns.len() + 1);
-        for col in columns {
+        let mut update_params = Vec::with_capacity(update_columns.len() + 1);
+        for col in update_columns {
             update_params.push(Self::value_to_param(record.after.get(col)));
         }
         update_params.push(Self::value_to_param(pk));
@@ -1271,6 +1283,19 @@ mod tests {
         ));
         assert!(!DamengSink::is_duplicate_key_error(
             "query failed: -2723: SET IDENTITY_INSERT is ON"
+        ));
+    }
+
+    #[test]
+    fn insert_control_flow_errors_are_not_retried() {
+        assert!(DamengSink::is_insert_control_flow_error(
+            "query failed: -6602: Violate unique constraint"
+        ));
+        assert!(DamengSink::is_insert_control_flow_error(
+            "query failed: -2723: SET IDENTITY_INSERT is ON"
+        ));
+        assert!(!DamengSink::is_insert_control_flow_error(
+            "query failed: -2665: record too long"
         ));
     }
 
