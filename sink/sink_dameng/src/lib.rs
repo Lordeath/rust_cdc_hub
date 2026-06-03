@@ -15,7 +15,7 @@ use dameng_types::DmValue;
 use std::collections::HashMap;
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 const DAMENG_INLINE_STRING_CHAR_LIMIT: u32 = 512;
 
@@ -260,10 +260,14 @@ impl DamengSink {
             .existing_columns(table_info.table_name.as_str())
             .await?;
         if existing_cols.is_empty() {
-            return Err(format!(
-                "Dameng target table metadata is empty: {}",
-                table_info.table_name
-            ));
+            warn!(
+                "Dameng target table metadata is empty, skip column check: {} auto_create_table={} auto_add_column={} auto_modify_column={}",
+                table_info.table_name,
+                self.auto_create_table,
+                self.auto_add_column,
+                self.auto_modify_column
+            );
+            return Ok(());
         }
         let defs =
             extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
