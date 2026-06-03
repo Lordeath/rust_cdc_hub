@@ -1360,7 +1360,7 @@ async fn parse_row(
                 data.insert(column_name, value);
             }
             ColumnValue::Blob(v) => {
-                let value: Value = Value::String(String::from_utf8_lossy(&v).to_string());
+                let value: Value = Value::Blob(v);
                 data.insert(column_name, value);
             }
             ColumnValue::Bit(v) => {

@@ -30,6 +30,7 @@ enum DamengParam {
     F32(f32),
     F64(f64),
     Text(String),
+    Bytes(Vec<u8>),
 }
 
 impl ToDmValue for DamengParam {
@@ -44,6 +45,7 @@ impl ToDmValue for DamengParam {
             DamengParam::F32(v) => DmValue::Float(*v),
             DamengParam::F64(v) => DmValue::Double(*v),
             DamengParam::Text(v) => DmValue::Text(v.clone()),
+            DamengParam::Bytes(v) => DmValue::Bytea(v.clone()),
         }
     }
 }
@@ -561,8 +563,8 @@ impl DamengSink {
             | Value::Date(v)
             | Value::DateTime(v)
             | Value::String(v)
-            | Value::Blob(v)
             | Value::Json(v) => DamengParam::Text(v.clone()),
+            Value::Blob(v) => DamengParam::Bytes(v.clone()),
             Value::Timestamp(_) | Value::Year(_) => DamengParam::Text(value.resolve_string()),
         }
     }
@@ -952,7 +954,9 @@ impl DamengSink {
 
 #[cfg(test)]
 mod tests {
-    use common::TableInfoVo;
+    use common::{TableInfoVo, Value};
+    use dameng::ToDmValue;
+    use dameng_types::DmValue;
 
     use super::DamengSink;
 
@@ -999,6 +1003,15 @@ mod tests {
         assert_eq!(opration.data_type, "VARCHAR");
         assert_eq!(opration.data_length, 4000);
         assert_eq!(opration.char_length, 1000);
+    }
+
+    #[test]
+    fn blob_values_bind_as_dameng_bytes() {
+        let value = Value::Blob(vec![0x1f, 0x8b, 0x08]);
+        assert_eq!(
+            DamengSink::value_to_param(&value).to_dm_value(),
+            DmValue::Bytea(vec![0x1f, 0x8b, 0x08])
+        );
     }
 
     #[test]

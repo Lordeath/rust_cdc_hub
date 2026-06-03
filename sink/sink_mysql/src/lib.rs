@@ -551,6 +551,8 @@ impl Sink for MySqlSink {
                             {
                                 // query = query.bind::<Json<_>>(Json(json));
                                 query = query.bind("null");
+                            } else if let Value::Blob(bytes) = x {
+                                query = query.bind(bytes.to_vec());
                             } else {
                                 query = query.bind(x.resolve_string());
                             }

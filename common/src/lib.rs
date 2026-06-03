@@ -305,7 +305,7 @@ pub enum Value {
     // A datatype for string values
     String(String),
     // A datatype containing binary large objects
-    Blob(String),
+    Blob(Vec<u8>),
     Json(String),
     // A datatype containing a set of bit
     Bit(u64),
@@ -344,11 +344,21 @@ impl Value {
                 dt_utc8.format("%Y-%m-%d %H:%M:%S").to_string()
             }
             Value::Year(s) => s.to_string(),
-            Value::Blob(s) => s.to_string(),
+            Value::Blob(v) => Self::bytes_to_hex(v),
             Value::Json(s) => s.to_string(),
             Value::Bit(s) => s.to_string(),
             Value::None => "null".to_string(),
         }
+    }
+
+    fn bytes_to_hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut result = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            result.push(HEX[(b >> 4) as usize] as char);
+            result.push(HEX[(b & 0x0f) as usize] as char);
+        }
+        result
     }
 
     pub fn is_none(&self) -> bool {
@@ -371,8 +381,8 @@ impl Serialize for Value {
             | Value::Time(s)
             | Value::Date(s)
             | Value::DateTime(s)
-            | Value::Json(s)
-            | Value::Blob(s) => serializer.serialize_str(s.as_str()),
+            | Value::Json(s) => serializer.serialize_str(s.as_str()),
+            Value::Blob(v) => serializer.serialize_str(Self::bytes_to_hex(v).as_str()),
             Value::Int8(v) => serializer.serialize_i8(*v),
             Value::Int16(v) => serializer.serialize_i16(*v),
             Value::Int32(v) => serializer.serialize_i32(*v),
@@ -487,6 +497,16 @@ fn is_mysql_string_type(type_name: &str) -> bool {
     type_name.eq_ignore_ascii_case("CHAR")
         || type_name.eq_ignore_ascii_case("VARCHAR")
         || type_name.eq_ignore_ascii_case("TEXT")
+}
+
+#[inline]
+fn is_mysql_binary_type(type_name: &str) -> bool {
+    type_name.eq_ignore_ascii_case("BINARY")
+        || type_name.eq_ignore_ascii_case("VARBINARY")
+        || type_name.eq_ignore_ascii_case("BLOB")
+        || type_name.eq_ignore_ascii_case("TINYBLOB")
+        || type_name.eq_ignore_ascii_case("MEDIUMBLOB")
+        || type_name.eq_ignore_ascii_case("LONGBLOB")
 }
 
 #[inline]
@@ -649,14 +669,16 @@ pub fn mysql_row_to_hashmap(row: &MySqlRow) -> CaseInsensitiveHashMap {
                         panic!("类型转换失败: {}", column.type_info().name());
                     }
                 },
-                "BLOB" => match row.try_get::<Vec<u8>, _>(name.as_str()) {
-                    Ok(v) => Value::Blob(String::from_utf8(v).expect("Invalid UTF-8").to_string()),
-                    Err(e) => {
-                        error!("类型转换失败: {}", column.type_info().name());
-                        error!("{}", e);
-                        panic!("类型转换失败: {}", column.type_info().name());
+                type_name if is_mysql_binary_type(type_name) => {
+                    match row.try_get::<Vec<u8>, _>(name.as_str()) {
+                        Ok(v) => Value::Blob(v),
+                        Err(e) => {
+                            error!("类型转换失败: {}", column.type_info().name());
+                            error!("{}", e);
+                            panic!("类型转换失败: {}", column.type_info().name());
+                        }
                     }
-                },
+                }
                 _ => {
                     error!("Unsupported column type: {}", column.type_info().name());
                     panic!("Unsupported column type: {}", column.type_info().name())
@@ -760,12 +782,27 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_string_blob_as_hex() {
+        let v = Value::Blob(vec![0x1f, 0x8b, 0x08, 0xff]);
+        assert_eq!(v.resolve_string(), "1f8b08ff");
+    }
+
+    #[test]
     fn test_mysql_char_type_is_string() {
         assert!(is_mysql_string_type("CHAR"));
         assert!(is_mysql_string_type("VARCHAR"));
         assert!(is_mysql_string_type("TEXT"));
         assert!(is_mysql_string_type("char"));
         assert!(!is_mysql_string_type("INT"));
+    }
+
+    #[test]
+    fn test_mysql_blob_type_is_binary() {
+        assert!(is_mysql_binary_type("BLOB"));
+        assert!(is_mysql_binary_type("LONGBLOB"));
+        assert!(is_mysql_binary_type("VARBINARY"));
+        assert!(is_mysql_binary_type("binary"));
+        assert!(!is_mysql_binary_type("VARCHAR"));
     }
 
     #[test]
