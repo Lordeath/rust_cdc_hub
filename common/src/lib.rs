@@ -483,6 +483,13 @@ pub struct ColumnInfoVo {
 }
 
 #[inline]
+fn is_mysql_string_type(type_name: &str) -> bool {
+    type_name.eq_ignore_ascii_case("CHAR")
+        || type_name.eq_ignore_ascii_case("VARCHAR")
+        || type_name.eq_ignore_ascii_case("TEXT")
+}
+
+#[inline]
 pub fn mysql_row_to_hashmap(row: &MySqlRow) -> CaseInsensitiveHashMap {
     let mut result = HashMap::new();
     for row_column in row.columns().iter().enumerate() {
@@ -608,14 +615,16 @@ pub fn mysql_row_to_hashmap(row: &MySqlRow) -> CaseInsensitiveHashMap {
                         panic!("类型转换失败: {}", column.type_info().name());
                     }
                 },
-                "VARCHAR" | "TEXT" => match row.try_get::<String, _>(name.as_str()) {
-                    Ok(v) => Value::String(v),
-                    Err(e) => {
-                        error!("类型转换失败: {}", column.type_info().name());
-                        error!("{}", e);
-                        panic!("类型转换失败: {}", column.type_info().name());
+                type_name if is_mysql_string_type(type_name) => {
+                    match row.try_get::<String, _>(name.as_str()) {
+                        Ok(v) => Value::String(v),
+                        Err(e) => {
+                            error!("类型转换失败: {}", column.type_info().name());
+                            error!("{}", e);
+                            panic!("类型转换失败: {}", column.type_info().name());
+                        }
                     }
-                },
+                }
                 "JSON" => match row.try_get::<JsonValue, &str>(name.as_str()) {
                     Ok(v) => Value::Json(v.to_string()),
                     Err(e) => {
@@ -748,6 +757,15 @@ mod tests {
     fn test_resolve_string_none() {
         let v = Value::None;
         assert_eq!(v.resolve_string(), "null");
+    }
+
+    #[test]
+    fn test_mysql_char_type_is_string() {
+        assert!(is_mysql_string_type("CHAR"));
+        assert!(is_mysql_string_type("VARCHAR"));
+        assert!(is_mysql_string_type("TEXT"));
+        assert!(is_mysql_string_type("char"));
+        assert!(!is_mysql_string_type("INT"));
     }
 
     #[test]
