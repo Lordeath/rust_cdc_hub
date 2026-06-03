@@ -12,7 +12,7 @@ use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfo
 use dameng::Client;
 use dameng::ToDmValue;
 use dameng_types::DmValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, trace, warn};
@@ -75,6 +75,7 @@ pub struct DamengSink {
     table_info_cache: Mutex<CaseInsensitiveHashMapTableInfoVo>,
     columns_cache: Mutex<CaseInsensitiveHashMapVecString>,
     checkpoint: Mutex<HashMap<String, MysqlCheckPointDetailEntity>>,
+    identity_insert_tables: Mutex<HashSet<String>>,
 }
 
 impl DamengSink {
@@ -114,6 +115,7 @@ impl DamengSink {
             table_info_cache: Mutex::new(CaseInsensitiveHashMapTableInfoVo::new_with_no_arg()),
             columns_cache: Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg()),
             checkpoint: Mutex::new(HashMap::new()),
+            identity_insert_tables: Mutex::new(HashSet::new()),
         };
         sink.ensure_database()
             .await
@@ -496,6 +498,95 @@ impl DamengSink {
         }
     }
 
+    async fn execute_insert_with_params(
+        &self,
+        sql: &str,
+        params: &[DamengParam],
+    ) -> Result<u64, String> {
+        let first_result = {
+            let mut client = self.client.lock().await;
+            let refs = Self::param_refs(params);
+            client.execute_with_params(sql, &refs)
+        };
+        match first_result {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let msg = e.to_string();
+                if Self::is_identity_insert_required_error(msg.as_str()) {
+                    return Err(msg);
+                }
+                error!("Dameng execute failed, retrying: {} sql: {}", msg, sql);
+                self.reconnect().await?;
+                let mut client = self.client.lock().await;
+                let refs = Self::param_refs(params);
+                client
+                    .execute_with_params(sql, &refs)
+                    .map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    async fn execute_with_identity_insert(
+        &self,
+        table_name: &str,
+        sql: &str,
+        params: &[DamengParam],
+    ) -> Result<u64, String> {
+        let qualified_table = self.qualified_table(table_name);
+        let first_result = {
+            let mut client = self.client.lock().await;
+            Self::execute_identity_insert_once(&mut client, qualified_table.as_str(), sql, params)
+        };
+        match first_result {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                error!(
+                    "Dameng identity insert failed, retrying: {} sql: {}",
+                    e, sql
+                );
+                self.reconnect().await?;
+                let mut client = self.client.lock().await;
+                Self::execute_identity_insert_once(
+                    &mut client,
+                    qualified_table.as_str(),
+                    sql,
+                    params,
+                )
+            }
+        }
+    }
+
+    fn execute_identity_insert_once(
+        client: &mut Client,
+        qualified_table: &str,
+        sql: &str,
+        params: &[DamengParam],
+    ) -> Result<u64, String> {
+        let on_sql = format!("SET IDENTITY_INSERT {} ON", qualified_table);
+        client.execute(on_sql.as_str()).map_err(|e| e.to_string())?;
+
+        let refs = Self::param_refs(params);
+        let insert_result = client
+            .execute_with_params(sql, &refs)
+            .map_err(|e| e.to_string());
+
+        let off_sql = format!("SET IDENTITY_INSERT {} OFF", qualified_table);
+        let off_result = client.execute(off_sql.as_str()).map_err(|e| e.to_string());
+
+        match (insert_result, off_result) {
+            (Ok(v), Ok(_)) => Ok(v),
+            (Err(insert_error), Ok(_)) => Err(insert_error),
+            (Ok(_), Err(off_error)) => Err(format!(
+                "Dameng set identity_insert off failed: {}",
+                off_error
+            )),
+            (Err(insert_error), Err(off_error)) => Err(format!(
+                "{}; Dameng set identity_insert off failed: {}",
+                insert_error, off_error
+            )),
+        }
+    }
+
     async fn query(&self, sql: &str, params: &[DamengParam]) -> Result<dameng::ResultSet, String> {
         let mut client = self.client.lock().await;
         let refs = Self::param_refs(params);
@@ -506,6 +597,14 @@ impl DamengSink {
 
     fn param_refs(params: &[DamengParam]) -> Vec<&dyn ToDmValue> {
         params.iter().map(|p| p as &dyn ToDmValue).collect()
+    }
+
+    fn is_identity_insert_required_error(error: &str) -> bool {
+        error.contains("-2723") || error.to_ascii_uppercase().contains("IDENTITY_INSERT")
+    }
+
+    fn identity_insert_cache_key(table_name: &str) -> String {
+        table_name.to_ascii_lowercase()
     }
 
     async fn get_pk_name_from_cache(&self, table_name: &str) -> String {
@@ -941,8 +1040,34 @@ impl DamengSink {
             .map(|col| Self::value_to_param(record.after.get(col)))
             .collect::<Vec<_>>();
         debug!("Dameng INSERT: {}", insert_sql);
-        self.execute_with_params(insert_sql.as_str(), &insert_params)
-            .await?;
+
+        let identity_insert_cache_key = Self::identity_insert_cache_key(table_name);
+        let use_identity_insert = self
+            .identity_insert_tables
+            .lock()
+            .await
+            .contains(identity_insert_cache_key.as_str());
+        if use_identity_insert {
+            self.execute_with_identity_insert(table_name, insert_sql.as_str(), &insert_params)
+                .await?;
+            return Ok(());
+        }
+
+        match self
+            .execute_insert_with_params(insert_sql.as_str(), &insert_params)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) if Self::is_identity_insert_required_error(e.as_str()) => {
+                self.identity_insert_tables
+                    .lock()
+                    .await
+                    .insert(identity_insert_cache_key);
+                self.execute_with_identity_insert(table_name, insert_sql.as_str(), &insert_params)
+                    .await?;
+            }
+            Err(e) => return Err(e),
+        }
         Ok(())
     }
 
@@ -1027,6 +1152,27 @@ mod tests {
         assert_eq!(
             DamengSink::value_to_param(&value).to_dm_value(),
             DmValue::Bytea(vec![0x1f, 0x8b, 0x08])
+        );
+    }
+
+    #[test]
+    fn detects_identity_insert_required_error() {
+        assert!(DamengSink::is_identity_insert_required_error(
+            "query failed: -2723: Only if specified in the column list and SET IDENTITY_INSERT is ON"
+        ));
+        assert!(DamengSink::is_identity_insert_required_error(
+            "SET identity_insert is ON"
+        ));
+        assert!(!DamengSink::is_identity_insert_required_error(
+            "query failed: -6609: Violate not null constraint"
+        ));
+    }
+
+    #[test]
+    fn identity_insert_cache_key_is_case_insensitive() {
+        assert_eq!(
+            DamengSink::identity_insert_cache_key("Ns_Core_Funcinfo"),
+            "ns_core_funcinfo"
         );
     }
 
