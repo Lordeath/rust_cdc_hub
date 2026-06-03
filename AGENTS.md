@@ -1,200 +1,33 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+本文件只记录这个仓库的长期偏好。通用 Rust、Cargo、Git 知识不要写进来。
 
-## Project Overview
+## 必须优先遵守
 
-rust_cdc_hub is a Rust-based CDC (Change Data Capture) tool that reads MySQL binlog events and synchronizes data to various sink targets. It supports checkpoint/resume, automatic schema migration, and plugin extensibility.
+- 回复和项目内说明优先使用中文。
+- 不要提交临时 demo 配置、真实密码、连接信息；示例或临时配置放到 `/tmp`。
+- 不要回滚用户已有改动；改动前后用 `git status` 确认范围。
+- 修改代码前先看现有实现和测试，按当前风格小范围改。
 
-## Build Commands
+## Git 操作
 
-```sh
-# Build release binary
-cargo build -r
+- 我完成任何改动后，包括文档改动，都要在验证通过后自动 commit 并 push，不要等用户再次要求。
+- 提交前必须看 `git status`，只暂存本次任务相关文件；不要把用户其他改动混进 commit。
+- 代码改动至少跑 `cargo check` 和相关 `cargo test`；触碰具体 crate 时优先跑对应 `cargo test -p <crate>`。
+- 文档-only 变更至少检查 diff 和 `git status`；如果同一批里包含代码改动，仍然按代码改动验证。
+- 检查失败、无法验证或工作区里有不确定的无关改动时，不要 commit/push；需要说明失败命令和原因。
+- commit message 要简短，说明具体变更。
 
-# Build with verbose output
-cargo build --verbose
+## 项目要点
 
-# Run the application (requires CONFIG_PATH env var)
-export CONFIG_PATH=/path/to/config.yaml
-cargo run -r
+- `rust_cdc_hub` 是 Rust CDC 同步工具，当前重点是 MySQL source 和各类 sink，特别是 Dameng sink。
+- 运行配置由 `CONFIG_PATH` 指向 YAML/JSON。
+- Dameng 里的 `auto_create_database` 按 schema 处理；建 schema/table/字段时注意达梦大小写、引号、字符长度语义。
+- 表过滤配置在 `source_config`：`table_name: "*"` 表示全表，排除优先看 `exclude_table_regex`、`except_table_name_prefix`。
+- 新增 source/sink 时按现有 workspace crate、factory 和 trait 模式接入。
 
-# Run all tests
-cargo test --verbose
+## 验证偏好
 
-# Run a single test
-cargo test test_name -- --nocapture
-
-# Run tests in a specific crate
-cargo test -p common --verbose
-```
-
-## Git Workflow
-
-- After code changes, run the relevant formatting/check/test commands before reporting the work as done.
-- When the user asks to commit and push (for example, "git commit and push"), stage only the intended files, create a concise commit, and push the current branch after the checks/tests pass.
-- If required checks/tests fail or cannot be run, do not commit/push unless the user explicitly approves that state; report the failure and what remains.
-
-## Architecture
-
-### Crate Structure (Workspace)
-
-```
-rust_cdc_hub/
-├── Cargo.toml              # Workspace root
-├── src/main.rs             # Entry point with UI server and Prometheus metrics
-├── common/                 # Core traits, data types, config, checkpoint, metrics
-├── source/
-│   └── source_mysql/      # MySQL binlog source
-├── sink/
-│   ├── sink_mysql/        # MySQL sink
-│   ├── sink_starrocks/    # StarRocks sink
-│   ├── sink_meilisearch/  # MeiliSearch sink
-│   └── sink_print/        # Console print sink (debug)
-└── plugin/
-    ├── plugin_column_in/  # Column filtering plugin
-    └── plugin_column_plus/# Column addition plugin
-```
-
-### Core Traits (defined in `common/src/lib.rs`)
-
-1. **`Source`** - Reads CDC events from a source database:
-   - `start(sink)` - Start streaming events to sink
-   - `add_plugins(plugins)` - Register transformation plugins
-   - `get_table_info()` - Return schema metadata
-
-2. **`Sink`** - Writes data to target systems:
-   - `connect()` - Establish connection
-   - `write_record()` - Write a single CDC event
-   - `flush()` - Flush buffered data (called periodically by timer)
-
-3. **`Plugin`** - Transforms CDC events:
-   - `collect(data_buffer)` - Transform and return modified buffer
-
-### Data Flow
-
-```
-MySQL Binlog → MySQLSource → [Plugins] → Sink → (MySQL/StarRocks/MeiliSearch/Print)
-                    ↓
-            Checkpoint Manager
-            (file-based resume)
-```
-
-### Key Data Types
-
-- **`DataBuffer`** - Represents a CDC event: table name, before/after images, operation type (CREATE/UPDATE/DELETE), binlog position
-- **`Value`** - Enum covering all MySQL types with `resolve_string()` for conversion
-- **`CdcConfig`** - Configuration struct parsed from YAML/JSON
-- **`Operation`** - Enum: Insert, Update, Delete
-- **`FlushByOperation`** - Trait for flushing strategies
-
-## Configuration
-
-Configuration is loaded from a YAML or JSON file specified via `CONFIG_PATH` environment variable.
-
-### Example: MySQL to MySQL
-
-```yaml
-source_type: MySQL
-sink_type: MySQL
-source_config:
-  - host: 192.168.1.52
-    port: 3306
-    username: root
-    password: password
-    database: source_db
-    table_name: "*"           # or comma-separated: "table1,table2"
-    except_table_name_prefix: "tmp_,dws_"  # exclude prefixes
-    server_id: 10001
-    pk_column: id             # primary key column
-
-sink_config:
-  - host: 192.168.1.53
-    port: 3306
-    username: root
-    password: password
-    database: target_db
-    pk_column: id
-
-# Optional settings
-log_level: debug
-enable_ui: true
-ui_port: 8080
-auto_create_database: true
-auto_create_table: true
-auto_add_column: true
-```
-
-### Example: MySQL to MeiliSearch
-
-```yaml
-source_type: MySQL
-sink_type: MeiliSearch
-source_config:
-  - host: 192.168.1.103
-    port: 3306
-    username: root
-    password: password
-    database: source_db
-    table_name: table_name
-    server_id: 10000
-    pk_column: id
-
-sink_config:
-  - meili_url: http://192.168.1.103:17700
-    meili_master_key: your_key
-    table_name: index_name
-    meili_table_pk: id
-```
-
-### Key Config Options
-
-- `source_type` / `sink_type` - Select implementations
-- `source_config` / `sink_config` - Per-target connection parameters
-- `table_name` - Table name, `*` for all tables, or comma-separated list
-- `except_table_name_prefix` - Exclude tables with given prefixes
-- `auto_create_database` / `auto_create_table` / `auto_add_column` - Schema migration flags
-- `enable_ui` / `ui_port` - Built-in monitoring UI
-- `server_id` - MySQL server ID for binlog replication (must be unique)
-
-## Built-in UI & Monitoring
-
-When `enable_ui: true` (default), the app starts an actix-web server:
-- `/` - HTML status page
-- `/health` - Health check
-- `/status` - JSON status with config summary, last flush time, restart count
-- `/metrics` - Prometheus metrics endpoint
-
-Environment variables for UI:
-- `UI_PORT` or `PORT` - Override UI port
-
-## Implemented Features
-
-- MySQL binlog as source
-- Multiple sink targets: MySQL, StarRocks, MeiliSearch, Print
-- Checkpoint/resume with file-based storage
-- Automatic schema migration (create database/table, add columns)
-- Plugin system for column filtering and addition
-- Prometheus metrics (throughput, latency, failures, checkpoints)
-- Built-in monitoring UI
-- Table include/exclude patterns (prefix, blacklist)
-
-## Adding New Sources or Sinks
-
-1. Create new crate under `source/` or `sink/`
-2. Implement the appropriate trait from `common`
-3. Add to workspace `Cargo.toml` members list
-4. Update factory in `source/src/lib.rs` or `sink/src/lib.rs` to handle new type
-
-## Docker
-
-```sh
-# Build Docker image
-docker build --network host -t my-cdc-hub:0.0.1 -f "./debian.dockerfile" .
-
-# Run with Docker
-docker run --name rust_cdc_hub --rm -it \
-  -e CONFIG_PATH=/config.yaml \
-  -v /path/to/config.yaml:/config.yaml \
-  my-cdc-hub:0.0.1
-```
+- 小的 Rust 逻辑改动：跑 `cargo check` 和相关 crate 单测。
+- 数据库同步或 DDL 行为：能本机复现时用现有 Docker 容器验证；不能复现要说明缺少的环境。
+- 不为文档或注释变更强行跑完整测试。
