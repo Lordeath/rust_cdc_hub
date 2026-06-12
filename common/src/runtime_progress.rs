@@ -21,6 +21,10 @@ pub struct RuntimeProgress {
 pub struct TableProgress {
     pub table_name: String,
     pub phase: String,
+    #[serde(default)]
+    pub initialization_started_at: i64,
+    #[serde(default)]
+    pub initialization_finished_at: i64,
     pub read_total: u64,
     pub synced_total: u64,
     pub filtered_total: u64,
@@ -60,11 +64,17 @@ impl RuntimeProgress {
         }
         let table = self.table_mut(table_name);
         table.phase = "initializing".to_string();
+        table.initialization_started_at = now;
+        table.initialization_finished_at = 0;
         table.last_event_at = now;
     }
 
     pub fn finish_table_initialization(&mut self, table_name: &str, now: i64) {
         let table = self.table_mut(table_name);
+        if table.initialization_started_at == 0 {
+            table.initialization_started_at = now;
+        }
+        table.initialization_finished_at = now;
         table.phase = "done".to_string();
         table.last_event_at = now;
         self.refresh_current_table();
@@ -86,6 +96,9 @@ impl RuntimeProgress {
         let table = self.table_mut(table_name);
         table.read_total += 1;
         table.phase = phase.to_string();
+        if phase == "initializing" && table.initialization_started_at == 0 {
+            table.initialization_started_at = now;
+        }
         if let Some(pk) = last_pk
             && !pk.is_empty()
         {
@@ -142,6 +155,8 @@ impl RuntimeProgress {
             .or_insert_with(|| TableProgress {
                 table_name: table_name.to_string(),
                 phase: "cdc".to_string(),
+                initialization_started_at: 0,
+                initialization_finished_at: 0,
                 read_total: 0,
                 synced_total: 0,
                 filtered_total: 0,
@@ -249,6 +264,8 @@ mod tests {
         let progress = RuntimeProgress::new();
         assert!(!progress.initializing);
         assert!(progress.current_table.is_empty());
+        assert_eq!(progress.initialization_started_at, 0);
+        assert_eq!(progress.initialization_finished_at, 0);
         assert!(progress.tables.is_empty());
         assert!(progress.plugin_filters.is_empty());
     }
@@ -265,6 +282,8 @@ mod tests {
         let table = progress.tables.get("orders").unwrap();
         assert_eq!(progress.current_table, "");
         assert_eq!(table.phase, "done");
+        assert_eq!(table.initialization_started_at, 10);
+        assert_eq!(table.initialization_finished_at, 14);
         assert_eq!(table.read_total, 1);
         assert_eq!(table.synced_total, 1);
         assert_eq!(table.filtered_total, 1);
@@ -282,13 +301,38 @@ mod tests {
         assert_eq!(progress.current_table, "db_a.orders");
         assert!(progress.initializing);
         assert_eq!(progress.initialization_finished_at, 0);
+        assert_eq!(
+            progress
+                .tables
+                .get("db_b.orders")
+                .unwrap()
+                .initialization_started_at,
+            11
+        );
+        assert_eq!(
+            progress
+                .tables
+                .get("db_b.orders")
+                .unwrap()
+                .initialization_finished_at,
+            12
+        );
 
         progress.finish_table_initialization("db_a.orders", 13);
         progress.finish_initialization(14);
 
         assert!(progress.current_table.is_empty());
         assert!(!progress.initializing);
+        assert_eq!(progress.initialization_started_at, 10);
         assert_eq!(progress.initialization_finished_at, 14);
+        assert_eq!(
+            progress
+                .tables
+                .get("db_a.orders")
+                .unwrap()
+                .initialization_finished_at,
+            13
+        );
     }
 
     #[test]

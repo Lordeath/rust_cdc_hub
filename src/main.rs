@@ -1630,6 +1630,13 @@ function groupPluginFiltersByTableAndColumn(filters) {
   }
   return Array.from(grouped.values());
 }
+function tableInitializationDurationSeconds(table, now) {
+  const startedAt = Number(table.initialization_started_at || 0);
+  if (startedAt <= 0) return null;
+  const finishedAt = table.phase === 'initializing' ? 0 : Number(table.initialization_finished_at || 0);
+  const effectiveEnd = finishedAt > 0 ? finishedAt : Number(now || 0);
+  return Math.max(0, effectiveEnd - startedAt);
+}
 function renderColumnInFilters(cfg, progress) {
   const section = el('pluginFilterSection');
   if (!section) return;
@@ -1660,17 +1667,26 @@ function renderColumnInFilters(cfg, progress) {
   </tr>`).join('');
   el('columnInFilterTable').innerHTML = `<table><thead><tr>${sortHeader('pluginFilters', 'table_name', t('table_name'))}${sortHeader('pluginFilters', 'column_name', t('matched_column'))}${sortHeader('pluginFilters', 'input_total', t('input_rows'))}${sortHeader('pluginFilters', 'output_total', t('output_rows'))}${sortHeader('pluginFilters', 'filtered_total', t('filtered_count'))}${sortHeader('pluginFilters', 'last_event_at', t('last_event_at'))}</tr></thead><tbody>${body}</tbody></table>`;
 }
-function renderSyncProgressTable(tables) {
+function renderSyncProgressTable(tables, now) {
   const target = el('syncProgressTable');
   if (!target) return;
   if (!tables.length) {
     target.innerHTML = `<div class="empty">${escapeHtml(t('no_table_sync'))}</div>`;
     return;
   }
-  const rows = sortRows(tables, 'syncProgress')
+  const rowsWithDurations = tables.map((table) => {
+    const duration = tableInitializationDurationSeconds(table, now);
+    return {
+      ...table,
+      initialization_duration: duration ?? -1,
+      initialization_duration_label: duration === null ? '-' : fmtDuration(duration),
+    };
+  });
+  const rows = sortRows(rowsWithDurations, 'syncProgress')
     .map((table) => `<tr class="${table.phase === 'initializing' ? 'phase-initializing' : ''}">
       <td>${escapeHtml(table.table_name || '-')}</td>
       <td>${escapeHtml(table.phase || '-')}</td>
+      <td>${escapeHtml(table.initialization_duration_label)}</td>
       <td>${escapeHtml(table.read_total ?? 0)}</td>
       <td>${escapeHtml(table.synced_total ?? 0)}</td>
       <td>${escapeHtml(table.filtered_total ?? 0)}</td>
@@ -1678,13 +1694,13 @@ function renderSyncProgressTable(tables) {
       <td>${escapeHtml(fmtTs(table.last_event_at))}</td>
     </tr>`)
     .join('');
-  target.innerHTML = `<table><thead><tr>${sortHeader('syncProgress', 'table_name', t('table_name'))}${sortHeader('syncProgress', 'phase', t('phase'))}${sortHeader('syncProgress', 'read_total', t('read'))}${sortHeader('syncProgress', 'synced_total', t('sink_written'))}${sortHeader('syncProgress', 'filtered_total', t('filtered'))}${sortHeader('syncProgress', 'last_pk', t('last_pk'))}${sortHeader('syncProgress', 'last_event_at', t('last_event_at'))}</tr></thead><tbody>${rows}</tbody></table>`;
+  target.innerHTML = `<table><thead><tr>${sortHeader('syncProgress', 'table_name', t('table_name'))}${sortHeader('syncProgress', 'phase', t('phase'))}${sortHeader('syncProgress', 'initialization_duration', t('initialization_duration'))}${sortHeader('syncProgress', 'read_total', t('read'))}${sortHeader('syncProgress', 'synced_total', t('sink_written'))}${sortHeader('syncProgress', 'filtered_total', t('filtered'))}${sortHeader('syncProgress', 'last_pk', t('last_pk'))}${sortHeader('syncProgress', 'last_event_at', t('last_event_at'))}</tr></thead><tbody>${rows}</tbody></table>`;
 }
 function renderInitializationTiming(progress, now) {
   const timingGrid = el('initializationTimingGrid');
   if (!timingGrid) return;
   const startedAt = Number(progress.initialization_started_at || 0);
-  const finishedAt = Number(progress.initialization_finished_at || 0);
+  const finishedAt = progress.initializing ? 0 : Number(progress.initialization_finished_at || 0);
   timingGrid.hidden = startedAt <= 0;
   if (startedAt <= 0) {
     setText('initializationStartedAt', '-');
@@ -1763,7 +1779,7 @@ function renderStatusData(data) {
     renderResources(data.resources);
     renderInitializationTiming(progress, data.now);
     renderColumnInFilters(cfg, progress);
-    renderSyncProgressTable(progressTables);
+    renderSyncProgressTable(progressTables, data.now);
     el('configKv').innerHTML = [
       kvRow(t('source_type'), cfg.source_type),
       kvRow(t('sink_type'), cfg.sink_type),
@@ -2533,6 +2549,9 @@ plugins:
         assert!(s.contains("initializationTimingGrid"));
         assert!(s.contains("初始化开始时间"));
         assert!(s.contains("Initialization Duration"));
+        assert!(s.contains("function tableInitializationDurationSeconds"));
+        assert!(s.contains("progress.initializing ? 0"));
+        assert!(s.contains("sortHeader('syncProgress', 'initialization_duration'"));
         assert!(s.contains("langToggle"));
         assert!(s.contains("Data Sync Progress"));
         assert!(s.contains("资源占用"));
