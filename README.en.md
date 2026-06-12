@@ -124,6 +124,7 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 | `sink_type` | Yes | Sink type: `MySQL`, `Starrocks`, `MeiliSearch`, `Dameng`, or `Print`. |
 | `source_config` | Yes | Source connection and sync settings. |
 | `sink_config` | Yes | Sink connection and write settings. |
+| `multi_mode` | No | Multi-database sync mode. Disabled by default; first version supports MySQL → MySQL only. |
 | `auto_create_database` | No | Create target databases automatically. Defaults to `true`. |
 | `auto_create_table` | No | Create target tables automatically. Defaults to `true`. |
 | `auto_add_column` | No | Add missing target columns automatically. |
@@ -149,6 +150,41 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 | `server_id` | Binlog replication server id. It must be unique in the MySQL topology. |
 
 The primary-key column is detected from the MySQL table schema automatically. Synchronized source tables need exactly one `bigint`/`bigint unsigned` primary key. `meili_table_pk` is still required for the MeiliSearch sink because it defines the target index primary key.
+
+### Multi-database sync mode (MySQL → MySQL)
+
+When `multi_mode.open: true`, `source_config[0].database` may contain comma-separated source databases and `sink_config[0].database` may contain a comma-separated target database allow-list. `database_route` must explicitly cover every source database.
+
+```yaml
+source_type: MySQL
+sink_type: MySQL
+source_config:
+  - host: 127.0.0.1
+    port: 3306
+    username: cdc_user
+    password: cdc_password
+    database: newsee-soss,newsee-system
+    table_name: "*"
+    server_id: 10000
+
+sink_config:
+  - host: 127.0.0.1
+    port: 3306
+    username: sink_user
+    password: sink_password
+    database: newsee-system-soss,newsee-system-test
+
+multi_mode:
+  open: true
+  init_parallelism: 4
+  database_route:
+    - source: newsee-soss
+      sink: newsee-system-soss
+    - source: newsee-system
+      sink: newsee-system-test
+```
+
+Multi mode uses one binlog stream for the same source host and initializes source databases in parallel. `init_parallelism` defaults to `4`. Table filters (`table_name`, `include_table_regex`, `exclude_table_regex`, `except_table_name_prefix`) are shared by all source databases. Multiple source databases may route to the same target database/table, but their primary key, columns, and column types must match.
 
 ### MySQL → MySQL example
 

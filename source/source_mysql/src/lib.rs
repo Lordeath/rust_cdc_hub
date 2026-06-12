@@ -9,8 +9,8 @@ use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::runtime_progress;
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value,
-    get_mysql_pool_by_url_with_max_connections, mysql_connection_url_from_config,
-    mysql_row_to_hashmap, redact_connection_url_password,
+    database_table_key, get_mysql_pool_by_url_with_max_connections,
+    mysql_connection_url_from_config, mysql_row_to_hashmap, redact_connection_url_password,
 };
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
@@ -29,11 +29,13 @@ use sqlx::{MySql, Pool, Transaction};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, trace};
 
 pub struct MySQLSource {
-    streams: Vec<Option<BinlogStream>>, // ✅ 多个流
+    streams: Vec<Option<BinlogStream>>,
+    stream_groups: Vec<MysqlStreamGroup>,
     mysql_source: Vec<MysqlSourceConfigDetail>,
     pools: Vec<Pool<MySql>>,
     checkpoint_entities: Mutex<Vec<Mutex<HashMap<String, MysqlCheckPointDetailEntity>>>>,
@@ -41,12 +43,23 @@ pub struct MySQLSource {
     binlog_filename_list: Mutex<Vec<Mutex<String>>>,
     binlog_position_list: Mutex<Vec<Mutex<u32>>>,
     checkpoint_manager: Arc<dyn CheckpointManager>,
+    init_parallelism: usize,
 }
 
 #[derive(Debug, Clone)]
 struct MysqlSourceConfig {
     mysql_source: Vec<MysqlSourceConfigDetail>,
     pools: Vec<Pool<MySql>>,
+    stream_groups: Vec<MysqlStreamGroup>,
+}
+
+#[derive(Debug, Clone)]
+struct MysqlStreamGroup {
+    connection_url: String,
+    server_id: u64,
+    source_indices: Vec<usize>,
+    start_binlog_filename: Option<String>,
+    start_binlog_position: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +69,7 @@ struct MysqlSourceConfigDetail {
     host: String,
     port: String,
     database: String,
+    target_database: String,
     server_id: u64,
     connection_url: String,
     table_info_list: Vec<TableInfoVo>,
@@ -66,24 +80,16 @@ struct MysqlSourceConfigDetail {
 
 impl MysqlSourceConfig {
     pub async fn new(config: &CdcConfig) -> Self {
-        let size = config.source_config.len();
         let mut mysql_source: Vec<MysqlSourceConfigDetail> = vec![];
         let mut pools: Vec<Pool<MySql>> = vec![];
+        let mut stream_groups: Vec<MysqlStreamGroup> = vec![];
 
         // split table_name
-        let configured_table_names: Vec<String> = config
-            .first_source("table_name")
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let configured_table_names: Vec<String> =
+            CdcConfig::split_csv_value(config.first_source("table_name").as_str());
 
-        let except_table_name_prefix: Vec<String> = config
-            .first_source("except_table_name_prefix")
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let except_table_name_prefix: Vec<String> =
+            CdcConfig::split_csv_value(config.first_source("except_table_name_prefix").as_str());
 
         let include_table_regex_str = config.first_source("include_table_regex");
         let include_regex = if !include_table_regex_str.is_empty() {
@@ -100,25 +106,42 @@ impl MysqlSourceConfig {
         };
 
         let mut all_tables_collected: Vec<String> = vec![];
+        let source_databases = config.source_databases();
+        let logical_source_size = if config.multi_mode_open() {
+            source_databases.len()
+        } else {
+            config.source_config.len()
+        };
 
-        for i in 0..size {
-            let username = config.source("username", i);
-            let password = config.source("password", i);
-            let host = config.source("host", i);
-            let port = config.source("port", i);
-            let database = config.source("database", i);
-            let server_id: u64 = config.source("server_id", i).parse::<u64>().unwrap_or(0);
-            let start_binlog_filename = match config.source("binlog_filename", i) {
+        for i in 0..logical_source_size {
+            let config_index = if config.multi_mode_open() { 0 } else { i };
+            let username = config.source("username", config_index);
+            let password = config.source("password", config_index);
+            let host = config.source("host", config_index);
+            let port = config.source("port", config_index);
+            let database = if config.multi_mode_open() {
+                source_databases[i].clone()
+            } else {
+                config.source("database", config_index)
+            };
+            let target_database = config.target_database_for_source(&database);
+            let server_id: u64 = config
+                .source("server_id", config_index)
+                .parse::<u64>()
+                .unwrap_or(0);
+            let start_binlog_filename = match config.source("binlog_filename", config_index) {
                 s if s.is_empty() => None,
                 s => Some(s),
             };
             let start_binlog_position = config
-                .source("binlog_position", i)
+                .source("binlog_position", config_index)
                 .parse::<u32>()
                 .ok()
                 .filter(|p| *p > 0);
-            let connection_url =
-                mysql_connection_url_from_config(&config.source_config[i], Some(&database));
+            let connection_url = mysql_connection_url_from_config(
+                &config.source_config[config_index],
+                Some(&database),
+            );
             let mut table_info_list: Vec<TableInfoVo> = vec![];
             let pool = get_mysql_pool_by_url_with_max_connections(
                 &connection_url,
@@ -242,6 +265,8 @@ impl MysqlSourceConfig {
                 let columns: Vec<String> = col_list.iter().map(|c| c.column_name.clone()).collect();
 
                 table_info_list.push(TableInfoVo {
+                    source_database: database.clone(),
+                    target_database: target_database.clone(),
                     table_name: table_name.clone(),
                     pk_column,
                     create_table_sql,
@@ -254,6 +279,7 @@ impl MysqlSourceConfig {
                 host,
                 port,
                 database,
+                target_database,
                 server_id,
                 connection_url,
                 table_info_list,
@@ -271,9 +297,37 @@ impl MysqlSourceConfig {
             panic!("no table found after filtering");
         }
 
+        if config.multi_mode_open() {
+            stream_groups.push(MysqlStreamGroup {
+                connection_url: mysql_connection_url_from_config(&config.source_config[0], None),
+                server_id: config.source("server_id", 0).parse::<u64>().unwrap_or(0),
+                source_indices: (0..mysql_source.len()).collect(),
+                start_binlog_filename: match config.source("binlog_filename", 0) {
+                    s if s.is_empty() => None,
+                    s => Some(s),
+                },
+                start_binlog_position: config
+                    .source("binlog_position", 0)
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|p| *p > 0),
+            });
+        } else {
+            for (index, source) in mysql_source.iter().enumerate() {
+                stream_groups.push(MysqlStreamGroup {
+                    connection_url: source.connection_url.clone(),
+                    server_id: source.server_id,
+                    source_indices: vec![index],
+                    start_binlog_filename: source.start_binlog_filename.clone(),
+                    start_binlog_position: source.start_binlog_position,
+                });
+            }
+        }
+
         MysqlSourceConfig {
             mysql_source,
             pools,
+            stream_groups,
         }
     }
 
@@ -304,6 +358,11 @@ pub struct ColumnInfoFromMysql {
 }
 
 impl MysqlSourceConfigDetail {
+    #[inline]
+    fn source_table_key(&self, table_name: &str) -> String {
+        database_table_key(self.database.as_str(), table_name)
+    }
+
     #[inline]
     fn is_target_database_and_table(&self, database_name: &str, table_name: &str) -> bool {
         if !self.database.eq_ignore_ascii_case(database_name) {
@@ -381,7 +440,9 @@ impl MysqlSourceConfigDetail {
             let before = CaseInsensitiveHashMap::new(HashMap::new());
             let after = mysql_row_to_hashmap(&row);
             let op = Operation::CREATE(true);
-            result.push(DataBuffer::new(
+            result.push(DataBuffer::new_with_route(
+                self.database.clone(),
+                self.target_database.clone(),
                 table_name.to_string(),
                 before,
                 after,
@@ -413,7 +474,7 @@ impl MySQLSource {
                 .table_info_list
                 .clone()
                 .iter()
-                .map(|t| t.table_name.to_lowercase().to_string())
+                .map(|t| database_table_key(t.source_database.as_str(), t.table_name.as_str()))
                 .collect::<Vec<String>>();
             let mut mysql_checkpoint_detail_entity_map = HashMap::new();
             for table in tables {
@@ -429,7 +490,6 @@ impl MySQLSource {
                 mysql_checkpoint_detail_entity_map
                     .insert(table.to_lowercase(), mysql_checkpoint_detail_entity);
             }
-            checkpoint_entities.push(Mutex::new(mysql_checkpoint_detail_entity_map.clone()));
 
             if let (Some(f), Some(p)) = (
                 cfg.mysql_source[i].start_binlog_filename.clone(),
@@ -442,12 +502,15 @@ impl MySQLSource {
                     }
                 }
             }
+            checkpoint_entities.push(Mutex::new(mysql_checkpoint_detail_entity_map.clone()));
 
-            // Stream creation deferred to start()
-            streams.push(None);
             mysql_source.push(cfg.mysql_source[i].clone());
             let pool: Pool<MySql> = cfg.pools[i].clone();
             pools.push(pool);
+        }
+        for _ in &cfg.stream_groups {
+            // Stream creation deferred to start()
+            streams.push(None);
             binlog_filename_list
                 .lock()
                 .await
@@ -464,6 +527,7 @@ impl MySQLSource {
 
         Self {
             streams,
+            stream_groups: cfg.stream_groups,
             mysql_source,
             pools,
             checkpoint_entities: Mutex::new(checkpoint_entities),
@@ -471,6 +535,7 @@ impl MySQLSource {
             binlog_filename_list,
             binlog_position_list,
             checkpoint_manager,
+            init_parallelism: config.multi_mode_init_parallelism(),
         }
     }
 
@@ -509,6 +574,210 @@ impl MySQLSource {
                 panic!("flush error");
             }
         }
+    }
+
+    async fn fetch_master_status(pool: &Pool<MySql>) -> Result<(String, u32), CustomError> {
+        let row: MySqlRow = sqlx::query("SHOW MASTER STATUS")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| CustomError {
+                message: e.to_string(),
+                error_type: CustomErrorType::Restart,
+            })?;
+        let columns: Vec<&str> = row.columns().iter().map(|c| c.name()).collect();
+        let file: String = row
+            .try_get::<String, _>("File")
+            .or_else(|_| row.try_get::<String, _>("Log_name"))
+            .or_else(|_| row.try_get::<String, _>(0))
+            .map_err(|e| CustomError {
+                message: format!(
+                    "SHOW MASTER STATUS 读取 binlog file 失败: {}; columns={:?}",
+                    e, columns
+                ),
+                error_type: CustomErrorType::Restart,
+            })?;
+        let pos_u64 = match row
+            .try_get::<u64, _>("Position")
+            .or_else(|_| row.try_get::<u64, _>("Pos"))
+            .or_else(|_| row.try_get::<u64, _>(1))
+        {
+            Ok(v) => v,
+            Err(e1) => {
+                let s: String = row
+                    .try_get::<String, _>("Position")
+                    .or_else(|_| row.try_get::<String, _>(1))
+                    .map_err(|e2| CustomError {
+                        message: format!(
+                            "SHOW MASTER STATUS 读取 Position 失败: {}; prior_err={}; columns={:?}",
+                            e2, e1, columns
+                        ),
+                        error_type: CustomErrorType::Restart,
+                    })?;
+                s.parse::<u64>().map_err(|e| CustomError {
+                    message: format!("SHOW MASTER STATUS Position 解析失败: {}; value={}", e, s),
+                    error_type: CustomErrorType::Restart,
+                })?
+            }
+        };
+        let pos: u32 = u32::try_from(pos_u64).map_err(|_| CustomError {
+            message: format!("SHOW MASTER STATUS Position 超出 u32: {}", pos_u64),
+            error_type: CustomErrorType::Restart,
+        })?;
+        Ok((file, pos))
+    }
+
+    async fn initialize_source_index(
+        source_index: usize,
+        config: MysqlSourceConfigDetail,
+        pool: Pool<MySql>,
+        mut checkpoints: HashMap<String, MysqlCheckPointDetailEntity>,
+        plugins: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>,
+        mut sink: Arc<Mutex<dyn Sink + Send + Sync>>,
+        checkpoint_manager: Arc<dyn CheckpointManager>,
+    ) -> Result<(usize, HashMap<String, MysqlCheckPointDetailEntity>), CustomError> {
+        let any_new = config.table_info_list.iter().any(|table_info| {
+            let table_key = config.source_table_key(table_info.table_name.as_str());
+            checkpoints
+                .get(table_key.to_lowercase().as_str())
+                .map(|cp| cp.is_new)
+                .unwrap_or(false)
+        });
+        if !any_new {
+            info!(
+                "No new tables found for {}, skipping full load",
+                config.database
+            );
+            return Ok((source_index, checkpoints));
+        }
+
+        info!(
+            "Detected new tables for {}, starting consistent snapshot initialization",
+            config.database
+        );
+        let (file, pos) = Self::fetch_master_status(&pool).await?;
+        info!(
+            "Consistent Snapshot Position for {}: {}/{}",
+            config.database, file, pos
+        );
+
+        for table_info in &config.table_info_list {
+            let table_key = config.source_table_key(table_info.table_name.as_str());
+            if let Some(cp) = checkpoints.get_mut(table_key.to_lowercase().as_str())
+                && cp.is_new
+            {
+                cp.last_binlog_filename = file.clone();
+                cp.last_binlog_position = pos;
+            }
+        }
+
+        let mut tx = pool.begin().await.map_err(|e| CustomError {
+            message: e.to_string(),
+            error_type: CustomErrorType::Restart,
+        })?;
+
+        for table_info_vo in config.table_info_list.clone() {
+            let table_name = table_info_vo.table_name.clone();
+            let table_key = config.source_table_key(table_name.as_str());
+            let is_new_table = checkpoints
+                .get(table_key.to_lowercase().as_str())
+                .map(|c| c.is_new)
+                .unwrap_or(false);
+
+            if !is_new_table {
+                continue;
+            }
+
+            let pk_column = table_info_vo.pk_column.clone();
+            let redacted_connection_url = redact_connection_url_password(&config.connection_url);
+            let progress_label =
+                progress_table_label(config.database.as_str(), table_name.as_str());
+            info!(
+                "开始初始化数据源: {}.{}",
+                redacted_connection_url, table_name
+            );
+            runtime_progress::begin_table_initialization(&progress_label).await;
+            let start = Instant::now();
+            let mut count = 0;
+            let mut id: i64 = i64::MIN;
+            loop {
+                let data_buffer_list: Vec<DataBuffer> = config
+                    .extract_init_data(&table_name, &pk_column, id, &mut tx)
+                    .await;
+                let len = data_buffer_list.len();
+                for data_buffer in data_buffer_list {
+                    runtime_progress::record_read(
+                        &progress_label,
+                        "initializing",
+                        pk_value_for_progress(&data_buffer, &pk_column),
+                    )
+                    .await;
+                    let this_id = data_buffer.after.get(&pk_column);
+                    let next_id = match this_id {
+                        Value::Int64(x) => *x,
+                        _ => {
+                            panic!("pk_column not found");
+                        }
+                    };
+                    let plugin_data = detail_with_plugin(&plugins, data_buffer).await;
+                    if let Ok(item) = plugin_data {
+                        Self::write_record_with_retry(&mut sink, &item, None).await;
+                        runtime_progress::record_synced(&progress_label).await;
+                    } else {
+                        runtime_progress::record_filtered(&progress_label).await;
+                    }
+                    if next_id > id {
+                        id = next_id;
+                    }
+                }
+                count += len;
+                debug!("当前最大id为 {}", id);
+                if len != config.batchsize {
+                    break;
+                }
+            }
+            sink.lock()
+                .await
+                .flush_with_retry(&FlushByOperation::Init)
+                .await;
+            info!(
+                "MySQL数据源初始化完成 {}.{} count: {} cost: {:?}",
+                redacted_connection_url,
+                table_name,
+                count,
+                start.elapsed()
+            );
+            runtime_progress::finish_table_initialization(&progress_label).await;
+            if let Some(cp) = checkpoints.get_mut(table_key.to_lowercase().as_str()) {
+                cp.is_new = false;
+                match checkpoint_manager.save(&table_key, cp).await {
+                    Ok(_) => info!("alter_flush success {}", cp.checkpoint_filepath),
+                    Err(e) => error!("alter_flush error: {}", e),
+                }
+            }
+        }
+        runtime_progress::finish_initialization().await;
+        tx.commit().await.map_err(|e| CustomError {
+            message: e.to_string(),
+            error_type: CustomErrorType::Restart,
+        })?;
+        Ok((source_index, checkpoints))
+    }
+
+    fn source_index_for_event(
+        &self,
+        stream_index: usize,
+        database_name: &str,
+        table_name: &str,
+    ) -> Option<usize> {
+        self.stream_groups
+            .get(stream_index)?
+            .source_indices
+            .iter()
+            .copied()
+            .find(|source_index| {
+                self.mysql_source[*source_index]
+                    .is_target_database_and_table(database_name, table_name)
+            })
     }
 }
 
@@ -580,6 +849,10 @@ fn pk_value_for_progress(data_buffer: &DataBuffer, pk_column: &str) -> Option<St
     }
 }
 
+fn progress_table_label(source_database: &str, table_name: &str) -> String {
+    database_table_key(source_database, table_name)
+}
+
 fn table_pk_column(config: &MysqlSourceConfigDetail, table_name: &str) -> Option<String> {
     config
         .table_info_list
@@ -628,231 +901,72 @@ impl Source for MySQLSource {
         &mut self,
         mut sink: Arc<Mutex<dyn Sink + Send + Sync>>,
     ) -> Result<(), CustomError> {
-        let plugins: &Vec<Arc<Mutex<dyn Plugin + Send + Sync>>> = &self.plugins;
         {
             info!("开始MySQL数据源初始化");
-            let max = self.pools.len();
             let start_all = Instant::now();
-            for i in 0..max {
-                let pool: &mut Pool<MySql> = &mut self.pools[i];
-                let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
-
-                // 1. Check if any table needs initialization
-                let mut any_new = false;
-                {
-                    let checkpoints_guard = self.checkpoint_entities.lock().await;
-                    let checkpoints = checkpoints_guard[i].lock().await;
-                    for table_info in &config.table_info_list {
-                        if let Some(cp) = checkpoints.get(&table_info.table_name.to_lowercase()) {
-                            if cp.is_new {
-                                any_new = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if any_new {
-                    info!("Detected new tables, starting consistent snapshot initialization");
-                    // 先在事务外获取binlog位置
-                    let row: MySqlRow = sqlx::query("SHOW MASTER STATUS")
-                        .fetch_one(&*pool)
-                        .await
-                        .map_err(|e| CustomError {
+            let semaphore = Arc::new(Semaphore::new(self.init_parallelism));
+            let mut init_tasks = JoinSet::new();
+            for i in 0..self.pools.len() {
+                let permit = semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| CustomError {
                         message: e.to_string(),
                         error_type: CustomErrorType::Restart,
                     })?;
-                    let columns: Vec<&str> = row.columns().iter().map(|c| c.name()).collect();
-                    let file: String = row
-                        .try_get::<String, _>("File")
-                        .or_else(|_| row.try_get::<String, _>("Log_name"))
-                        .or_else(|_| row.try_get::<String, _>(0))
-                        .map_err(|e| CustomError {
-                            message: format!(
-                                "SHOW MASTER STATUS 读取 binlog file 失败: {}; columns={:?}",
-                                e, columns
-                            ),
-                            error_type: CustomErrorType::Restart,
-                        })?;
-                    let pos_u64 = match row
-                        .try_get::<u64, _>("Position")
-                        .or_else(|_| row.try_get::<u64, _>("Pos"))
-                        .or_else(|_| row.try_get::<u64, _>(1))
-                    {
-                        Ok(v) => v,
-                        Err(e1) => {
-                            let s: String = row
-                                .try_get::<String, _>("Position")
-                                .or_else(|_| row.try_get::<String, _>(1))
-                                .map_err(|e2| CustomError {
-                                    message: format!(
-                                        "SHOW MASTER STATUS 读取 Position 失败: {}; prior_err={}; columns={:?}",
-                                        e2, e1, columns
-                                    ),
-                                    error_type: CustomErrorType::Restart,
-                                })?;
-                            s.parse::<u64>().map_err(|e| CustomError {
-                                message: format!(
-                                    "SHOW MASTER STATUS Position 解析失败: {}; value={}",
-                                    e, s
-                                ),
-                                error_type: CustomErrorType::Restart,
-                            })?
-                        }
-                    };
-                    let pos: u32 = u32::try_from(pos_u64).map_err(|_| CustomError {
-                        message: format!("SHOW MASTER STATUS Position 超出 u32: {}", pos_u64),
-                        error_type: CustomErrorType::Restart,
-                    })?;
-                    info!("Consistent Snapshot Position: {}/{}", file, pos);
-
-                    // 然后开启事务读取表数据
-                    let mut tx = pool.begin().await.map_err(|e| CustomError {
-                        message: e.to_string(),
-                        error_type: CustomErrorType::Restart,
-                    })?;
-
-                    // Update checkpoints for new tables
-                    {
-                        let checkpoints_guard = self.checkpoint_entities.lock().await;
-                        let mut checkpoints = checkpoints_guard[i].lock().await;
-                        for table_info in &config.table_info_list {
-                            if let Some(cp) =
-                                checkpoints.get_mut(&table_info.table_name.to_lowercase())
-                            {
-                                if cp.is_new {
-                                    cp.last_binlog_filename = file.clone();
-                                    cp.last_binlog_position = pos;
-                                }
-                            }
-                        }
-                    }
-
-                    for table_info_vo in config.table_info_list.clone() {
-                        let table_name = table_info_vo.table_name.clone();
-                        let is_new_table = {
-                            let checkpoints_guard = self.checkpoint_entities.lock().await;
-                            let checkpoints = checkpoints_guard[i].lock().await;
-                            checkpoints
-                                .get(&table_name.to_lowercase())
-                                .map(|c| c.is_new)
-                                .unwrap_or(false)
-                        };
-
-                        if !is_new_table {
-                            continue;
-                        }
-
-                        let pk_column = table_info_vo.pk_column.clone();
-                        let redacted_connection_url =
-                            redact_connection_url_password(&config.connection_url);
-                        info!(
-                            "开始初始化数据源: {}.{}",
-                            redacted_connection_url, table_name
-                        );
-                        runtime_progress::begin_table_initialization(&table_name).await;
-                        let start = Instant::now();
-                        let mut count = 0;
-                        let mut id: i64 = i64::MIN;
-                        loop {
-                            let data_buffer_list: Vec<DataBuffer> = config
-                                .extract_init_data(&table_name, &pk_column, id, &mut tx)
-                                .await;
-                            let len = data_buffer_list.len();
-                            for data_buffer in data_buffer_list {
-                                runtime_progress::record_read(
-                                    &table_name,
-                                    "initializing",
-                                    pk_value_for_progress(&data_buffer, &pk_column),
-                                )
-                                .await;
-                                let this_id = data_buffer.after.get(&pk_column);
-                                let next_id = match this_id {
-                                    Value::Int64(x) => *x,
-                                    _ => {
-                                        panic!("pk_column not found");
-                                    }
-                                };
-                                let plugin_data = detail_with_plugin(plugins, data_buffer).await;
-                                if let Ok(item) = plugin_data {
-                                    Self::write_record_with_retry(&mut sink, &item, None).await;
-                                    runtime_progress::record_synced(&table_name).await;
-                                } else {
-                                    runtime_progress::record_filtered(&table_name).await;
-                                }
-                                if next_id > id {
-                                    id = next_id;
-                                }
-                            }
-                            count += len;
-                            debug!("当前最大id为 {}", id);
-                            if len != config.batchsize {
-                                break;
-                            }
-                        }
-                        sink.lock()
-                            .await
-                            .flush_with_retry(&FlushByOperation::Init)
-                            .await;
-                        info!(
-                            "MySQL数据源初始化完成 {}.{} count: {} cost: {:?}",
-                            redacted_connection_url,
-                            table_name,
-                            count,
-                            start.elapsed()
-                        );
-                        runtime_progress::finish_table_initialization(&table_name).await;
-                        // Mark as done and save
-                        {
-                            let checkpoints_guard = self.checkpoint_entities.lock().await;
-                            let mut checkpoints = checkpoints_guard[i].lock().await;
-                            if let Some(cp) = checkpoints.get_mut(&table_name.to_lowercase()) {
-                                cp.is_new = false;
-                                match self.checkpoint_manager.save(&table_name, cp).await {
-                                    Ok(_) => {
-                                        info!("alter_flush success {}", cp.checkpoint_filepath)
-                                    }
-                                    Err(e) => {
-                                        error!("alter_flush error: {}", e)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    runtime_progress::finish_initialization().await;
-                    tx.commit().await.map_err(|e| CustomError {
-                        message: e.to_string(),
-                        error_type: CustomErrorType::Restart,
-                    })?;
-                } else {
-                    info!("No new tables found, skipping full load");
-                }
-
-                // Initialize Binlog Stream
+                let config = self.mysql_source[i].clone();
+                let pool = self.pools[i].clone();
                 let checkpoints = {
                     let checkpoints_guard = self.checkpoint_entities.lock().await;
                     checkpoints_guard[i].lock().await.clone()
                 };
-                let max: MysqlCheckPointDetailEntity = checkpoints
-                    .values()
-                    .max_by(|a, b| {
-                        a.last_binlog_filename
-                            .cmp(&b.last_binlog_filename)
-                            .then(a.last_binlog_position.cmp(&b.last_binlog_position))
-                    })
-                    .unwrap()
-                    .clone();
+                let plugins = self.plugins.clone();
+                let sink_for_task = sink.clone();
+                let checkpoint_manager = self.checkpoint_manager.clone();
+                init_tasks.spawn(async move {
+                    let _permit = permit;
+                    Self::initialize_source_index(
+                        i,
+                        config,
+                        pool,
+                        checkpoints,
+                        plugins,
+                        sink_for_task,
+                        checkpoint_manager,
+                    )
+                    .await
+                });
+            }
+            while let Some(result) = init_tasks.join_next().await {
+                let (source_index, checkpoints) = result.map_err(|e| CustomError {
+                    message: e.to_string(),
+                    error_type: CustomErrorType::Restart,
+                })??;
+                let checkpoints_guard = self.checkpoint_entities.lock().await;
+                *checkpoints_guard[source_index].lock().await = checkpoints;
+            }
 
-                let start_position: StartPosition =
-                    if max.last_binlog_filename.is_empty() || max.last_binlog_position == 0 {
-                        StartPosition::Latest
-                    } else {
-                        StartPosition::BinlogPosition(
-                            max.last_binlog_filename,
-                            max.last_binlog_position,
-                        )
-                    };
+            for (stream_index, group) in self.stream_groups.iter().enumerate() {
+                let mut group_checkpoints: HashMap<String, MysqlCheckPointDetailEntity> =
+                    HashMap::new();
+                {
+                    let checkpoints_guard = self.checkpoint_entities.lock().await;
+                    for source_index in &group.source_indices {
+                        group_checkpoints
+                            .extend(checkpoints_guard[*source_index].lock().await.clone());
+                    }
+                }
 
+                let resume_position = compute_resume_position(
+                    group.start_binlog_filename.as_deref(),
+                    group.start_binlog_position,
+                    &group_checkpoints,
+                );
+                let start_position = match resume_position {
+                    ResumePosition::Latest => StartPosition::Latest,
+                    ResumePosition::BinlogPosition(f, p) => StartPosition::BinlogPosition(f, p),
+                };
                 let start_pos_str = match &start_position {
                     StartPosition::Latest => "Latest".to_string(),
                     StartPosition::BinlogPosition(f, p) => format!("{}/{}", f, p),
@@ -860,11 +974,11 @@ impl Source for MySQLSource {
                 };
                 info!(
                     "Connecting to Binlog: {} with start_position: {}",
-                    redact_connection_url_password(&config.connection_url),
+                    redact_connection_url_password(&group.connection_url),
                     start_pos_str
                 );
                 let client =
-                    BinlogClient::new(&config.connection_url, config.server_id, start_position)
+                    BinlogClient::new(&group.connection_url, group.server_id, start_position)
                         .with_master_heartbeat(Duration::from_secs(5))
                         .with_keepalive(Duration::from_secs(60), Duration::from_secs(10))
                         .connect()
@@ -872,12 +986,12 @@ impl Source for MySQLSource {
                         .unwrap_or_else(|e| {
                             error!(
                                 "MySQL source binlog连接失败 url: {} error: {}",
-                                redact_connection_url_password(&config.connection_url),
+                                redact_connection_url_password(&group.connection_url),
                                 e
                             );
                             panic!("MySQL source binlog连接失败: {}", e);
                         });
-                self.streams[i] = Some(client);
+                self.streams[stream_index] = Some(client);
             }
             info!("MySQL数据源初始化完成, cost: {:?}", start_all.elapsed());
         }
@@ -909,38 +1023,56 @@ impl Source for MySQLSource {
                                 let table_name = event.table_name;
                                 let table_id = event.table_id;
                                 let database_name = event.database_name;
-                                table_map.insert(table_id, table_name);
-                                table_database_map.insert(table_id, database_name);
+                                table_map.insert((i, table_id), table_name);
+                                table_database_map.insert((i, table_id), database_name);
                             }
                             EventData::WriteRows(event) => {
-                                let pool: &mut Pool<MySql> = &mut self.pools[i];
-                                let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
-                                let mut to_modify = self.checkpoint_entities.lock().await[i]
+                                let table_name = table_map
+                                    .get(&(i, event.table_id))
+                                    .unwrap_or_else(|| {
+                                        panic!("Table id {} not found", event.table_id)
+                                    })
+                                    .clone();
+                                let database_name = table_database_map
+                                    .get(&(i, event.table_id))
+                                    .unwrap_or_else(|| {
+                                        panic!("Table id {} not found", event.table_id)
+                                    })
+                                    .clone();
+                                let Some(source_index) = self.source_index_for_event(
+                                    i,
+                                    database_name.as_str(),
+                                    table_name.as_str(),
+                                ) else {
+                                    continue;
+                                };
+                                let plugins = self.plugins.clone();
+                                let pool: &mut Pool<MySql> = &mut self.pools[source_index];
+                                let config: &MysqlSourceConfigDetail =
+                                    &mut self.mysql_source[source_index];
+                                let table_key = config.source_table_key(table_name.as_str());
+                                let progress_label = progress_table_label(
+                                    database_name.as_str(),
+                                    table_name.as_str(),
+                                );
+                                let mut to_modify = self.checkpoint_entities.lock().await
+                                    [source_index]
                                     .lock()
                                     .await
                                     .clone();
-                                let table_name = table_map
-                                    .get(&event.table_id)
-                                    .unwrap_or_else(|| {
-                                        panic!("Table id {} not found", event.table_id)
-                                    })
-                                    .as_str();
-                                let database_name = table_database_map
-                                    .get(&event.table_id)
-                                    .unwrap_or_else(|| {
-                                        panic!("Table id {} not found", event.table_id)
-                                    })
-                                    .as_str();
-                                if config.is_target_database_and_table(database_name, table_name) {
+                                if config.is_target_database_and_table(
+                                    database_name.as_str(),
+                                    table_name.as_str(),
+                                ) {
                                     debug!("WriteRows: {}.{}", database_name, table_name);
 
-                                    let checkpoint_entity: &mut MysqlCheckPointDetailEntity =
-                                        &mut self.checkpoint_entities.lock().await[i]
-                                            .lock()
-                                            .await
-                                            .get(&table_name.to_lowercase())
-                                            .expect("checkpoint_entity not found")
-                                            .clone();
+                                    let checkpoint_entity = self.checkpoint_entities.lock().await
+                                        [source_index]
+                                        .lock()
+                                        .await
+                                        .get(table_key.to_lowercase().as_str())
+                                        .expect("checkpoint_entity not found")
+                                        .clone();
                                     let mut checkpoint_entity = checkpoint_entity.clone();
 
                                     let binlog_filename = self.binlog_filename_list.lock().await[i]
@@ -949,19 +1081,30 @@ impl Source for MySQLSource {
                                         .clone();
                                     let timestamp = header.timestamp;
                                     let next_event_position = header.next_event_position;
-                                    let pk_column = table_pk_column(config, table_name);
+                                    let pk_column = table_pk_column(config, table_name.as_str());
                                     for row in event.rows {
                                         let before: CaseInsensitiveHashMap =
                                             CaseInsensitiveHashMap::new_with_no_arg();
-                                        let after: CaseInsensitiveHashMap =
-                                            parse_row(row, table_name, &mut columns, config, pool)
-                                                .await;
+                                        let after: CaseInsensitiveHashMap = parse_row(
+                                            row,
+                                            table_name.as_str(),
+                                            &mut columns,
+                                            config,
+                                            pool,
+                                        )
+                                        .await;
                                         let op = Operation::CREATE(false);
                                         SOURCE_EVENTS_TOTAL
-                                            .with_label_values(&["mysql", table_name, "create"])
+                                            .with_label_values(&[
+                                                "mysql",
+                                                progress_label.as_str(),
+                                                "create",
+                                            ])
                                             .inc();
-                                        let data_buffer = DataBuffer::new(
-                                            table_name.to_string(),
+                                        let data_buffer = DataBuffer::new_with_route(
+                                            database_name.clone(),
+                                            config.target_database.clone(),
+                                            table_name.clone(),
                                             before,
                                             after,
                                             op,
@@ -970,7 +1113,7 @@ impl Source for MySQLSource {
                                             next_event_position,
                                         );
                                         runtime_progress::record_read(
-                                            table_name,
+                                            &progress_label,
                                             "cdc",
                                             pk_column.as_ref().and_then(|pk| {
                                                 pk_value_for_progress(&data_buffer, pk)
@@ -978,7 +1121,7 @@ impl Source for MySQLSource {
                                         )
                                         .await;
                                         let plugin_data =
-                                            detail_with_plugin(plugins, data_buffer).await;
+                                            detail_with_plugin(&plugins, data_buffer).await;
                                         if let Ok(item) = plugin_data {
                                             Self::write_record_with_retry(
                                                 &mut sink,
@@ -986,14 +1129,15 @@ impl Source for MySQLSource {
                                                 Some(checkpoint_entity.clone()),
                                             )
                                             .await;
-                                            runtime_progress::record_synced(table_name).await;
+                                            runtime_progress::record_synced(&progress_label).await;
                                         } else {
-                                            runtime_progress::record_filtered(table_name).await;
+                                            runtime_progress::record_filtered(&progress_label)
+                                                .await;
                                         }
                                     }
                                     if !binlog_filename.is_empty() {
                                         SOURCE_LAG_POSITION
-                                            .with_label_values(&["mysql", table_name])
+                                            .with_label_values(&["mysql", progress_label.as_str()])
                                             .set(next_event_position as i64);
                                         checkpoint_entity = checkpoint_entity
                                             .update(binlog_filename, next_event_position);
@@ -1004,36 +1148,56 @@ impl Source for MySQLSource {
                                     }
                                 }
                                 trace!("Checkpoint: {:?}", to_modify);
-                                *self.checkpoint_entities.lock().await[i].lock().await = to_modify;
+                                *self.checkpoint_entities.lock().await[source_index]
+                                    .lock()
+                                    .await = to_modify;
                             }
                             EventData::DeleteRows(event) => {
-                                let pool: &mut Pool<MySql> = &mut self.pools[i];
-                                let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
-                                let mut to_modify = self.checkpoint_entities.lock().await[i]
+                                let table_name = table_map
+                                    .get(&(i, event.table_id))
+                                    .unwrap_or_else(|| {
+                                        panic!("Table id {} not found", event.table_id)
+                                    })
+                                    .clone();
+                                let database_name = table_database_map
+                                    .get(&(i, event.table_id))
+                                    .unwrap_or_else(|| {
+                                        panic!("Table id {} not found", event.table_id)
+                                    })
+                                    .clone();
+                                let Some(source_index) = self.source_index_for_event(
+                                    i,
+                                    database_name.as_str(),
+                                    table_name.as_str(),
+                                ) else {
+                                    continue;
+                                };
+                                let plugins = self.plugins.clone();
+                                let pool: &mut Pool<MySql> = &mut self.pools[source_index];
+                                let config: &MysqlSourceConfigDetail =
+                                    &mut self.mysql_source[source_index];
+                                let table_key = config.source_table_key(table_name.as_str());
+                                let progress_label = progress_table_label(
+                                    database_name.as_str(),
+                                    table_name.as_str(),
+                                );
+                                let mut to_modify = self.checkpoint_entities.lock().await
+                                    [source_index]
                                     .lock()
                                     .await
                                     .clone();
-                                let table_name = table_map
-                                    .get(&event.table_id)
-                                    .unwrap_or_else(|| {
-                                        panic!("Table id {} not found", event.table_id)
-                                    })
-                                    .as_str();
-                                let database_name = table_database_map
-                                    .get(&event.table_id)
-                                    .unwrap_or_else(|| {
-                                        panic!("Table id {} not found", event.table_id)
-                                    })
-                                    .as_str();
-                                if config.is_target_database_and_table(database_name, table_name) {
+                                if config.is_target_database_and_table(
+                                    database_name.as_str(),
+                                    table_name.as_str(),
+                                ) {
                                     debug!("DeleteRows: {}.{}", database_name, table_name);
-                                    let checkpoint_entity: &mut MysqlCheckPointDetailEntity =
-                                        &mut self.checkpoint_entities.lock().await[i]
-                                            .lock()
-                                            .await
-                                            .get(&table_name.to_lowercase())
-                                            .expect("checkpoint_entity not found")
-                                            .clone();
+                                    let checkpoint_entity = self.checkpoint_entities.lock().await
+                                        [source_index]
+                                        .lock()
+                                        .await
+                                        .get(table_key.to_lowercase().as_str())
+                                        .expect("checkpoint_entity not found")
+                                        .clone();
                                     let mut checkpoint_entity = checkpoint_entity.clone();
 
                                     let binlog_filename = self.binlog_filename_list.lock().await[i]
@@ -1042,19 +1206,30 @@ impl Source for MySQLSource {
                                         .clone();
                                     let timestamp = header.timestamp;
                                     let next_event_position = header.next_event_position;
-                                    let pk_column = table_pk_column(config, table_name);
+                                    let pk_column = table_pk_column(config, table_name.as_str());
                                     for row in event.rows {
-                                        let before: CaseInsensitiveHashMap =
-                                            parse_row(row, table_name, &mut columns, config, pool)
-                                                .await;
+                                        let before: CaseInsensitiveHashMap = parse_row(
+                                            row,
+                                            table_name.as_str(),
+                                            &mut columns,
+                                            config,
+                                            pool,
+                                        )
+                                        .await;
                                         let after: CaseInsensitiveHashMap =
                                             CaseInsensitiveHashMap::new_with_no_arg();
                                         let op = Operation::DELETE;
                                         SOURCE_EVENTS_TOTAL
-                                            .with_label_values(&["mysql", table_name, "delete"])
+                                            .with_label_values(&[
+                                                "mysql",
+                                                progress_label.as_str(),
+                                                "delete",
+                                            ])
                                             .inc();
-                                        let data_buffer = DataBuffer::new(
-                                            table_name.to_string(),
+                                        let data_buffer = DataBuffer::new_with_route(
+                                            database_name.clone(),
+                                            config.target_database.clone(),
+                                            table_name.clone(),
                                             before,
                                             after,
                                             op,
@@ -1063,7 +1238,7 @@ impl Source for MySQLSource {
                                             next_event_position,
                                         );
                                         runtime_progress::record_read(
-                                            table_name,
+                                            &progress_label,
                                             "cdc",
                                             pk_column.as_ref().and_then(|pk| {
                                                 pk_value_for_progress(&data_buffer, pk)
@@ -1071,7 +1246,7 @@ impl Source for MySQLSource {
                                         )
                                         .await;
                                         let plugin_data =
-                                            detail_with_plugin(plugins, data_buffer).await;
+                                            detail_with_plugin(&plugins, data_buffer).await;
                                         if let Ok(item) = plugin_data {
                                             Self::write_record_with_retry(
                                                 &mut sink,
@@ -1079,14 +1254,15 @@ impl Source for MySQLSource {
                                                 Some(checkpoint_entity.clone()),
                                             )
                                             .await;
-                                            runtime_progress::record_synced(table_name).await;
+                                            runtime_progress::record_synced(&progress_label).await;
                                         } else {
-                                            runtime_progress::record_filtered(table_name).await;
+                                            runtime_progress::record_filtered(&progress_label)
+                                                .await;
                                         }
                                     }
                                     if !binlog_filename.is_empty() {
                                         SOURCE_LAG_POSITION
-                                            .with_label_values(&["mysql", table_name])
+                                            .with_label_values(&["mysql", progress_label.as_str()])
                                             .set(next_event_position as i64);
                                         checkpoint_entity = checkpoint_entity
                                             .update(binlog_filename, next_event_position);
@@ -1097,36 +1273,56 @@ impl Source for MySQLSource {
                                     }
                                 }
                                 trace!("Checkpoint: {:?}", to_modify);
-                                *self.checkpoint_entities.lock().await[i].lock().await = to_modify;
+                                *self.checkpoint_entities.lock().await[source_index]
+                                    .lock()
+                                    .await = to_modify;
                             }
                             EventData::UpdateRows(event) => {
-                                let pool: &mut Pool<MySql> = &mut self.pools[i];
-                                let config: &MysqlSourceConfigDetail = &mut self.mysql_source[i];
-                                let mut to_modify = self.checkpoint_entities.lock().await[i]
+                                let table_name = table_map
+                                    .get(&(i, event.table_id))
+                                    .unwrap_or_else(|| {
+                                        panic!("Table id {} not found", event.table_id)
+                                    })
+                                    .clone();
+                                let database_name = table_database_map
+                                    .get(&(i, event.table_id))
+                                    .unwrap_or_else(|| {
+                                        panic!("Table id {} not found", event.table_id)
+                                    })
+                                    .clone();
+                                let Some(source_index) = self.source_index_for_event(
+                                    i,
+                                    database_name.as_str(),
+                                    table_name.as_str(),
+                                ) else {
+                                    continue;
+                                };
+                                let plugins = self.plugins.clone();
+                                let pool: &mut Pool<MySql> = &mut self.pools[source_index];
+                                let config: &MysqlSourceConfigDetail =
+                                    &mut self.mysql_source[source_index];
+                                let table_key = config.source_table_key(table_name.as_str());
+                                let progress_label = progress_table_label(
+                                    database_name.as_str(),
+                                    table_name.as_str(),
+                                );
+                                let mut to_modify = self.checkpoint_entities.lock().await
+                                    [source_index]
                                     .lock()
                                     .await
                                     .clone();
-                                let table_name = table_map
-                                    .get(&event.table_id)
-                                    .unwrap_or_else(|| {
-                                        panic!("Table id {} not found", event.table_id)
-                                    })
-                                    .as_str();
-                                let database_name = table_database_map
-                                    .get(&event.table_id)
-                                    .unwrap_or_else(|| {
-                                        panic!("Table id {} not found", event.table_id)
-                                    })
-                                    .as_str();
-                                if config.is_target_database_and_table(database_name, table_name) {
+                                if config.is_target_database_and_table(
+                                    database_name.as_str(),
+                                    table_name.as_str(),
+                                ) {
                                     debug!("UpdateRows: {}.{}", database_name, table_name);
-                                    let checkpoint_entity: &mut MysqlCheckPointDetailEntity =
-                                        &mut self.checkpoint_entities.lock().await[i]
-                                            .lock()
-                                            .await
-                                            .get(&table_name.to_lowercase())
-                                            .expect("checkpoint_entity not found")
-                                            .clone();
+                                    let checkpoint_entity = self.checkpoint_entities.lock().await
+                                        [source_index]
+                                        .lock()
+                                        .await
+                                        .get(table_key.to_lowercase().as_str())
+                                        .expect("checkpoint_entity not found")
+                                        .clone();
                                     let mut checkpoint_entity = checkpoint_entity.clone();
 
                                     let binlog_filename = self.binlog_filename_list.lock().await[i]
@@ -1135,20 +1331,36 @@ impl Source for MySQLSource {
                                         .clone();
                                     let timestamp = header.timestamp;
                                     let next_event_position = header.next_event_position;
-                                    let pk_column = table_pk_column(config, table_name);
+                                    let pk_column = table_pk_column(config, table_name.as_str());
                                     for (b, a) in event.rows {
-                                        let before: CaseInsensitiveHashMap =
-                                            parse_row(b, table_name, &mut columns, config, pool)
-                                                .await;
-                                        let after: CaseInsensitiveHashMap =
-                                            parse_row(a, table_name, &mut columns, config, pool)
-                                                .await;
+                                        let before: CaseInsensitiveHashMap = parse_row(
+                                            b,
+                                            table_name.as_str(),
+                                            &mut columns,
+                                            config,
+                                            pool,
+                                        )
+                                        .await;
+                                        let after: CaseInsensitiveHashMap = parse_row(
+                                            a,
+                                            table_name.as_str(),
+                                            &mut columns,
+                                            config,
+                                            pool,
+                                        )
+                                        .await;
                                         let op = Operation::UPDATE;
                                         SOURCE_EVENTS_TOTAL
-                                            .with_label_values(&["mysql", table_name, "update"])
+                                            .with_label_values(&[
+                                                "mysql",
+                                                progress_label.as_str(),
+                                                "update",
+                                            ])
                                             .inc();
-                                        let data_buffer = DataBuffer::new(
-                                            table_name.to_string(),
+                                        let data_buffer = DataBuffer::new_with_route(
+                                            database_name.clone(),
+                                            config.target_database.clone(),
+                                            table_name.clone(),
                                             before,
                                             after,
                                             op,
@@ -1157,7 +1369,7 @@ impl Source for MySQLSource {
                                             next_event_position,
                                         );
                                         runtime_progress::record_read(
-                                            table_name,
+                                            &progress_label,
                                             "cdc",
                                             pk_column.as_ref().and_then(|pk| {
                                                 pk_value_for_progress(&data_buffer, pk)
@@ -1165,7 +1377,7 @@ impl Source for MySQLSource {
                                         )
                                         .await;
                                         let plugin_data =
-                                            detail_with_plugin(plugins, data_buffer).await;
+                                            detail_with_plugin(&plugins, data_buffer).await;
                                         if let Ok(item) = plugin_data {
                                             Self::write_record_with_retry(
                                                 &mut sink,
@@ -1173,15 +1385,16 @@ impl Source for MySQLSource {
                                                 Some(checkpoint_entity.clone()),
                                             )
                                             .await;
-                                            runtime_progress::record_synced(table_name).await;
+                                            runtime_progress::record_synced(&progress_label).await;
                                         } else {
-                                            runtime_progress::record_filtered(table_name).await;
+                                            runtime_progress::record_filtered(&progress_label)
+                                                .await;
                                         }
                                     }
 
                                     if !binlog_filename.is_empty() {
                                         SOURCE_LAG_POSITION
-                                            .with_label_values(&["mysql", table_name])
+                                            .with_label_values(&["mysql", progress_label.as_str()])
                                             .set(next_event_position as i64);
                                         checkpoint_entity = checkpoint_entity
                                             .update(binlog_filename, next_event_position);
@@ -1192,7 +1405,9 @@ impl Source for MySQLSource {
                                     }
                                 }
                                 trace!("Checkpoint: {:?}", to_modify);
-                                *self.checkpoint_entities.lock().await[i].lock().await = to_modify;
+                                *self.checkpoint_entities.lock().await[source_index]
+                                    .lock()
+                                    .await = to_modify;
                             }
                             _ => {}
                         }
@@ -1203,18 +1418,24 @@ impl Source for MySQLSource {
                             continue;
                         }
                         if should_reconnect_read_error(&message) {
-                            let connection_url = self.mysql_source[i].connection_url.clone();
-                            let server_id = self.mysql_source[i].server_id;
+                            let group = self.stream_groups[i].clone();
+                            let connection_url = group.connection_url.clone();
+                            let server_id = group.server_id;
                             let runtime_binlog_filename = self.binlog_filename_list.lock().await[i]
                                 .lock()
                                 .await
                                 .clone();
                             let runtime_binlog_position =
                                 *self.binlog_position_list.lock().await[i].lock().await;
-                            let checkpoints = self.checkpoint_entities.lock().await[i]
-                                .lock()
-                                .await
-                                .clone();
+                            let mut checkpoints = HashMap::new();
+                            {
+                                let checkpoints_guard = self.checkpoint_entities.lock().await;
+                                for source_index in &group.source_indices {
+                                    checkpoints.extend(
+                                        checkpoints_guard[*source_index].lock().await.clone(),
+                                    );
+                                }
+                            }
                             let resume_position = compute_resume_position(
                                 if runtime_binlog_filename.is_empty() {
                                     None
@@ -1312,7 +1533,8 @@ async fn parse_row(
 ) -> CaseInsensitiveHashMap {
     let mut data: HashMap<String, Value> = HashMap::new();
     let mut index = 0;
-    let mut columns = columns_map.lock().await.get(table_name);
+    let table_key = config.source_table_key(table_name);
+    let mut columns = columns_map.lock().await.get(table_key.as_str());
     if columns.len() != row.column_values.len() {
         let columns_new = config.fill_table_column(table_name, pool).await;
         columns.clear();
@@ -1320,7 +1542,7 @@ async fn parse_row(
         columns_map
             .lock()
             .await
-            .insert(table_name.to_string(), columns.clone());
+            .insert(table_key.clone(), columns.clone());
     }
     if columns.len() != row.column_values.len() {
         panic!("columns length not equal to column_values length");

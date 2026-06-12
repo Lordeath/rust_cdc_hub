@@ -1392,6 +1392,8 @@ mod tests {
     #[test]
     fn large_varchar_columns_use_clob_placeholder() {
         let table_info = TableInfoVo {
+            source_database: "source_db".to_string(),
+            target_database: "target_schema".to_string(),
             table_name: "ns_system_log".to_string(),
             pk_column: "id".to_string(),
             create_table_sql: r#"CREATE TABLE `ns_system_log` (

@@ -124,6 +124,7 @@ export CONFIG_PATH=/path/to/config.yaml
 | `sink_type` | 是 | Sink 类型：`MySQL`、`Starrocks`、`MeiliSearch`、`Dameng`、`Print`。 |
 | `source_config` | 是 | Source 连接与同步配置列表。 |
 | `sink_config` | 是 | Sink 连接与写入配置列表。 |
+| `multi_mode` | 否 | 多库同步模式配置，默认关闭；第一版仅支持 MySQL → MySQL。 |
 | `auto_create_database` | 否 | 是否自动建库，默认 `true`。 |
 | `auto_create_table` | 否 | 是否自动建表，默认 `true`。 |
 | `auto_add_column` | 否 | 是否自动加字段。 |
@@ -150,6 +151,41 @@ export CONFIG_PATH=/path/to/config.yaml
 | `ssl_mode` | MySQL SSL模式，透传为SQLx连接参数 `ssl-mode`。可选：`disabled`、`preferred`、`required`、`verify_ca`、`verify_identity`；默认 `disabled`。如果源库/目标库必须使用SSL，请显式设置为 `required` 或证书校验模式。 |
 
 主键列会从 MySQL 表结构自动识别；参与同步的表需要单一 `bigint`/`bigint unsigned` 主键。MeiliSearch 目标端的 `meili_table_pk` 仍需单独配置为索引主键字段。
+
+### 多库同步模式（MySQL → MySQL）
+
+`multi_mode.open: true` 后，单个 `source_config[0].database` 可以用逗号配置多个源库，单个 `sink_config[0].database` 可以用逗号配置目标库清单；`database_route` 必须显式覆盖每个源库。
+
+```yaml
+source_type: MySQL
+sink_type: MySQL
+source_config:
+  - host: 127.0.0.1
+    port: 3306
+    username: cdc_user
+    password: cdc_password
+    database: newsee-soss,newsee-system
+    table_name: "*"
+    server_id: 10000
+
+sink_config:
+  - host: 127.0.0.1
+    port: 3306
+    username: sink_user
+    password: sink_password
+    database: newsee-system-soss,newsee-system-test
+
+multi_mode:
+  open: true
+  init_parallelism: 4
+  database_route:
+    - source: newsee-soss
+      sink: newsee-system-soss
+    - source: newsee-system
+      sink: newsee-system-test
+```
+
+多库模式下只创建一个 binlog stream 读取同一 host 的 binlog；初始化阶段按源库并行抽取，`init_parallelism` 默认 `4`。表过滤规则（`table_name`、`include_table_regex`、`exclude_table_regex`、`except_table_name_prefix`）对所有源库共用。允许多个源库路由到同一个目标库/表，但源表主键、字段和字段类型必须一致。
 
 ### MySQL → MySQL 示例
 

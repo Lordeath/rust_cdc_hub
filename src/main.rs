@@ -1882,6 +1882,10 @@ async fn main() {
         error!("{}", e);
         panic!("{}", e);
     }
+    if let Err(e) = config.validate_multi_mode() {
+        error!("{}", e);
+        panic!("{}", e);
+    }
     let ui_state = UiState::new(&config);
     if config.enable_ui.unwrap_or(true) {
         let bind = config.ui_bind.clone().unwrap_or("0.0.0.0".to_string());
@@ -2134,12 +2138,16 @@ plugins:
     fn test_table_info_list() -> Vec<TableInfoVo> {
         vec![
             TableInfoVo {
+                source_database: "source_shard_01".to_string(),
+                target_database: "target_shard_08".to_string(),
                 table_name: "orders".to_string(),
                 pk_column: "id".to_string(),
                 create_table_sql: "".to_string(),
                 columns: vec!["id".to_string(), "project_id".to_string()],
             },
             TableInfoVo {
+                source_database: "source_shard_01".to_string(),
+                target_database: "target_shard_08".to_string(),
                 table_name: "tenant_map".to_string(),
                 pk_column: "id".to_string(),
                 create_table_sql: "".to_string(),

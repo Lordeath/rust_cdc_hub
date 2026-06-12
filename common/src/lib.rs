@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
@@ -128,6 +128,7 @@ pub struct CdcConfig {
     pub sink_type: SinkType,
     pub source_config: Vec<HashMap<String, String>>,
     pub sink_config: Vec<HashMap<String, String>>,
+    pub multi_mode: Option<MultiModeConfig>,
     pub auto_create_database: Option<bool>,
     pub auto_create_table: Option<bool>,
     pub auto_add_column: Option<bool>,
@@ -178,6 +179,182 @@ impl CdcConfig {
         let value = self.first_source(key);
         value.parse::<u32>().unwrap_or(0)
     }
+
+    pub fn multi_mode_open(&self) -> bool {
+        self.multi_mode
+            .as_ref()
+            .map(|multi_mode| multi_mode.open.unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    pub fn multi_mode_init_parallelism(&self) -> usize {
+        self.multi_mode
+            .as_ref()
+            .and_then(|multi_mode| multi_mode.init_parallelism)
+            .unwrap_or(4)
+            .max(1)
+    }
+
+    pub fn multi_mode_route_map(&self) -> HashMap<String, String> {
+        let mut result = HashMap::new();
+        if let Some(multi_mode) = &self.multi_mode {
+            for route in &multi_mode.database_route {
+                result.insert(
+                    route.source.to_ascii_lowercase(),
+                    route.sink.trim().to_string(),
+                );
+            }
+        }
+        result
+    }
+
+    pub fn target_database_for_source(&self, source_database: &str) -> String {
+        if self.multi_mode_open() {
+            return self
+                .multi_mode_route_map()
+                .get(&source_database.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "multi_mode database_route missing source database: {}",
+                        source_database
+                    )
+                });
+        }
+        self.first_sink("database")
+    }
+
+    pub fn split_csv_value(value: &str) -> Vec<String> {
+        value
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    pub fn source_databases(&self) -> Vec<String> {
+        if self.multi_mode_open() {
+            return Self::split_csv_value(self.first_source("database").as_str());
+        }
+        self.source_config
+            .iter()
+            .map(|item| item.get("database").cloned().unwrap_or_default())
+            .collect()
+    }
+
+    pub fn sink_databases(&self) -> Vec<String> {
+        if self.multi_mode_open() {
+            return Self::split_csv_value(self.first_sink("database").as_str());
+        }
+        vec![self.first_sink("database")]
+    }
+
+    pub fn validate_multi_mode(&self) -> Result<(), String> {
+        if !self.multi_mode_open() {
+            return Ok(());
+        }
+        if !matches!(self.source_type, SourceType::MySQL)
+            || !matches!(self.sink_type, SinkType::MySQL)
+        {
+            return Err("multi_mode 第一版只支持 MySQL -> MySQL".to_string());
+        }
+        if self.source_config.len() != 1 {
+            return Err(
+                "multi_mode 第一版只支持单个 source_config，通过 database 逗号分隔多个源库"
+                    .to_string(),
+            );
+        }
+        if self.sink_config.len() != 1 {
+            return Err(
+                "multi_mode 第一版只支持单个 sink_config，通过 database 逗号分隔多个目标库"
+                    .to_string(),
+            );
+        }
+        let source_databases = self.source_databases();
+        if source_databases.is_empty() {
+            return Err("multi_mode.source_config[0].database 不能为空".to_string());
+        }
+        ensure_no_duplicate_values("multi_mode source database", &source_databases)?;
+        let sink_databases = self.sink_databases();
+        if sink_databases.is_empty() {
+            return Err("multi_mode.sink_config[0].database 不能为空".to_string());
+        }
+        ensure_no_duplicate_values("multi_mode sink database", &sink_databases)?;
+        let source_set = lower_set(&source_databases);
+        let sink_set = lower_set(&sink_databases);
+        let multi_mode = self
+            .multi_mode
+            .as_ref()
+            .ok_or_else(|| "multi_mode 配置缺失".to_string())?;
+        if multi_mode.database_route.is_empty() {
+            return Err("multi_mode.database_route 必须覆盖所有源库".to_string());
+        }
+        let mut route_sources = HashSet::new();
+        for route in &multi_mode.database_route {
+            let source = route.source.trim();
+            let sink = route.sink.trim();
+            if source.is_empty() || sink.is_empty() {
+                return Err("multi_mode.database_route source/sink 不能为空".to_string());
+            }
+            let source_key = source.to_ascii_lowercase();
+            if !source_set.contains(&source_key) {
+                return Err(format!(
+                    "multi_mode.database_route source 不在 source_config.database 中: {}",
+                    source
+                ));
+            }
+            if !route_sources.insert(source_key.clone()) {
+                return Err(format!("multi_mode.database_route source 重复: {}", source));
+            }
+            if !sink_set.contains(&sink.to_ascii_lowercase()) {
+                return Err(format!(
+                    "multi_mode.database_route sink 不在 sink_config.database 清单中: {}",
+                    sink
+                ));
+            }
+        }
+        for source in source_databases {
+            if !route_sources.contains(&source.to_ascii_lowercase()) {
+                return Err(format!("multi_mode.database_route 未覆盖源库: {}", source));
+            }
+        }
+        if multi_mode.init_parallelism == Some(0) {
+            return Err("multi_mode.init_parallelism 必须大于 0".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn lower_set(values: &[String]) -> HashSet<String> {
+    values
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect()
+}
+
+fn ensure_no_duplicate_values(label: &str, values: &[String]) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for value in values {
+        let key = value.to_ascii_lowercase();
+        if !seen.insert(key) {
+            return Err(format!("{} 重复: {}", label, value));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MultiModeConfig {
+    pub open: Option<bool>,
+    pub init_parallelism: Option<usize>,
+    #[serde(default)]
+    pub database_route: Vec<DatabaseRoute>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DatabaseRoute {
+    pub source: String,
+    pub sink: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +373,8 @@ impl PluginConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataBuffer {
+    pub source_database: String,
+    pub target_database: String,
     pub table_name: String,
     pub before: CaseInsensitiveHashMap,
     pub after: CaseInsensitiveHashMap,
@@ -215,7 +394,33 @@ impl DataBuffer {
         timestamp: u32,
         next_event_position: u32,
     ) -> DataBuffer {
+        DataBuffer::new_with_route(
+            "".to_string(),
+            "".to_string(),
+            table_name,
+            before,
+            after,
+            op,
+            binlog_filename,
+            timestamp,
+            next_event_position,
+        )
+    }
+
+    pub fn new_with_route(
+        source_database: String,
+        target_database: String,
+        table_name: String,
+        before: CaseInsensitiveHashMap,
+        after: CaseInsensitiveHashMap,
+        op: Operation,
+        binlog_filename: String,
+        timestamp: u32,
+        next_event_position: u32,
+    ) -> DataBuffer {
         DataBuffer {
+            source_database,
+            target_database,
             table_name,
             before,
             after,
@@ -235,7 +440,9 @@ impl DataBuffer {
     }
 
     pub fn new_before(&self, data: CaseInsensitiveHashMap) -> DataBuffer {
-        DataBuffer::new(
+        DataBuffer::new_with_route(
+            self.source_database.clone(),
+            self.target_database.clone(),
             self.table_name.clone(),
             data,
             self.after.clone(),
@@ -246,7 +453,9 @@ impl DataBuffer {
         )
     }
     pub fn new_after(&self, data: CaseInsensitiveHashMap) -> DataBuffer {
-        DataBuffer::new(
+        DataBuffer::new_with_route(
+            self.source_database.clone(),
+            self.target_database.clone(),
             self.table_name.clone(),
             self.before.clone(),
             data,
@@ -255,6 +464,22 @@ impl DataBuffer {
             self.timestamp,
             self.next_event_position,
         )
+    }
+
+    pub fn source_table_key(&self) -> String {
+        database_table_key(self.source_database.as_str(), self.table_name.as_str())
+    }
+
+    pub fn target_table_key(&self) -> String {
+        database_table_key(self.target_database.as_str(), self.table_name.as_str())
+    }
+}
+
+pub fn database_table_key(database: &str, table_name: &str) -> String {
+    if database.trim().is_empty() {
+        table_name.to_string()
+    } else {
+        format!("{}.{}", database, table_name)
     }
 }
 
@@ -481,6 +706,10 @@ pub enum Operation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableInfoVo {
+    #[serde(default)]
+    pub source_database: String,
+    #[serde(default)]
+    pub target_database: String,
     pub table_name: String,
     pub pk_column: String,
     pub create_table_sql: String,
@@ -1023,5 +1252,76 @@ mod tests {
             mysql_connection_url_from_config(&config, Some("demo")),
             "mysql://user:secret@127.0.0.1:3306/demo?ssl-mode=disabled&ssl-ca=%2Ftmp%2Fmysql%20ca.pem"
         );
+    }
+
+    fn multi_mode_config() -> CdcConfig {
+        let mut source = HashMap::new();
+        source.insert("database".to_string(), "src_a,src_b".to_string());
+        let mut sink = HashMap::new();
+        sink.insert("database".to_string(), "dst_a,dst_b".to_string());
+        CdcConfig {
+            source_type: SourceType::MySQL,
+            sink_type: SinkType::MySQL,
+            source_config: vec![source],
+            sink_config: vec![sink],
+            multi_mode: Some(MultiModeConfig {
+                open: Some(true),
+                init_parallelism: Some(4),
+                database_route: vec![
+                    DatabaseRoute {
+                        source: "src_a".to_string(),
+                        sink: "dst_a".to_string(),
+                    },
+                    DatabaseRoute {
+                        source: "src_b".to_string(),
+                        sink: "dst_b".to_string(),
+                    },
+                ],
+            }),
+            auto_create_database: None,
+            auto_create_table: None,
+            auto_add_column: None,
+            auto_modify_column: None,
+            plugins: None,
+            source_batch_size: None,
+            sink_batch_size: None,
+            checkpoint_file_path: None,
+            log_level: None,
+            enable_ui: None,
+            ui_bind: None,
+            ui_port: None,
+        }
+    }
+
+    #[test]
+    fn test_multi_mode_validate_success() {
+        let config = multi_mode_config();
+
+        assert!(config.validate_multi_mode().is_ok());
+        assert_eq!(
+            config.source_databases(),
+            vec!["src_a".to_string(), "src_b".to_string()]
+        );
+        assert_eq!(config.target_database_for_source("src_b"), "dst_b");
+    }
+
+    #[test]
+    fn test_multi_mode_route_must_cover_all_sources() {
+        let mut config = multi_mode_config();
+        config.multi_mode.as_mut().unwrap().database_route.pop();
+
+        let err = config.validate_multi_mode().unwrap_err();
+
+        assert!(err.contains("未覆盖源库"));
+    }
+
+    #[test]
+    fn test_multi_mode_route_sink_must_be_declared() {
+        let mut config = multi_mode_config();
+        config.multi_mode.as_mut().unwrap().database_route[1].sink = "dst_x".to_string();
+
+        let err = config.validate_multi_mode().unwrap_err();
+
+        assert!(err.contains("sink 不在 sink_config.database"));
     }
 }

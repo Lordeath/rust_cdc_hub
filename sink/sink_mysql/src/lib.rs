@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use common::case_insensitive_hash_map::{
-    CaseInsensitiveHashMapTableInfoVo, CaseInsensitiveHashMapVecCaseInsensitiveHashMap,
-    CaseInsensitiveHashMapVecString,
+    CaseInsensitiveHashMapTableInfoVo, CaseInsensitiveHashMapVecString,
 };
 use common::metrics::{SINK_EVENTS_TOTAL, SINK_FLUSH_DURATION_SECONDS, SINK_FLUSH_ERRORS_TOTAL};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
@@ -11,7 +10,8 @@ use common::schema::{
 };
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value,
-    get_mysql_pool_by_url, mysql_connection_url_from_config, mysql_row_to_hashmap,
+    database_table_key, get_mysql_pool_by_url, mysql_connection_url_from_config,
+    mysql_row_to_hashmap,
 };
 use sqlx::mysql::{MySqlArguments, MySqlQueryResult};
 use sqlx::query::Query;
@@ -20,12 +20,14 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinSet;
 use tracing::log::trace;
 use tracing::{debug, error, info};
 
 pub struct MySqlSink {
-    pool: Mutex<Pool<MySql>>,
-    connection_url: String,
+    primary_database: String,
+    target_pools: HashMap<String, Pool<MySql>>,
+    connection_urls: HashMap<String, String>,
     table_info_list: Vec<TableInfoVo>,
     buffer: Mutex<Vec<DataBuffer>>,
     initialized: RwLock<bool>,
@@ -40,43 +42,81 @@ pub struct MySqlSink {
 
 impl MySqlSink {
     pub async fn new(config: &CdcConfig, table_info_list: Vec<TableInfoVo>) -> Self {
-        let database = config.first_sink("database");
-        let connection_url =
-            mysql_connection_url_from_config(&config.sink_config[0], Some(&database));
-        let pool =
-            match Self::get_pool_auto_create_database(config, database, &connection_url).await {
+        if let Err(e) = Self::validate_merged_target_schema(&table_info_list) {
+            panic!("{}", e);
+        }
+
+        let target_databases = config.sink_databases();
+        let primary_database = target_databases.first().cloned().unwrap_or_default();
+        let mut target_pools = HashMap::new();
+        let mut connection_urls = HashMap::new();
+        for database in &target_databases {
+            let connection_url =
+                mysql_connection_url_from_config(&config.sink_config[0], Some(database));
+            let pool = match Self::get_pool_auto_create_database(
+                config,
+                database.clone(),
+                &connection_url,
+            )
+            .await
+            {
                 Ok(value) => value,
                 Err(value) => return value,
             };
+            target_pools.insert(database.to_ascii_lowercase(), pool);
+            connection_urls.insert(database.to_ascii_lowercase(), connection_url);
+        }
 
-        // judge is need to create table
+        let mut target_tables: HashMap<String, TableInfoVo> = HashMap::new();
+        for table_info in &table_info_list {
+            let database = Self::table_info_target_database(table_info, primary_database.as_str());
+            target_tables
+                .entry(database_table_key(
+                    database.as_str(),
+                    table_info.table_name.as_str(),
+                ))
+                .or_insert_with(|| table_info.clone());
+        }
+
         if config.auto_create_table.unwrap_or(true) {
-            let sql = "select * from information_schema.`COLUMNS` where TABLE_SCHEMA = (select database()) AND TABLE_NAME = ?";
-            for table_info in &table_info_list {
+            let sql = "select * from information_schema.`COLUMNS` where TABLE_SCHEMA = ? AND TABLE_NAME = ?";
+            for table_info in target_tables.values() {
+                let database =
+                    Self::table_info_target_database(table_info, primary_database.as_str());
+                let pool = target_pools
+                    .get(database.to_ascii_lowercase().as_str())
+                    .unwrap_or_else(|| panic!("target database pool not found: {}", database));
                 let table_name = table_info.table_name.clone();
                 let is_empty = sqlx::query(sql)
+                    .bind(&database)
                     .bind(&table_name)
-                    .fetch_all(&pool)
+                    .fetch_all(pool)
                     .await
                     .unwrap()
                     .is_empty();
                 if is_empty {
                     let create_table_sql = table_info.create_table_sql.clone();
                     sqlx::query(&create_table_sql)
-                        .execute(&pool)
+                        .execute(pool)
                         .await
                         .expect("Failed to create table");
                 }
             }
         }
         if config.auto_add_column.unwrap_or(true) {
-            for table_info in &table_info_list {
+            for table_info in target_tables.values() {
+                let database =
+                    Self::table_info_target_database(table_info, primary_database.as_str());
+                let pool = target_pools
+                    .get(database.to_ascii_lowercase().as_str())
+                    .unwrap_or_else(|| panic!("target database pool not found: {}", database));
                 let table_name = table_info.table_name.clone();
                 let rows = sqlx::query(
-                    "select COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE from information_schema.`COLUMNS` where TABLE_SCHEMA = (select database()) AND TABLE_NAME = ?",
+                    "select COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE from information_schema.`COLUMNS` where TABLE_SCHEMA = ? AND TABLE_NAME = ?",
                 )
+                .bind(&database)
                 .bind(&table_name)
-                .fetch_all(&pool)
+                .fetch_all(pool)
                 .await
                 .unwrap_or_default();
                 let exists_set: HashSet<String> = rows
@@ -99,27 +139,39 @@ impl MySqlSink {
                         Some(v) => v,
                     };
                     let alter_sql = format!("ALTER TABLE `{}` ADD COLUMN {}", table_name, def);
-                    match sqlx::query(&alter_sql).execute(&pool).await {
-                        Ok(_) => info!("auto add column success: {} {}", table_name, src_col),
+                    match sqlx::query(&alter_sql).execute(pool).await {
+                        Ok(_) => info!(
+                            "auto add column success: {}.{} {}",
+                            database, table_name, src_col
+                        ),
                         Err(e) => {
-                            error!("auto add column failed: {} {} {}", table_name, src_col, e)
+                            error!(
+                                "auto add column failed: {}.{} {} {}",
+                                database, table_name, src_col, e
+                            )
                         }
                     }
                 }
             }
         }
         if config.auto_modify_column.unwrap_or(true) {
-            for table_info in &table_info_list {
+            for table_info in target_tables.values() {
+                let database =
+                    Self::table_info_target_database(table_info, primary_database.as_str());
+                let pool = target_pools
+                    .get(database.to_ascii_lowercase().as_str())
+                    .unwrap_or_else(|| panic!("target database pool not found: {}", database));
                 let table_name = table_info.table_name.clone();
                 let defs = extract_mysql_create_table_column_definitions(
                     table_info.create_table_sql.as_str(),
                 );
 
                 let rows = sqlx::query(
-                    "select COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE from information_schema.`COLUMNS` where TABLE_SCHEMA = (select database()) AND TABLE_NAME = ?",
+                    "select COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE from information_schema.`COLUMNS` where TABLE_SCHEMA = ? AND TABLE_NAME = ?",
                 )
+                .bind(&database)
                 .bind(&table_name)
-                .fetch_all(&pool)
+                .fetch_all(pool)
                 .await
                 .unwrap_or_default();
 
@@ -159,11 +211,14 @@ impl MySqlSink {
                         continue;
                     }
                     let modify_sql = format!("ALTER TABLE `{}` MODIFY COLUMN {}", table_name, def);
-                    match sqlx::query(&modify_sql).execute(&pool).await {
-                        Ok(_) => info!("auto modify column success: {} {}", table_name, src_col),
+                    match sqlx::query(&modify_sql).execute(pool).await {
+                        Ok(_) => info!(
+                            "auto modify column success: {}.{} {}",
+                            database, table_name, src_col
+                        ),
                         Err(e) => error!(
-                            "auto modify column failed: {} {} {}",
-                            table_name, src_col, e
+                            "auto modify column failed: {}.{} {} {}",
+                            database, table_name, src_col, e
                         ),
                     }
                 }
@@ -171,8 +226,9 @@ impl MySqlSink {
         }
         let sink_batch_size = config.sink_batch_size.unwrap_or(256);
         MySqlSink {
-            pool: Mutex::new(pool),
-            connection_url,
+            primary_database,
+            target_pools,
+            connection_urls,
             table_info_list,
             buffer: Mutex::new(Vec::with_capacity(sink_batch_size)),
             initialized: RwLock::new(false),
@@ -225,61 +281,103 @@ impl MySqlSink {
         Ok(pool)
     }
 
-    async fn get_pk_name_from_cache(&self, table_name: &str) -> String {
-        self.table_info_cache
-            .lock()
-            .await
-            .get(table_name)
-            .pk_column
-            .to_string()
+    fn table_info_target_database(table_info: &TableInfoVo, fallback: &str) -> String {
+        if table_info.target_database.trim().is_empty() {
+            fallback.to_string()
+        } else {
+            table_info.target_database.clone()
+        }
     }
 
-    async fn execute_with_retry(
-        &self,
-        query: Query<'_, MySql, MySqlArguments>,
-        sql: String,
-    ) -> Result<MySqlQueryResult, String> {
-        let result: Result<(Option<MySqlQueryResult>, Option<Pool<MySql>>), String> =
-            match query.execute(&*self.pool.lock().await).await {
-                Ok(ok) => Ok((Some(ok), None)),
-                Err(err) => {
-                    error!("Failed to execute query: {} 进行重试, sql: {}", err, sql);
-                    match get_mysql_pool_by_url(
-                        &self.connection_url,
-                        "sql执行遇到报错，尝试重新获取连接",
-                    )
-                    .await
+    fn record_target_database(&self, record: &DataBuffer) -> String {
+        if record.target_database.trim().is_empty() {
+            self.primary_database.clone()
+        } else {
+            record.target_database.clone()
+        }
+    }
+
+    fn target_table_key(database: &str, table_name: &str) -> String {
+        database_table_key(database, table_name)
+    }
+
+    fn quote_mysql_identifier(identifier: &str) -> String {
+        format!("`{}`", identifier.replace('`', "``"))
+    }
+
+    fn qualified_table_name(database: &str, table_name: &str) -> String {
+        format!(
+            "{}.{}",
+            Self::quote_mysql_identifier(database),
+            Self::quote_mysql_identifier(table_name)
+        )
+    }
+
+    fn validate_merged_target_schema(table_info_list: &[TableInfoVo]) -> Result<(), String> {
+        let mut signatures: HashMap<String, (String, Vec<(String, String)>)> = HashMap::new();
+        for table_info in table_info_list {
+            let database = if table_info.target_database.trim().is_empty() {
+                "".to_string()
+            } else {
+                table_info.target_database.clone()
+            };
+            let target_key =
+                Self::target_table_key(database.as_str(), table_info.table_name.as_str())
+                    .to_ascii_lowercase();
+            let signature = Self::table_schema_signature(table_info);
+            match signatures.get(&target_key) {
+                None => {
+                    signatures.insert(
+                        target_key,
+                        (table_info.pk_column.to_ascii_lowercase(), signature),
+                    );
+                }
+                Some((pk, existing_signature)) => {
+                    if !pk.eq_ignore_ascii_case(table_info.pk_column.as_str())
+                        || existing_signature != &signature
                     {
-                        Ok(new_pool) => Ok((None, Some(new_pool))),
-                        Err(e) => {
-                            info!("重连失败");
-                            Err(e.to_string())
-                        }
+                        return Err(format!(
+                            "multi_mode target table schema mismatch: {}.{}",
+                            database, table_info.table_name
+                        ));
                     }
                 }
-            };
-        if result.is_ok() {
-            let (query_result, new_pool) = result?;
-            if let Some(query_result) = query_result {
-                return Ok(query_result);
-            }
-            if let Some(new_pool) = new_pool {
-                info!("重连成功，正在进行赋值");
-                *self.pool.lock().await = new_pool;
-                info!("赋值成功");
             }
         }
-        Err("sql执行失败".to_string())
+        Ok(())
     }
 
-    async fn get_stored_cols(&self, table_name: &String) -> Vec<String> {
+    fn table_schema_signature(table_info: &TableInfoVo) -> Vec<(String, String)> {
+        let defs =
+            extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
+        table_info
+            .columns
+            .iter()
+            .map(|column| {
+                let key = column.to_ascii_lowercase();
+                let type_token = defs
+                    .get(&key)
+                    .and_then(|def| mysql_type_token_from_column_definition(def.as_str()))
+                    .unwrap_or_else(|| "__missing_definition__".to_string())
+                    .to_ascii_lowercase();
+                (key, type_token)
+            })
+            .collect()
+    }
+
+    async fn get_stored_cols(
+        pool: &Pool<MySql>,
+        database: &str,
+        table_name: &String,
+    ) -> Vec<String> {
         // 去掉那些STORED的字段
         let stored_cols_sql = r#"
-                    select COLUMN_NAME from information_schema.columns where EXTRA = 'STORED GENERATED' AND TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?;
+                    select COLUMN_NAME from information_schema.columns where EXTRA = 'STORED GENERATED' AND TABLE_SCHEMA = ? AND TABLE_NAME = ?;
                 "#;
         let stored_cols: Vec<String> = sqlx::query(stored_cols_sql)
+            .bind(database)
             .bind(table_name)
-            .fetch_all(&*self.pool.lock().await)
+            .fetch_all(pool)
             .await
             .unwrap()
             .iter()
@@ -288,14 +386,19 @@ impl MySqlSink {
             .collect();
         stored_cols
     }
-    async fn get_exists_cols(&self, table_name: &String) -> Vec<String> {
+    async fn get_exists_cols(
+        pool: &Pool<MySql>,
+        database: &str,
+        table_name: &String,
+    ) -> Vec<String> {
         // 去掉那些STORED的字段
         let stored_cols_sql = r#"
-                    select COLUMN_NAME from information_schema.columns where TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?;
+                    select COLUMN_NAME from information_schema.columns where TABLE_SCHEMA = ? AND TABLE_NAME = ?;
                 "#;
         let cols: Vec<String> = sqlx::query(stored_cols_sql)
+            .bind(database)
             .bind(table_name)
-            .fetch_all(&*self.pool.lock().await)
+            .fetch_all(pool)
             .await
             .unwrap()
             .iter()
@@ -335,15 +438,256 @@ impl MySqlSink {
             .map(|c| c.to_string())
             .collect()
     }
+
+    async fn execute_upsert_batch(
+        pool: &Pool<MySql>,
+        connection_url: &str,
+        database: &str,
+        table_name: &str,
+        columns: &[String],
+        inserts: &[common::case_insensitive_hash_map::CaseInsensitiveHashMap],
+    ) -> Result<MySqlQueryResult, String> {
+        let cols_str = columns
+            .iter()
+            .map(|c| Self::quote_mysql_identifier(c))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let placeholders_row = format!("({})", vec!["?"; columns.len()].join(","));
+
+        let values_sql = (0..inserts.len())
+            .map(|_| placeholders_row.clone())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let updates_sql = columns
+            .iter()
+            .map(|c| {
+                let col = Self::quote_mysql_identifier(c);
+                format!("{} = VALUES({})", col, col)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES {} ON DUPLICATE KEY UPDATE {}",
+            Self::qualified_table_name(database, table_name),
+            cols_str,
+            values_sql,
+            updates_sql
+        );
+
+        let query = Self::bind_upsert_query(sql.as_str(), columns, inserts);
+        match query.execute(pool).await {
+            Ok(ok) => Ok(ok),
+            Err(err) => {
+                error!("Failed to execute query: {} 进行重试, sql: {}", err, sql);
+                let new_pool =
+                    get_mysql_pool_by_url(connection_url, "sql执行遇到报错，尝试重新获取连接")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                let retry_query = Self::bind_upsert_query(sql.as_str(), columns, inserts);
+                retry_query
+                    .execute(&new_pool)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    fn bind_upsert_query<'a>(
+        sql: &'a str,
+        columns: &'a [String],
+        inserts: &'a [common::case_insensitive_hash_map::CaseInsensitiveHashMap],
+    ) -> Query<'a, MySql, MySqlArguments> {
+        let mut query = sqlx::query(sql);
+        for row in inserts {
+            for col in columns {
+                let x = row.get(col);
+                debug!("inserting {:?} into {}", x, col);
+                if !x.is_none() {
+                    if x.is_json()
+                        && let Value::Json(json) = x
+                        && (json.is_empty() || json.eq_ignore_ascii_case("null"))
+                    {
+                        query = query.bind("null");
+                    } else if let Value::Blob(bytes) = x {
+                        query = query.bind(bytes.to_vec());
+                    } else {
+                        query = query.bind(x.resolve_string());
+                    }
+                } else {
+                    query = query.bind(None::<String>);
+                }
+            }
+        }
+        query
+    }
+
+    async fn execute_delete_batch(
+        pool: &Pool<MySql>,
+        connection_url: &str,
+        database: &str,
+        table_name: &str,
+        pk_name: &str,
+        deletes: &[String],
+    ) -> Result<MySqlQueryResult, String> {
+        let ph = (0..deletes.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let sql = format!(
+            "DELETE FROM {} WHERE {} IN ({})",
+            Self::qualified_table_name(database, table_name),
+            Self::quote_mysql_identifier(pk_name),
+            ph
+        );
+
+        let query = Self::bind_delete_query(sql.as_str(), deletes);
+        match query.execute(pool).await {
+            Ok(ok) => Ok(ok),
+            Err(err) => {
+                error!("Failed to execute query: {} 进行重试, sql: {}", err, sql);
+                let new_pool =
+                    get_mysql_pool_by_url(connection_url, "sql执行遇到报错，尝试重新获取连接")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                let retry_query = Self::bind_delete_query(sql.as_str(), deletes);
+                retry_query
+                    .execute(&new_pool)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    fn bind_delete_query<'a>(
+        sql: &'a str,
+        deletes: &'a [String],
+    ) -> Query<'a, MySql, MySqlArguments> {
+        let mut query = sqlx::query(sql);
+        for pk in deletes {
+            query = query.bind(pk);
+        }
+        query
+    }
+
+    async fn flush_database_batch(
+        database: String,
+        pool: Pool<MySql>,
+        connection_url: String,
+        batch: Vec<DataBuffer>,
+        columns_by_table: HashMap<String, Vec<String>>,
+        pk_by_table: HashMap<String, String>,
+    ) -> Result<(), String> {
+        let mut insert_map: HashMap<
+            String,
+            Vec<common::case_insensitive_hash_map::CaseInsensitiveHashMap>,
+        > = HashMap::new();
+        let mut delete_map: HashMap<String, Vec<String>> = HashMap::new();
+
+        for r in batch {
+            let table_name = r.table_name.clone();
+            let table_key = Self::target_table_key(database.as_str(), table_name.as_str());
+            let pk_name = pk_by_table
+                .get(table_key.to_ascii_lowercase().as_str())
+                .cloned()
+                .unwrap_or_else(|| panic!("pk not found: {}", table_key));
+            match r.op {
+                Operation::CREATE(_) | Operation::UPDATE => {
+                    insert_map
+                        .entry(table_name.clone())
+                        .or_default()
+                        .push(r.after);
+                }
+                Operation::DELETE => {
+                    let pk = r.get_pk(pk_name.as_str());
+                    if !pk.is_none() {
+                        delete_map
+                            .entry(table_name.clone())
+                            .or_default()
+                            .push(pk.resolve_string());
+                    }
+                }
+                _ => {
+                    panic!("unexpected operation {:?}", r.op);
+                }
+            }
+        }
+
+        for (table_name, inserts) in insert_map {
+            if inserts.is_empty() {
+                error!("inserts is empty: {}.{}", database, table_name);
+                continue;
+            }
+            let table_key =
+                Self::target_table_key(database.as_str(), table_name.as_str()).to_ascii_lowercase();
+            let columns = columns_by_table
+                .get(table_key.as_str())
+                .cloned()
+                .unwrap_or_default();
+            if columns.is_empty() {
+                error!("columns is empty: {}.{}", database, table_name);
+                continue;
+            }
+            if let Err(e) = Self::execute_upsert_batch(
+                &pool,
+                connection_url.as_str(),
+                database.as_str(),
+                table_name.as_str(),
+                &columns,
+                &inserts,
+            )
+            .await
+            {
+                error!("MySQL batch UPSERT error: {:?}", e);
+                SINK_FLUSH_ERRORS_TOTAL
+                    .with_label_values(&["mysql", "upsert"])
+                    .inc();
+                return Err("sql执行报错".to_string());
+            }
+        }
+
+        for (table_name, deletes) in delete_map {
+            if deletes.is_empty() {
+                continue;
+            }
+            let table_key =
+                Self::target_table_key(database.as_str(), table_name.as_str()).to_ascii_lowercase();
+            let pk_name = pk_by_table
+                .get(table_key.as_str())
+                .cloned()
+                .unwrap_or_else(|| panic!("pk not found: {}", table_key));
+            if let Err(e) = Self::execute_delete_batch(
+                &pool,
+                connection_url.as_str(),
+                database.as_str(),
+                table_name.as_str(),
+                pk_name.as_str(),
+                &deletes,
+            )
+            .await
+            {
+                error!("MySQL batch delete error: {:?}", e);
+                SINK_FLUSH_ERRORS_TOTAL
+                    .with_label_values(&["mysql", "delete"])
+                    .inc();
+                return Err(e);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl Sink for MySqlSink {
     async fn connect(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         // 测试连接
-        sqlx::query("SELECT 1")
-            .execute(&*self.pool.lock().await)
-            .await?;
+        for pool in self.target_pools.values() {
+            sqlx::query("SELECT 1").execute(pool).await?;
+        }
         info!("Connected to MySQL via SQLx");
         Ok(())
     }
@@ -376,25 +720,44 @@ impl Sink for MySqlSink {
             .start_timer();
 
         if !*self.initialized.read().await {
+            let mut inserted_tables = HashSet::new();
             for table_info in &self.table_info_list {
+                let database =
+                    Self::table_info_target_database(table_info, self.primary_database.as_str());
+                let table_key =
+                    Self::target_table_key(database.as_str(), table_info.table_name.as_str());
+                if !inserted_tables.insert(table_key.to_ascii_lowercase()) {
+                    continue;
+                }
                 self.table_info_cache
                     .lock()
                     .await
-                    .insert(table_info.table_name.clone(), table_info.clone());
+                    .insert(table_key.clone(), table_info.clone());
             }
 
             let mut col_info: CaseInsensitiveHashMapVecString =
                 CaseInsensitiveHashMapVecString::new_with_no_arg();
             for table_info in &self.table_info_list {
+                let database =
+                    Self::table_info_target_database(table_info, self.primary_database.as_str());
+                let table_key =
+                    Self::target_table_key(database.as_str(), table_info.table_name.as_str());
+                if !col_info.get(table_key.as_str()).is_empty() {
+                    continue;
+                }
+                let pool = self
+                    .target_pools
+                    .get(database.to_ascii_lowercase().as_str())
+                    .unwrap_or_else(|| panic!("target database pool not found: {}", database));
                 let table_name = table_info.table_name.clone();
                 let mut cols = table_info.columns.clone();
-                let stored_cols = self.get_stored_cols(&table_name).await;
-                let exists_cols = self.get_exists_cols(&table_name).await;
+                let stored_cols = Self::get_stored_cols(pool, database.as_str(), &table_name).await;
+                let exists_cols = Self::get_exists_cols(pool, database.as_str(), &table_name).await;
                 cols = Self::remove_cols(&mut cols, &stored_cols);
                 cols = Self::contains_cols(&mut cols, &exists_cols);
 
                 for c in cols {
-                    col_info.entry_insert(&table_name, c.clone());
+                    col_info.entry_insert(table_key.as_str(), c.clone());
                 }
             }
             let mut cols = self.columns_cache.lock().await;
@@ -434,16 +797,28 @@ impl Sink for MySqlSink {
         let batch = std::mem::take(&mut *buf);
         drop(buf);
 
-        let mut insert_map: CaseInsensitiveHashMapVecCaseInsensitiveHashMap =
-            CaseInsensitiveHashMapVecCaseInsensitiveHashMap::new_with_no_arg();
-        let mut delete_map: CaseInsensitiveHashMapVecString =
-            CaseInsensitiveHashMapVecString::new_with_no_arg();
+        let cache_for_roll_back = batch.clone();
+        let mut pk_by_table = HashMap::new();
+        for table_info in &self.table_info_list {
+            let database =
+                Self::table_info_target_database(table_info, self.primary_database.as_str());
+            let table_key =
+                Self::target_table_key(database.as_str(), table_info.table_name.as_str())
+                    .to_ascii_lowercase();
+            pk_by_table
+                .entry(table_key)
+                .or_insert_with(|| table_info.pk_column.clone());
+        }
+        let columns_cache = self.columns_cache.lock().await.clone();
+        let mut columns_by_table = HashMap::new();
+        for table_key in columns_cache.keys() {
+            columns_by_table.insert(table_key.to_ascii_lowercase(), columns_cache.get(table_key));
+        }
 
-        let mut cache_for_roll_back: Vec<DataBuffer> = vec![];
+        let mut db_batches: HashMap<String, Vec<DataBuffer>> = HashMap::new();
         for r in batch {
+            let database = self.record_target_database(&r);
             let table_name = r.table_name.clone();
-            let pk_name = self.get_pk_name_from_cache(&table_name).await;
-            cache_for_roll_back.push(r.clone());
             debug!("Flushing Mysql Sink: {:?}", r);
             let op_str = match r.op {
                 Operation::CREATE(_) => "create",
@@ -451,144 +826,59 @@ impl Sink for MySqlSink {
                 Operation::DELETE => "delete",
                 _ => "other",
             };
+            let table_label = Self::target_table_key(database.as_str(), table_name.as_str());
             SINK_EVENTS_TOTAL
-                .with_label_values(&["mysql", &table_name, op_str])
+                .with_label_values(&["mysql", table_label.as_str(), op_str])
                 .inc();
+            db_batches.entry(database).or_default().push(r);
+        }
 
-            match r.op {
-                Operation::CREATE(_) | Operation::UPDATE => {
-                    insert_map.entry_insert(table_name.clone(), r.after);
+        let mut tasks = JoinSet::new();
+        for (database, db_batch) in db_batches {
+            let pool = self
+                .target_pools
+                .get(database.to_ascii_lowercase().as_str())
+                .unwrap_or_else(|| panic!("target database pool not found: {}", database))
+                .clone();
+            let connection_url = self
+                .connection_urls
+                .get(database.to_ascii_lowercase().as_str())
+                .unwrap_or_else(|| panic!("target database url not found: {}", database))
+                .clone();
+            let columns_by_table = columns_by_table.clone();
+            let pk_by_table = pk_by_table.clone();
+            tasks.spawn(async move {
+                Self::flush_database_batch(
+                    database,
+                    pool,
+                    connection_url,
+                    db_batch,
+                    columns_by_table,
+                    pk_by_table,
+                )
+                .await
+            });
+        }
+
+        let mut first_error = None;
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    first_error.get_or_insert(e);
                 }
-                Operation::DELETE => {
-                    let pk = r.get_pk(pk_name.as_str());
-                    if !pk.is_none() {
-                        delete_map.entry_insert(&table_name.clone(), pk.resolve_string());
-                    }
-                }
-                _ => {
-                    panic!("unexpected operation {:?}", r.op);
+                Err(e) => {
+                    first_error.get_or_insert(e.to_string());
                 }
             }
         }
-
-        let column_map = self.columns_cache.lock().await;
-
-        // ======================================
-        //       批量 UPSERT（INSERT ... ON DUP）
-        // ======================================
-        if !insert_map.is_empty() {
-            for table_name in insert_map.keys() {
-                let inserts = insert_map.get(table_name.clone().as_str());
-                if inserts.is_empty() {
-                    error!("inserts is empty: {}", &table_name);
-                    continue;
-                }
-
-                let columns = column_map.get(table_name);
-                if columns.is_empty() {
-                    error!("columns is empty: {}", &table_name);
-                    continue;
-                }
-                // let pk_name = self.get_pk_name_from_cache(&table_name).await;
-                let cols_str = columns
-                    .iter()
-                    .map(|c| format!("`{}`", c))
-                    .collect::<Vec<_>>()
-                    .join(",");
-
-                let placeholders_row = format!("({})", vec!["?"; columns.len()].join(","));
-
-                let values_sql = (0..inserts.len())
-                    .map(|_| placeholders_row.clone())
-                    .collect::<Vec<_>>()
-                    .join(",");
-
-                let updates_sql = columns
-                    .iter()
-                    // .filter(|c| !c.eq_ignore_ascii_case(pk_name.as_str()))
-                    .map(|c| format!("`{}` = VALUES(`{}`)", c, c))
-                    .collect::<Vec<_>>()
-                    .join(",");
-
-                let sql = format!(
-                    "INSERT INTO `{}` ({}) VALUES {} ON DUPLICATE KEY UPDATE {}",
-                    table_name, cols_str, values_sql, updates_sql
-                );
-
-                let mut query = sqlx::query(&sql);
-
-                for row in &inserts {
-                    for col in &columns {
-                        let x = row.get(col);
-                        debug!("inserting {:?} into {}.{}", x, table_name, col);
-                        if !x.is_none() {
-                            if x.is_json()
-                                && let Value::Json(json) = x
-                                && (json.is_empty() || json.eq_ignore_ascii_case("null"))
-                            {
-                                // query = query.bind::<Json<_>>(Json(json));
-                                query = query.bind("null");
-                            } else if let Value::Blob(bytes) = x {
-                                query = query.bind(bytes.to_vec());
-                            } else {
-                                query = query.bind(x.resolve_string());
-                            }
-                        } else {
-                            query = query.bind(None::<String>);
-                        }
-                    }
-                }
-                debug!("MySQL batch UPSERT: {}", sql);
-                if let Err(e) = self.execute_with_retry(query, sql.clone()).await {
-                    error!("MySQL batch UPSERT error: {:?}", e);
-                    SINK_FLUSH_ERRORS_TOTAL
-                        .with_label_values(&["mysql", "upsert"])
-                        .inc();
-                    error!("need to do it again: {}", cache_for_roll_back.len());
-                    let mut buf = self.buffer.lock().await;
-                    for cached_data_buffer in cache_for_roll_back {
-                        buf.push(cached_data_buffer);
-                    }
-                    return Err("sql执行报错".to_string());
-                }
+        if let Some(e) = first_error {
+            error!("need to do it again: {}", cache_for_roll_back.len());
+            let mut buf = self.buffer.lock().await;
+            for cached_data_buffer in cache_for_roll_back {
+                buf.push(cached_data_buffer);
             }
-        }
-
-        // ======================================
-        //             批量 DELETE
-        // ======================================
-        for table_name in delete_map.keys() {
-            let deletes = delete_map.get(table_name);
-            if !deletes.is_empty() {
-                let pk_name = self.get_pk_name_from_cache(table_name).await;
-                let ph = (0..deletes.len())
-                    .map(|_| "?")
-                    .collect::<Vec<_>>()
-                    .join(",");
-
-                let sql = format!(
-                    "DELETE FROM `{}` WHERE `{}` IN ({})",
-                    table_name, pk_name, ph
-                );
-
-                let mut query = sqlx::query(&sql);
-                for pk in deletes {
-                    query = query.bind(pk);
-                }
-
-                if let Err(e) = self.execute_with_retry(query, sql.clone()).await {
-                    error!("MySQL batch delete error: {:?}", e);
-                    SINK_FLUSH_ERRORS_TOTAL
-                        .with_label_values(&["mysql", "delete"])
-                        .inc();
-                    error!("need to do it again: {}", cache_for_roll_back.len());
-                    let mut buf = self.buffer.lock().await;
-                    for cached_data_buffer in cache_for_roll_back {
-                        buf.push(cached_data_buffer);
-                    }
-                    return Err(e);
-                }
-            }
+            return Err(e);
         }
 
         Ok(())
@@ -618,5 +908,56 @@ impl Sink for MySqlSink {
         }
         trace!("alter flush done");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table_info(source_database: &str, target_database: &str, column_type: &str) -> TableInfoVo {
+        TableInfoVo {
+            source_database: source_database.to_string(),
+            target_database: target_database.to_string(),
+            table_name: "orders".to_string(),
+            pk_column: "id".to_string(),
+            create_table_sql: format!(
+                "CREATE TABLE `orders` (\n  `id` bigint NOT NULL,\n  `name` {} DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB",
+                column_type
+            ),
+            columns: vec!["id".to_string(), "name".to_string()],
+        }
+    }
+
+    #[test]
+    fn merged_target_schema_allows_identical_tables() {
+        let tables = vec![
+            table_info("src_a", "dst", "varchar(64)"),
+            table_info("src_b", "dst", "varchar(64)"),
+        ];
+
+        assert!(MySqlSink::validate_merged_target_schema(&tables).is_ok());
+    }
+
+    #[test]
+    fn merged_target_schema_rejects_type_mismatch() {
+        let tables = vec![
+            table_info("src_a", "dst", "varchar(64)"),
+            table_info("src_b", "dst", "varchar(128)"),
+        ];
+
+        let err = MySqlSink::validate_merged_target_schema(&tables).unwrap_err();
+
+        assert!(err.contains("schema mismatch"));
+    }
+
+    #[test]
+    fn merged_target_schema_allows_same_table_in_different_targets() {
+        let tables = vec![
+            table_info("src_a", "dst_a", "varchar(64)"),
+            table_info("src_b", "dst_b", "varchar(128)"),
+        ];
+
+        assert!(MySqlSink::validate_merged_target_schema(&tables).is_ok());
     }
 }
