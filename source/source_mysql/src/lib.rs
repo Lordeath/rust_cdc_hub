@@ -634,7 +634,7 @@ impl MySQLSource {
         plugins: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>,
         mut sink: Arc<Mutex<dyn Sink + Send + Sync>>,
         checkpoint_manager: Arc<dyn CheckpointManager>,
-    ) -> Result<(usize, HashMap<String, MysqlCheckPointDetailEntity>), CustomError> {
+    ) -> Result<(usize, HashMap<String, MysqlCheckPointDetailEntity>, bool), CustomError> {
         let any_new = config.table_info_list.iter().any(|table_info| {
             let table_key = config.source_table_key(table_info.table_name.as_str());
             checkpoints
@@ -647,7 +647,7 @@ impl MySQLSource {
                 "No new tables found for {}, skipping full load",
                 config.database
             );
-            return Ok((source_index, checkpoints));
+            return Ok((source_index, checkpoints, false));
         }
 
         info!(
@@ -755,12 +755,11 @@ impl MySQLSource {
                 }
             }
         }
-        runtime_progress::finish_initialization().await;
         tx.commit().await.map_err(|e| CustomError {
             message: e.to_string(),
             error_type: CustomErrorType::Restart,
         })?;
-        Ok((source_index, checkpoints))
+        Ok((source_index, checkpoints, true))
     }
 
     fn source_index_for_event(
@@ -938,13 +937,19 @@ impl Source for MySQLSource {
                     .await
                 });
             }
+            let mut any_initialized = false;
             while let Some(result) = init_tasks.join_next().await {
-                let (source_index, checkpoints) = result.map_err(|e| CustomError {
-                    message: e.to_string(),
-                    error_type: CustomErrorType::Restart,
-                })??;
+                let (source_index, checkpoints, initialized) =
+                    result.map_err(|e| CustomError {
+                        message: e.to_string(),
+                        error_type: CustomErrorType::Restart,
+                    })??;
+                any_initialized |= initialized;
                 let checkpoints_guard = self.checkpoint_entities.lock().await;
                 *checkpoints_guard[source_index].lock().await = checkpoints;
+            }
+            if any_initialized {
+                runtime_progress::finish_initialization().await;
             }
 
             for (stream_index, group) in self.stream_groups.iter().enumerate() {

@@ -54,6 +54,7 @@ impl RuntimeProgress {
     pub fn begin_table_initialization(&mut self, table_name: &str, now: i64) {
         self.initializing = true;
         self.current_table = table_name.to_string();
+        self.initialization_finished_at = 0;
         if self.initialization_started_at == 0 {
             self.initialization_started_at = now;
         }
@@ -66,9 +67,7 @@ impl RuntimeProgress {
         let table = self.table_mut(table_name);
         table.phase = "done".to_string();
         table.last_event_at = now;
-        if self.current_table.eq_ignore_ascii_case(table_name) {
-            self.current_table.clear();
-        }
+        self.refresh_current_table();
     }
 
     pub fn finish_initialization(&mut self, now: i64) {
@@ -149,6 +148,24 @@ impl RuntimeProgress {
                 last_pk: String::new(),
                 last_event_at: 0,
             })
+    }
+
+    fn refresh_current_table(&mut self) {
+        let current_is_initializing = self
+            .tables
+            .get(self.current_table.as_str())
+            .map(|table| table.phase == "initializing")
+            .unwrap_or(false);
+        if current_is_initializing {
+            return;
+        }
+        self.current_table = self
+            .tables
+            .values()
+            .filter(|table| table.phase == "initializing")
+            .max_by_key(|table| table.last_event_at)
+            .map(|table| table.table_name.clone())
+            .unwrap_or_default();
     }
 }
 
@@ -252,6 +269,26 @@ mod tests {
         assert_eq!(table.synced_total, 1);
         assert_eq!(table.filtered_total, 1);
         assert_eq!(table.last_pk, "1");
+    }
+
+    #[test]
+    fn runtime_progress_keeps_current_table_for_parallel_initialization() {
+        let mut progress = RuntimeProgress::new();
+        progress.begin_table_initialization("db_a.orders", 10);
+        progress.begin_table_initialization("db_b.orders", 11);
+
+        progress.finish_table_initialization("db_b.orders", 12);
+
+        assert_eq!(progress.current_table, "db_a.orders");
+        assert!(progress.initializing);
+        assert_eq!(progress.initialization_finished_at, 0);
+
+        progress.finish_table_initialization("db_a.orders", 13);
+        progress.finish_initialization(14);
+
+        assert!(progress.current_table.is_empty());
+        assert!(!progress.initializing);
+        assert_eq!(progress.initialization_finished_at, 14);
     }
 
     #[test]
