@@ -5,7 +5,7 @@ use common::metrics::APP_RESTART_COUNT;
 use common::runtime_progress;
 use common::{
     CdcConfig, FlushByOperation, Plugin, PluginConfig, PluginType, Sink, Source, TableInfoVo,
-    get_mysql_pool_by_url,
+    get_mysql_pool_by_url, mysql_connection_url_from_config,
 };
 use prometheus::{Encoder, TextEncoder, gather};
 use serde_json::json;
@@ -644,27 +644,12 @@ fn cleanup_summary_json(config: &CdcConfig, table_info_list: &[TableInfoVo]) -> 
 }
 
 fn mysql_connection_url(config: &CdcConfig, source: bool) -> String {
-    let (username, password, host, port, database) = if source {
-        (
-            config.source("username", 0),
-            config.source("password", 0),
-            config.source("host", 0),
-            config.source("port", 0),
-            config.source("database", 0),
-        )
+    let config_item = if source {
+        &config.source_config[0]
     } else {
-        (
-            config.first_sink("username"),
-            config.first_sink("password"),
-            config.first_sink("host"),
-            config.first_sink("port"),
-            config.first_sink("database"),
-        )
+        &config.sink_config[0]
     };
-    format!(
-        "mysql://{}:{}@{}:{}/{}",
-        username, password, host, port, database
-    )
+    mysql_connection_url_from_config(config_item, config_item.get("database").map(String::as_str))
 }
 
 fn quoted_identifier(identifier: &str) -> String {

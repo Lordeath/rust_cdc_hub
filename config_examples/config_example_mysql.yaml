@@ -6,6 +6,8 @@ source_config:
     username: XXXX
     password: XXXXXXXXXXXXXXXXXXXXXX
     database: XXXXXX
+    # 遇到TLS握手失败且源库不需要SSL时可打开：
+    # ssl_mode: disabled
     table_name: "*"
     server_id: 10000
     pk_column: id
@@ -16,6 +18,8 @@ sink_config:
     username: XXXX
     password: XXXXXXXXXXXXXXXXXXXXXX
     database: XXXXXXXXXXXX
+    # 遇到TLS握手失败且目标库不需要SSL时可打开：
+    # ssl_mode: disabled
     pk_column: id
 
 plugins:

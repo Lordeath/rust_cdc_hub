@@ -9,7 +9,8 @@ use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::runtime_progress;
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value,
-    get_mysql_pool_by_url, mysql_row_to_hashmap, redact_connection_url_password,
+    get_mysql_pool_by_url, mysql_connection_url_from_config, mysql_row_to_hashmap,
+    redact_connection_url_password,
 };
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
@@ -115,18 +116,12 @@ impl MysqlSourceConfig {
                 .parse::<u32>()
                 .ok()
                 .filter(|p| *p > 0);
-            let connection_url = format!(
-                "mysql://{}:{}@{}:{}/{}",
-                username,
-                password,
-                host,
-                port,
-                database.clone(),
-            );
+            let connection_url =
+                mysql_connection_url_from_config(&config.source_config[i], Some(&database));
             let mut table_info_list: Vec<TableInfoVo> = vec![];
             let pool = get_mysql_pool_by_url(&connection_url, "mysql source 初始化获取数据结构")
                 .await
-                .unwrap();
+                .unwrap_or_else(|e| panic!("MySQL source 初始化获取数据结构连接失败: {}", e));
 
             let mut current_source_tables = configured_table_names.clone();
 
@@ -851,7 +846,14 @@ impl Source for MySQLSource {
                         .with_keepalive(Duration::from_secs(60), Duration::from_secs(10))
                         .connect()
                         .await
-                        .expect("Failed to connect to MySQL server");
+                        .unwrap_or_else(|e| {
+                            error!(
+                                "MySQL source binlog连接失败 url: {} error: {}",
+                                redact_connection_url_password(&config.connection_url),
+                                e
+                            );
+                            panic!("MySQL source binlog连接失败: {}", e);
+                        });
                 self.streams[i] = Some(client);
             }
             info!("MySQL数据源初始化完成, cost: {:?}", start_all.elapsed());

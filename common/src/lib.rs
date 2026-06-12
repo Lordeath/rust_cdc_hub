@@ -703,10 +703,10 @@ pub async fn get_mysql_pool_by_url(
     connection_url: &str,
     from: &str,
 ) -> Result<Pool<MySql>, String> {
+    let redacted_connection_url = redact_connection_url_password(connection_url);
     info!(
         "Connecting to MySQL: {} from: {}",
-        redact_connection_url_password(connection_url),
-        from
+        redacted_connection_url, from
     );
     match MySqlPoolOptions::new()
         .max_connections(10)
@@ -724,10 +724,121 @@ pub async fn get_mysql_pool_by_url(
             Ok(x)
         }
         Err(e) => {
-            error!("Failed to connect to MySQL: {}", e);
-            Err(e.to_string())
+            let error_detail = error_chain_message(&e);
+            error!(
+                "Failed to connect to MySQL from: {} url: {} error: {}",
+                from, redacted_connection_url, error_detail
+            );
+            if is_likely_mysql_tls_error(&error_detail) {
+                error!(
+                    "MySQL TLS握手失败 from: {}。如果该连接不需要SSL，可在对应的source_config/sink_config中添加 ssl_mode: disabled；如果必须使用SSL，请检查MySQL TLS版本、证书和ssl_ca配置。",
+                    from
+                );
+            }
+            Err(format!(
+                "MySQL连接失败 from: {} url: {} error: {}",
+                from, redacted_connection_url, error_detail
+            ))
         }
     }
+}
+
+const MYSQL_URL_OPTION_KEYS: &[(&str, &str)] = &[
+    ("ssl_mode", "ssl-mode"),
+    ("ssl-mode", "ssl-mode"),
+    ("sslmode", "ssl-mode"),
+    ("ssl_ca", "ssl-ca"),
+    ("ssl-ca", "ssl-ca"),
+    ("sslca", "ssl-ca"),
+    ("ssl_cert", "ssl-cert"),
+    ("ssl-cert", "ssl-cert"),
+    ("sslcert", "ssl-cert"),
+    ("ssl_key", "ssl-key"),
+    ("ssl-key", "ssl-key"),
+    ("sslkey", "ssl-key"),
+    ("charset", "charset"),
+    ("collation", "collation"),
+    ("statement_cache_capacity", "statement-cache-capacity"),
+    ("statement-cache-capacity", "statement-cache-capacity"),
+];
+
+pub fn mysql_connection_url_from_config(
+    config: &HashMap<String, String>,
+    database: Option<&str>,
+) -> String {
+    let username = config.get("username").map(String::as_str).unwrap_or("");
+    let password = config.get("password").map(String::as_str).unwrap_or("");
+    let host = config.get("host").map(String::as_str).unwrap_or("");
+    let port = config.get("port").map(String::as_str).unwrap_or("");
+    let mut connection_url = format!("mysql://{}:{}@{}:{}", username, password, host, port);
+    if let Some(database) = database.filter(|database| !database.is_empty()) {
+        connection_url.push('/');
+        connection_url.push_str(database);
+    }
+
+    let mysql_options = mysql_url_options_from_config(config);
+    if !mysql_options.is_empty() {
+        connection_url.push('?');
+        connection_url.push_str(
+            &mysql_options
+                .into_iter()
+                .map(|(key, value)| format!("{}={}", key, percent_encode_query_component(value)))
+                .collect::<Vec<_>>()
+                .join("&"),
+        );
+    }
+    connection_url
+}
+
+fn mysql_url_options_from_config(config: &HashMap<String, String>) -> Vec<(&'static str, &str)> {
+    let mut result = Vec::new();
+    let mut seen_url_keys: Vec<&'static str> = Vec::new();
+    for (config_key, url_key) in MYSQL_URL_OPTION_KEYS {
+        let Some(value) = config.get(*config_key).map(String::as_str) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() || seen_url_keys.contains(url_key) {
+            continue;
+        }
+        seen_url_keys.push(*url_key);
+        result.push((*url_key, value));
+    }
+    result
+}
+
+fn percent_encode_query_component(value: &str) -> String {
+    let mut result = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            result.push(byte as char);
+        } else {
+            result.push_str(&format!("%{:02X}", byte));
+        }
+    }
+    result
+}
+
+fn error_chain_message(error: &(dyn Error + 'static)) -> String {
+    let mut messages = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(error) = source {
+        let message = error.to_string();
+        if !messages.iter().any(|item| item == &message) {
+            messages.push(message);
+        }
+        source = error.source();
+    }
+    messages.join(": ")
+}
+
+fn is_likely_mysql_tls_error(error_detail: &str) -> bool {
+    let lower_error = error_detail.to_ascii_lowercase();
+    lower_error.contains("handshakefailure")
+        || lower_error.contains("handshake failure")
+        || lower_error.contains("tls")
+        || lower_error.contains("ssl")
+        || lower_error.contains("certificate")
 }
 
 pub fn redact_connection_url_password(connection_url: &str) -> String {
@@ -840,6 +951,51 @@ mod tests {
         assert_eq!(
             redact_connection_url_password("mysql://127.0.0.1:3306/demo"),
             "mysql://127.0.0.1:3306/demo"
+        );
+    }
+
+    #[test]
+    fn test_mysql_connection_url_from_config_appends_ssl_mode() {
+        let mut config = HashMap::new();
+        config.insert("host".to_string(), "127.0.0.1".to_string());
+        config.insert("port".to_string(), "3306".to_string());
+        config.insert("username".to_string(), "user".to_string());
+        config.insert("password".to_string(), "secret".to_string());
+        config.insert("ssl_mode".to_string(), "disabled".to_string());
+
+        assert_eq!(
+            mysql_connection_url_from_config(&config, Some("demo")),
+            "mysql://user:secret@127.0.0.1:3306/demo?ssl-mode=disabled"
+        );
+    }
+
+    #[test]
+    fn test_mysql_connection_url_from_config_without_database() {
+        let mut config = HashMap::new();
+        config.insert("host".to_string(), "127.0.0.1".to_string());
+        config.insert("port".to_string(), "3306".to_string());
+        config.insert("username".to_string(), "user".to_string());
+        config.insert("password".to_string(), "secret".to_string());
+        config.insert("ssl-mode".to_string(), "required".to_string());
+
+        assert_eq!(
+            mysql_connection_url_from_config(&config, None),
+            "mysql://user:secret@127.0.0.1:3306?ssl-mode=required"
+        );
+    }
+
+    #[test]
+    fn test_mysql_connection_url_from_config_encodes_option_values() {
+        let mut config = HashMap::new();
+        config.insert("host".to_string(), "127.0.0.1".to_string());
+        config.insert("port".to_string(), "3306".to_string());
+        config.insert("username".to_string(), "user".to_string());
+        config.insert("password".to_string(), "secret".to_string());
+        config.insert("ssl_ca".to_string(), "/tmp/mysql ca.pem".to_string());
+
+        assert_eq!(
+            mysql_connection_url_from_config(&config, Some("demo")),
+            "mysql://user:secret@127.0.0.1:3306/demo?ssl-ca=%2Ftmp%2Fmysql%20ca.pem"
         );
     }
 }

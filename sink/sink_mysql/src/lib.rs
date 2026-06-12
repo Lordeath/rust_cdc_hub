@@ -11,7 +11,7 @@ use common::schema::{
 };
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value,
-    get_mysql_pool_by_url, mysql_row_to_hashmap,
+    get_mysql_pool_by_url, mysql_connection_url_from_config, mysql_row_to_hashmap,
 };
 use sqlx::mysql::{MySqlArguments, MySqlQueryResult};
 use sqlx::query::Query;
@@ -40,33 +40,14 @@ pub struct MySqlSink {
 
 impl MySqlSink {
     pub async fn new(config: &CdcConfig, table_info_list: Vec<TableInfoVo>) -> Self {
-        let username = config.first_sink("username");
-        let password = config.first_sink("password");
-        let host = config.first_sink("host");
-        let port = config.first_sink("port");
         let database = config.first_sink("database");
-        let connection_url = format!(
-            "mysql://{}:{}@{}:{}/{}",
-            username,
-            password,
-            host,
-            port,
-            database.clone(),
-        );
-        let pool = match Self::get_pool_auto_create_database(
-            config,
-            &username,
-            &password,
-            &host,
-            &port,
-            database,
-            &connection_url,
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(value) => return value,
-        };
+        let connection_url =
+            mysql_connection_url_from_config(&config.sink_config[0], Some(&database));
+        let pool =
+            match Self::get_pool_auto_create_database(config, database, &connection_url).await {
+                Ok(value) => value,
+                Err(value) => return value,
+            };
 
         // judge is need to create table
         if config.auto_create_table.unwrap_or(true) {
@@ -205,10 +186,6 @@ impl MySqlSink {
 
     async fn get_pool_auto_create_database(
         config: &CdcConfig,
-        username: &String,
-        password: &String,
-        host: &String,
-        port: &String,
         database: String,
         connection_url: &str,
     ) -> Result<Pool<MySql>, MySqlSink> {
@@ -219,11 +196,11 @@ impl MySqlSink {
                 Err(e) => {
                     if config.auto_create_database.unwrap_or(true) {
                         let pool_for_auto_create_database = get_mysql_pool_by_url(
-                            &format!("mysql://{}:{}@{}:{}", username, password, host, port,),
+                            &mysql_connection_url_from_config(&config.sink_config[0], None),
                             "mysql sink 自动创建数据库-创建",
                         )
                         .await
-                        .unwrap();
+                        .unwrap_or_else(|e| panic!("MySQL sink 自动创建数据库连接失败: {}", e));
                         let sql = format!("CREATE DATABASE IF NOT EXISTS `{}`", database.clone());
                         match sqlx::query(&sql)
                             .execute(&pool_for_auto_create_database)
@@ -238,7 +215,7 @@ impl MySqlSink {
                         let pool: Pool<MySql> =
                             get_mysql_pool_by_url(connection_url, "mysql sink 自动创建数据库-获取")
                                 .await
-                                .unwrap();
+                                .unwrap_or_else(|e| panic!("MySQL sink 获取数据库连接失败: {}", e));
                         return Ok(pool);
                     }
                     error!("Failed to connect to MySQL: {}", e);
