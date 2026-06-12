@@ -22,7 +22,7 @@ use chrono::Local;
 use chrono::Utc;
 use plugin::PluginFactory;
 use std::time::Duration;
-use std::{env, fs, process};
+use std::{env, fs, io, process};
 use tokio::time::sleep;
 use tracing::subscriber::set_global_default;
 use tracing::{debug, error, info, trace, warn};
@@ -1855,7 +1855,12 @@ async fn start_ui(ui_state: UiState, bind: String, port: u16) -> Result<(), Box<
 async fn main() {
     ensure_default_backtrace();
     let config_path = get_env("CONFIG_PATH");
-    let config: CdcConfig = load_config(&config_path).expect("Failed to load config");
+    let config: CdcConfig = load_config(&config_path).unwrap_or_else(|e| {
+        panic!(
+            "Failed to load config from CONFIG_PATH={}: {}",
+            config_path, e
+        )
+    });
     let log_level = config.log_level.clone().unwrap_or("info".to_string());
 
     // 设置 tracing 日志格式，自动输出文件名、行号和函数名
@@ -2035,16 +2040,44 @@ fn get_env(key: &str) -> String {
 }
 
 pub fn load_config(path: &str) -> Result<CdcConfig, Box<dyn Error>> {
-    let content = fs::read_to_string(path)?;
+    let cwd = env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|e| format!("读取当前目录失败: {}", e));
+    let content = fs::read_to_string(path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "读取配置文件失败: CONFIG_PATH={}, cwd={}, error={}",
+                path, cwd, e
+            ),
+        )
+    })?;
 
     if path.ends_with(".yaml") || path.ends_with(".yml") {
-        let cfg: CdcConfig = serde_yaml::from_str(&content)?;
+        let cfg: CdcConfig = serde_yaml::from_str(&content).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("解析 YAML 配置失败: CONFIG_PATH={}, error={}", path, e),
+            )
+        })?;
         Ok(cfg)
     } else if path.ends_with(".json") {
-        let cfg: CdcConfig = serde_json::from_str(&content)?;
+        let cfg: CdcConfig = serde_json::from_str(&content).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("解析 JSON 配置失败: CONFIG_PATH={}, error={}", path, e),
+            )
+        })?;
         Ok(cfg)
     } else {
-        Err("Unsupported config file format".into())
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "不支持的配置文件格式: CONFIG_PATH={}, 只支持 .yaml/.yml/.json",
+                path
+            ),
+        )
+        .into())
     }
 }
 
@@ -2570,5 +2603,19 @@ plugins:
         assert!(s.contains("splitSystemCpu"));
         assert!(s.contains("splitProcessMemory"));
         assert!(s.contains("function renderSplitResources"));
+    }
+
+    #[test]
+    fn test_load_config_missing_file_mentions_path() {
+        let path = format!(
+            "/tmp/rust_cdc_hub_missing_config_{}.yaml",
+            std::process::id()
+        );
+
+        let err = load_config(path.as_str()).unwrap_err().to_string();
+
+        assert!(err.contains(path.as_str()));
+        assert!(err.contains("CONFIG_PATH="));
+        assert!(err.contains("cwd="));
     }
 }
