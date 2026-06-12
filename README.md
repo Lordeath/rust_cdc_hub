@@ -148,7 +148,7 @@ export CONFIG_PATH=/path/to/config.yaml
 | `except_table_name_prefix` | 排除指定前缀的表，多个前缀用逗号分隔。 |
 | `server_id` | Binlog replication server id，必须与 MySQL 集群中其他 server id 不重复。 |
 | `pk_column` | 主键列名。 |
-| `ssl_mode` | MySQL SSL模式，透传为SQLx连接参数 `ssl-mode`。可选：`disabled`、`preferred`、`required`、`verify_ca`、`verify_identity`；默认是SQLx的 `preferred`。遇到 `HandshakeFailure` 且不需要SSL时可设为 `disabled`。 |
+| `ssl_mode` | MySQL SSL模式，透传为SQLx连接参数 `ssl-mode`。可选：`disabled`、`preferred`、`required`、`verify_ca`、`verify_identity`；默认 `disabled`。如果源库/目标库必须使用SSL，请显式设置为 `required` 或证书校验模式。 |
 
 ### MySQL → MySQL 示例
 
@@ -161,7 +161,6 @@ source_config:
     username: cdc_user
     password: cdc_password
     database: source_db
-    ssl_mode: disabled
     table_name: "*"
     except_table_name_prefix: "tmp_,dws_"
     server_id: 10000
@@ -173,7 +172,6 @@ sink_config:
     username: sink_user
     password: sink_password
     database: target_db
-    ssl_mode: disabled
     pk_column: id
 
 auto_create_database: true

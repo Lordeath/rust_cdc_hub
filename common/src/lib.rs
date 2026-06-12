@@ -761,6 +761,7 @@ const MYSQL_URL_OPTION_KEYS: &[(&str, &str)] = &[
     ("statement_cache_capacity", "statement-cache-capacity"),
     ("statement-cache-capacity", "statement-cache-capacity"),
 ];
+const DEFAULT_MYSQL_SSL_MODE: &str = "disabled";
 
 pub fn mysql_connection_url_from_config(
     config: &HashMap<String, String>,
@@ -803,6 +804,9 @@ fn mysql_url_options_from_config(config: &HashMap<String, String>) -> Vec<(&'sta
         }
         seen_url_keys.push(*url_key);
         result.push((*url_key, value));
+    }
+    if !seen_url_keys.contains(&"ssl-mode") {
+        result.insert(0, ("ssl-mode", DEFAULT_MYSQL_SSL_MODE));
     }
     result
 }
@@ -970,6 +974,20 @@ mod tests {
     }
 
     #[test]
+    fn test_mysql_connection_url_from_config_defaults_ssl_mode_disabled() {
+        let mut config = HashMap::new();
+        config.insert("host".to_string(), "127.0.0.1".to_string());
+        config.insert("port".to_string(), "3306".to_string());
+        config.insert("username".to_string(), "user".to_string());
+        config.insert("password".to_string(), "secret".to_string());
+
+        assert_eq!(
+            mysql_connection_url_from_config(&config, Some("demo")),
+            "mysql://user:secret@127.0.0.1:3306/demo?ssl-mode=disabled"
+        );
+    }
+
+    #[test]
     fn test_mysql_connection_url_from_config_without_database() {
         let mut config = HashMap::new();
         config.insert("host".to_string(), "127.0.0.1".to_string());
@@ -995,7 +1013,7 @@ mod tests {
 
         assert_eq!(
             mysql_connection_url_from_config(&config, Some("demo")),
-            "mysql://user:secret@127.0.0.1:3306/demo?ssl-ca=%2Ftmp%2Fmysql%20ca.pem"
+            "mysql://user:secret@127.0.0.1:3306/demo?ssl-mode=disabled&ssl-ca=%2Ftmp%2Fmysql%20ca.pem"
         );
     }
 }
