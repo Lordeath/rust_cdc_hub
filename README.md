@@ -144,7 +144,7 @@ export CONFIG_PATH=/path/to/config.yaml
 | `host` / `port` | MySQL 地址和端口。 |
 | `username` / `password` | MySQL 账号密码。 |
 | `database` | 源库名。 |
-| `table_name` | 表名；可填单表、逗号分隔多表或 `"*"` 表示全部表。 |
+| `table_name` | 表名；可填单表、逗号分隔多表或 `"*"` 表示按规则自动发现表。`"*"` 会筛选单一 `bigint` 主键且没有外键依赖的表。 |
 | `except_table_name_prefix` | 排除指定前缀的表，多个前缀用逗号分隔。 |
 | `server_id` | Binlog replication server id，必须与 MySQL 集群中其他 server id 不重复。 |
 | `pk_column` | 主键列名。 |

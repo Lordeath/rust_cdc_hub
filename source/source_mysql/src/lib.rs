@@ -136,7 +136,7 @@ impl MysqlSourceConfig {
                     FROM information_schema.COLUMNS c
                     WHERE c.TABLE_SCHEMA = (SELECT DATABASE())
                       AND c.COLUMN_KEY = 'PRI'
-                      AND c.COLUMN_TYPE = 'bigint'
+                      AND c.DATA_TYPE = 'bigint'
                       AND c.TABLE_NAME NOT IN (
                             SELECT TABLE_NAME
                             FROM information_schema.KEY_COLUMN_USAGE
@@ -154,7 +154,7 @@ impl MysqlSourceConfig {
                                 FROM information_schema.COLUMNS cc
                                 WHERE cc.TABLE_SCHEMA = (SELECT DATABASE())
                                     AND cc.COLUMN_KEY = 'PRI'
-                                    AND cc.COLUMN_TYPE = 'bigint'
+                                    AND cc.DATA_TYPE = 'bigint'
                                 GROUP BY cc.TABLE_NAME
                                 HAVING COUNT(*) > 1
                         )
@@ -219,7 +219,7 @@ impl MysqlSourceConfig {
                 let pk_column: Vec<String> = col_list
                     .iter()
                     .filter(|c| c.column_key == "PRI")
-                    .filter(|c| c.data_type == "bigint")
+                    .filter(|c| c.data_type.eq_ignore_ascii_case("bigint"))
                     .map(|c| c.column_name.clone())
                     .collect();
                 if pk_column.is_empty() || pk_column.len() > 1 {
