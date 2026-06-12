@@ -9,8 +9,8 @@ use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::runtime_progress;
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value,
-    get_mysql_pool_by_url, mysql_connection_url_from_config, mysql_row_to_hashmap,
-    redact_connection_url_password,
+    get_mysql_pool_by_url_with_max_connections, mysql_connection_url_from_config,
+    mysql_row_to_hashmap, redact_connection_url_password,
 };
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
@@ -43,10 +43,10 @@ pub struct MySQLSource {
     checkpoint_manager: Arc<dyn CheckpointManager>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct MysqlSourceConfig {
-    table_name_list: Vec<String>,
     mysql_source: Vec<MysqlSourceConfigDetail>,
+    pools: Vec<Pool<MySql>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +68,7 @@ impl MysqlSourceConfig {
     pub async fn new(config: &CdcConfig) -> Self {
         let size = config.source_config.len();
         let mut mysql_source: Vec<MysqlSourceConfigDetail> = vec![];
+        let mut pools: Vec<Pool<MySql>> = vec![];
 
         // split table_name
         let configured_table_names: Vec<String> = config
@@ -119,9 +120,13 @@ impl MysqlSourceConfig {
             let connection_url =
                 mysql_connection_url_from_config(&config.source_config[i], Some(&database));
             let mut table_info_list: Vec<TableInfoVo> = vec![];
-            let pool = get_mysql_pool_by_url(&connection_url, "mysql source 初始化获取数据结构")
-                .await
-                .unwrap_or_else(|e| panic!("MySQL source 初始化获取数据结构连接失败: {}", e));
+            let pool = get_mysql_pool_by_url_with_max_connections(
+                &connection_url,
+                "mysql source 初始化获取数据结构",
+                1,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("MySQL source 初始化获取数据结构连接失败: {}", e));
 
             let mut current_source_tables = configured_table_names.clone();
 
@@ -198,7 +203,10 @@ impl MysqlSourceConfig {
 
             for table_name in current_source_tables.clone() {
                 // fill table_info
-                let show_create_table_sql = format!("show create table `{}`", table_name);
+                let show_create_table_sql = format!(
+                    "show create table {}",
+                    qualified_mysql_table_name(&database, &table_name)
+                );
                 info!("{}", show_create_table_sql);
                 let show_create_table_result = sqlx::query(&show_create_table_sql)
                     .fetch_one(&pool)
@@ -253,6 +261,7 @@ impl MysqlSourceConfig {
                 start_binlog_filename,
                 start_binlog_position,
             });
+            pools.push(pool);
 
             all_tables_collected.extend(current_source_tables);
         }
@@ -263,8 +272,8 @@ impl MysqlSourceConfig {
         }
 
         MysqlSourceConfig {
-            table_name_list: all_tables_collected,
             mysql_source,
+            pools,
         }
     }
 
@@ -344,7 +353,11 @@ impl MysqlSourceConfigDetail {
                 order by {}
                 limit {}
             "#,
-            table_name, pk_column, id, pk_column, self.batchsize
+            qualified_mysql_table_name(&self.database, table_name),
+            quote_mysql_identifier(pk_column),
+            id,
+            quote_mysql_identifier(pk_column),
+            self.batchsize
         );
         debug!(
             "extract_init_data: [{}.{}] {} {}",
@@ -433,9 +446,7 @@ impl MySQLSource {
             // Stream creation deferred to start()
             streams.push(None);
             mysql_source.push(cfg.mysql_source[i].clone());
-            let pool: Pool<MySql> = get_mysql_pool_by_url(&connection_url, "mysql source 初始化")
-                .await
-                .unwrap();
+            let pool: Pool<MySql> = cfg.pools[i].clone();
             pools.push(pool);
             binlog_filename_list
                 .lock()
@@ -546,6 +557,18 @@ fn should_reconnect_read_error(message: &str) -> bool {
         || msg.contains("connection closed")
         || msg.contains("connection aborted")
         || msg.contains("eof")
+}
+
+fn quote_mysql_identifier(identifier: &str) -> String {
+    format!("`{}`", identifier.replace('`', "``"))
+}
+
+fn qualified_mysql_table_name(database: &str, table_name: &str) -> String {
+    format!(
+        "{}.{}",
+        quote_mysql_identifier(database),
+        quote_mysql_identifier(table_name)
+    )
 }
 
 fn pk_value_for_progress(data_buffer: &DataBuffer, pk_column: &str) -> Option<String> {
@@ -1472,5 +1495,19 @@ mod tests {
         ));
         assert!(should_reconnect_read_error("connection reset by peer"));
         assert!(should_reconnect_read_error("Broken pipe"));
+    }
+
+    #[test]
+    fn mysql_identifier_is_quoted() {
+        assert_eq!(quote_mysql_identifier("newsee-system"), "`newsee-system`");
+        assert_eq!(quote_mysql_identifier("a`b"), "`a``b`");
+    }
+
+    #[test]
+    fn mysql_table_name_is_qualified() {
+        assert_eq!(
+            qualified_mysql_table_name("newsee-system", "ns_core_role_user"),
+            "`newsee-system`.`ns_core_role_user`"
+        );
     }
 }

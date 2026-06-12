@@ -703,13 +703,21 @@ pub async fn get_mysql_pool_by_url(
     connection_url: &str,
     from: &str,
 ) -> Result<Pool<MySql>, String> {
+    get_mysql_pool_by_url_with_max_connections(connection_url, from, 10).await
+}
+
+pub async fn get_mysql_pool_by_url_with_max_connections(
+    connection_url: &str,
+    from: &str,
+    max_connections: u32,
+) -> Result<Pool<MySql>, String> {
     let redacted_connection_url = redact_connection_url_password(connection_url);
     info!(
-        "Connecting to MySQL: {} from: {}",
-        redacted_connection_url, from
+        "Connecting to MySQL: {} from: {} max_connections: {}",
+        redacted_connection_url, from, max_connections
     );
     match MySqlPoolOptions::new()
-        .max_connections(10)
+        .max_connections(max_connections.max(1))
         .acquire_timeout(Duration::from_secs(10))
         .test_before_acquire(true)
         // 连接空闲超过 20 分钟直接丢弃
