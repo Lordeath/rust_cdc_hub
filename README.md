@@ -144,11 +144,12 @@ export CONFIG_PATH=/path/to/config.yaml
 | `host` / `port` | MySQL 地址和端口。 |
 | `username` / `password` | MySQL 账号密码。 |
 | `database` | 源库名。 |
-| `table_name` | 表名；可填单表、逗号分隔多表或 `"*"` 表示按规则自动发现表。`"*"` 会筛选单一 `bigint` 主键且没有外键依赖的表。 |
+| `table_name` | 表名；可填单表、逗号分隔多表或 `"*"` 表示按规则自动发现表。`"*"` 会筛选单一 `bigint`/`bigint unsigned` 主键且没有外键依赖的表。 |
 | `except_table_name_prefix` | 排除指定前缀的表，多个前缀用逗号分隔。 |
 | `server_id` | Binlog replication server id，必须与 MySQL 集群中其他 server id 不重复。 |
-| `pk_column` | 主键列名。 |
 | `ssl_mode` | MySQL SSL模式，透传为SQLx连接参数 `ssl-mode`。可选：`disabled`、`preferred`、`required`、`verify_ca`、`verify_identity`；默认 `disabled`。如果源库/目标库必须使用SSL，请显式设置为 `required` 或证书校验模式。 |
+
+主键列会从 MySQL 表结构自动识别；参与同步的表需要单一 `bigint`/`bigint unsigned` 主键。MeiliSearch 目标端的 `meili_table_pk` 仍需单独配置为索引主键字段。
 
 ### MySQL → MySQL 示例
 
@@ -164,7 +165,6 @@ source_config:
     table_name: "*"
     except_table_name_prefix: "tmp_,dws_"
     server_id: 10000
-    pk_column: id
 
 sink_config:
   - host: 127.0.0.1
@@ -172,7 +172,6 @@ sink_config:
     username: sink_user
     password: sink_password
     database: target_db
-    pk_column: id
 
 auto_create_database: true
 auto_create_table: true
@@ -195,7 +194,6 @@ source_config:
     database: source_db
     table_name: articles
     server_id: 10001
-    pk_column: id
 
 sink_config:
   - meili_url: http://127.0.0.1:7700
@@ -217,7 +215,6 @@ source_config:
     database: source_db
     table_name: "*"
     server_id: 10003
-    pk_column: id
 
 sink_config:
   - host: 127.0.0.1
@@ -225,7 +222,6 @@ sink_config:
     username: SYSDBA
     password: SYSDBA
     database: TARGET_SCHEMA
-    pk_column: id
 
 auto_create_database: true  # 达梦：自动创建目标 schema，不是物理数据库
 auto_create_table: true
@@ -247,7 +243,6 @@ source_config:
     database: test
     table_name: test_table
     server_id: 10002
-    pk_column: id
 
 sink_config:
   - {}

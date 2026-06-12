@@ -100,7 +100,6 @@ source_config:
     table_name: "*"           # or comma-separated: "table1,table2"
     except_table_name_prefix: "tmp_,dws_"  # exclude prefixes
     server_id: 10001
-    pk_column: id             # primary key column
 
 sink_config:
   - host: 192.168.1.53
@@ -108,7 +107,6 @@ sink_config:
     username: root
     password: password
     database: target_db
-    pk_column: id
 
 # Optional settings
 log_level: debug
@@ -132,7 +130,6 @@ source_config:
     database: source_db
     table_name: table_name
     server_id: 10000
-    pk_column: id
 
 sink_config:
   - meili_url: http://192.168.1.103:17700

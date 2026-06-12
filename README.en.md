@@ -144,10 +144,11 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 | `host` / `port` | MySQL host and port. |
 | `username` / `password` | MySQL credentials. |
 | `database` | Source database name. |
-| `table_name` | Table name; use a single table, comma-separated names, or `"*"` for all tables. |
+| `table_name` | Table name; use a single table, comma-separated names, or `"*"` for automatic discovery. `"*"` selects tables with one `bigint`/`bigint unsigned` primary key and no foreign-key dependency. |
 | `except_table_name_prefix` | Exclude tables by prefix; use comma-separated prefixes. |
 | `server_id` | Binlog replication server id. It must be unique in the MySQL topology. |
-| `pk_column` | Primary-key column name. |
+
+The primary-key column is detected from the MySQL table schema automatically. Synchronized source tables need exactly one `bigint`/`bigint unsigned` primary key. `meili_table_pk` is still required for the MeiliSearch sink because it defines the target index primary key.
 
 ### MySQL → MySQL example
 
@@ -163,7 +164,6 @@ source_config:
     table_name: "*"
     except_table_name_prefix: "tmp_,dws_"
     server_id: 10000
-    pk_column: id
 
 sink_config:
   - host: 127.0.0.1
@@ -171,7 +171,6 @@ sink_config:
     username: sink_user
     password: sink_password
     database: target_db
-    pk_column: id
 
 auto_create_database: true
 auto_create_table: true
@@ -194,7 +193,6 @@ source_config:
     database: source_db
     table_name: articles
     server_id: 10001
-    pk_column: id
 
 sink_config:
   - meili_url: http://127.0.0.1:7700
@@ -216,7 +214,6 @@ source_config:
     database: source_db
     table_name: "*"
     server_id: 10003
-    pk_column: id
 
 sink_config:
   - host: 127.0.0.1
@@ -224,7 +221,6 @@ sink_config:
     username: SYSDBA
     password: SYSDBA
     database: TARGET_SCHEMA
-    pk_column: id
 
 auto_create_database: true  # Dameng: creates the target schema, not a physical database
 auto_create_table: true
@@ -246,7 +242,6 @@ source_config:
     database: test
     table_name: test_table
     server_id: 10002
-    pk_column: id
 
 sink_config:
   - {}

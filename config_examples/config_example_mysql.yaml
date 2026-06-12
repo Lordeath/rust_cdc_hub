@@ -9,7 +9,6 @@ source_config:
     # 默认 ssl_mode: disabled；如果源库必须使用SSL，可设置 ssl_mode: required
     table_name: "*"
     server_id: 10000
-    pk_column: id
 
 sink_config:
   - host: 127.0.0.1
@@ -18,7 +17,6 @@ sink_config:
     password: XXXXXXXXXXXXXXXXXXXXXX
     database: XXXXXXXXXXXX
     # 默认 ssl_mode: disabled；如果目标库必须使用SSL，可设置 ssl_mode: required
-    pk_column: id
 
 plugins:
   - plugin_type: ColumnIn

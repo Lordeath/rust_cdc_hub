@@ -9,7 +9,6 @@ source_config:
     database: source_db
     table_name: "*"
     server_id: 10003
-    pk_column: id
 
 sink_config:
   - host: 127.0.0.1
@@ -17,7 +16,6 @@ sink_config:
     username: SYSDBA
     password: SYSDBA
     database: TARGET_SCHEMA
-    pk_column: id
 
 auto_create_database: true  # Dameng: creates target schema when missing
 auto_create_table: true
