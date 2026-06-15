@@ -6,7 +6,7 @@ use common::metrics::{SINK_EVENTS_TOTAL, SINK_FLUSH_DURATION_SECONDS, SINK_FLUSH
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::schema::{
     extract_mysql_create_table_column_definitions, mysql_column_allows_null_from_definition,
-    mysql_type_token_from_column_definition,
+    mysql_type_token_from_column_definition, normalize_mysql_column_type_token,
 };
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value,
@@ -207,16 +207,30 @@ impl MySqlSink {
                     };
                     let src_nullable = mysql_column_allows_null_from_definition(def.as_str());
 
-                    let need_modify_type = sink_type != src_type;
+                    let sink_type_normalized =
+                        normalize_mysql_column_type_token(sink_type.as_str());
+                    let src_type_normalized = normalize_mysql_column_type_token(src_type.as_str());
+                    let need_modify_type = sink_type_normalized != src_type_normalized;
                     let need_modify_nullable = src_nullable && !sink_nullable;
                     if !need_modify_type && !need_modify_nullable {
                         continue;
                     }
+                    let mut reasons = Vec::new();
+                    if need_modify_type {
+                        reasons.push(format!(
+                            "type {} -> {}",
+                            sink_type_normalized, src_type_normalized
+                        ));
+                    }
+                    if need_modify_nullable {
+                        reasons.push(format!("nullable {} -> {}", sink_nullable, src_nullable));
+                    }
+                    let reason = reasons.join(", ");
                     let modify_sql = format!("ALTER TABLE `{}` MODIFY COLUMN {}", table_name, def);
                     match pool.execute(modify_sql.as_str()).await {
                         Ok(_) => info!(
-                            "auto modify column success: {}.{} {}",
-                            database, table_name, src_col
+                            "auto modify column success: {}.{} {} reason: {}",
+                            database, table_name, src_col, reason
                         ),
                         Err(e) => error!(
                             "auto modify column failed: {}.{} {} {}",
@@ -357,6 +371,7 @@ impl MySqlSink {
                 let type_token = defs
                     .get(&key)
                     .and_then(|def| mysql_type_token_from_column_definition(def.as_str()))
+                    .map(|type_token| normalize_mysql_column_type_token(type_token.as_str()))
                     .unwrap_or_else(|| "__missing_definition__".to_string())
                     .to_ascii_lowercase();
                 (key, type_token)
@@ -957,6 +972,16 @@ mod tests {
         let tables = vec![
             table_info("src_a", "dst_a", "varchar(64)"),
             table_info("src_b", "dst_b", "varchar(128)"),
+        ];
+
+        assert!(MySqlSink::validate_merged_target_schema(&tables).is_ok());
+    }
+
+    #[test]
+    fn merged_target_schema_allows_integer_display_width_mismatch() {
+        let tables = vec![
+            table_info("src_a", "dst", "bigint(20)"),
+            table_info("src_b", "dst", "bigint"),
         ];
 
         assert!(MySqlSink::validate_merged_target_schema(&tables).is_ok());

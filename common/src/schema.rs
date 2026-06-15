@@ -49,6 +49,52 @@ pub fn mysql_type_token_from_column_definition(definition: &str) -> Option<Strin
     Some(first.to_string())
 }
 
+pub fn normalize_mysql_column_type_token(type_token: &str) -> String {
+    let normalized = type_token.trim().to_ascii_lowercase();
+    let mut parts = normalized.split_whitespace();
+    let Some(first) = parts.next() else {
+        return normalized;
+    };
+
+    let mut result = normalize_mysql_integer_display_width(first);
+    let rest = parts.collect::<Vec<_>>().join(" ");
+    if !rest.is_empty() {
+        result.push(' ');
+        result.push_str(&rest);
+    }
+    result
+}
+
+fn normalize_mysql_integer_display_width(type_name: &str) -> String {
+    const INTEGER_TYPES: &[&str] = &[
+        "tinyint",
+        "smallint",
+        "mediumint",
+        "int",
+        "integer",
+        "bigint",
+    ];
+
+    for integer_type in INTEGER_TYPES {
+        if type_name == *integer_type {
+            return type_name.to_string();
+        }
+
+        let Some(width) = type_name
+            .strip_prefix(integer_type)
+            .and_then(|rest| rest.strip_prefix('('))
+            .and_then(|rest| rest.strip_suffix(')'))
+        else {
+            continue;
+        };
+        if width.chars().all(|c| c.is_ascii_digit()) {
+            return (*integer_type).to_string();
+        }
+    }
+
+    type_name.to_string()
+}
+
 pub fn mysql_column_allows_null_from_definition(definition: &str) -> bool {
     let s = definition.to_ascii_lowercase();
     !s.contains("not null")
@@ -83,6 +129,28 @@ mod tests {
         assert_eq!(
             mysql_type_token_from_column_definition(def),
             Some("int(11) unsigned".to_string())
+        );
+    }
+
+    #[test]
+    fn mysql_type_normalization_ignores_integer_display_width() {
+        assert_eq!(normalize_mysql_column_type_token("bigint(20)"), "bigint");
+        assert_eq!(
+            normalize_mysql_column_type_token("int(11) unsigned"),
+            "int unsigned"
+        );
+        assert_eq!(normalize_mysql_column_type_token("TINYINT(1)"), "tinyint");
+    }
+
+    #[test]
+    fn mysql_type_normalization_preserves_semantic_lengths() {
+        assert_ne!(
+            normalize_mysql_column_type_token("varchar(64)"),
+            normalize_mysql_column_type_token("varchar(128)")
+        );
+        assert_eq!(
+            normalize_mysql_column_type_token("decimal(10,2)"),
+            "decimal(10,2)"
         );
     }
 
