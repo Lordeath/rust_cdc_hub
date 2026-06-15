@@ -1,6 +1,6 @@
-use mysql_async::prelude::Queryable;
-use mysql_async::{OptsBuilder, Pool};
 use serde_json::json;
+use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlSslMode};
+use sqlx::{Executor, MySql, Pool};
 use std::error::Error;
 use tracing::{error, info, trace};
 
@@ -10,7 +10,7 @@ pub struct StarrocksClient {
     pub base_url: String,
     pub username: String,
     pub password: String,
-    pub mysql_pool: Pool,
+    pub mysql_pool: Pool<MySql>,
 }
 impl StarrocksClient {
     pub async fn new(
@@ -20,14 +20,14 @@ impl StarrocksClient {
         mysql_host: &str,
         mysql_port: u16,
     ) -> Self {
-        let opts = OptsBuilder::default()
-            .ip_or_hostname(mysql_host)
-            .tcp_port(mysql_port)
-            .user(Some(username))
-            .pass(Some(password))
-            .db_name(Some("information_schema"))
-            .prefer_socket(false);
-        let mysql_pool = Pool::new(opts);
+        let options = MySqlConnectOptions::new()
+            .host(mysql_host)
+            .port(mysql_port)
+            .username(username)
+            .password(password)
+            .database("information_schema")
+            .ssl_mode(MySqlSslMode::Disabled);
+        let mysql_pool = MySqlPoolOptions::new().connect_lazy_with(options);
         StarrocksClient {
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -152,8 +152,7 @@ impl StarrocksClient {
     }
 
     pub async fn execute_mysql_sql(&self, sql: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let mut conn = self.mysql_pool.get_conn().await?;
-        conn.query_drop(sql).await?;
+        self.mysql_pool.execute(sql).await?;
         Ok(())
     }
 }
