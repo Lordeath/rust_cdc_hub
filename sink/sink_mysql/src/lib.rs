@@ -15,7 +15,7 @@ use common::{
 };
 use sqlx::mysql::{MySqlArguments, MySqlQueryResult};
 use sqlx::query::Query;
-use sqlx::{MySql, Pool};
+use sqlx::{Executor, MySql, Pool};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
@@ -88,6 +88,7 @@ impl MySqlSink {
                     .unwrap_or_else(|| panic!("target database pool not found: {}", database));
                 let table_name = table_info.table_name.clone();
                 let is_empty = sqlx::query(sql)
+                    .persistent(false)
                     .bind(&database)
                     .bind(&table_name)
                     .fetch_all(pool)
@@ -96,8 +97,7 @@ impl MySqlSink {
                     .is_empty();
                 if is_empty {
                     let create_table_sql = table_info.create_table_sql.clone();
-                    sqlx::query(&create_table_sql)
-                        .execute(pool)
+                    pool.execute(create_table_sql.as_str())
                         .await
                         .expect("Failed to create table");
                 }
@@ -114,6 +114,7 @@ impl MySqlSink {
                 let rows = sqlx::query(
                     "select COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE from information_schema.`COLUMNS` where TABLE_SCHEMA = ? AND TABLE_NAME = ?",
                 )
+                .persistent(false)
                 .bind(&database)
                 .bind(&table_name)
                 .fetch_all(pool)
@@ -139,7 +140,7 @@ impl MySqlSink {
                         Some(v) => v,
                     };
                     let alter_sql = format!("ALTER TABLE `{}` ADD COLUMN {}", table_name, def);
-                    match sqlx::query(&alter_sql).execute(pool).await {
+                    match pool.execute(alter_sql.as_str()).await {
                         Ok(_) => info!(
                             "auto add column success: {}.{} {}",
                             database, table_name, src_col
@@ -169,6 +170,7 @@ impl MySqlSink {
                 let rows = sqlx::query(
                     "select COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE from information_schema.`COLUMNS` where TABLE_SCHEMA = ? AND TABLE_NAME = ?",
                 )
+                .persistent(false)
                 .bind(&database)
                 .bind(&table_name)
                 .fetch_all(pool)
@@ -211,7 +213,7 @@ impl MySqlSink {
                         continue;
                     }
                     let modify_sql = format!("ALTER TABLE `{}` MODIFY COLUMN {}", table_name, def);
-                    match sqlx::query(&modify_sql).execute(pool).await {
+                    match pool.execute(modify_sql.as_str()).await {
                         Ok(_) => info!(
                             "auto modify column success: {}.{} {}",
                             database, table_name, src_col
@@ -258,10 +260,7 @@ impl MySqlSink {
                         .await
                         .unwrap_or_else(|e| panic!("MySQL sink 自动创建数据库连接失败: {}", e));
                         let sql = format!("CREATE DATABASE IF NOT EXISTS `{}`", database.clone());
-                        match sqlx::query(&sql)
-                            .execute(&pool_for_auto_create_database)
-                            .await
-                        {
+                        match (&pool_for_auto_create_database).execute(sql.as_str()).await {
                             Ok(xx) => xx,
                             Err(e) => {
                                 error!("Failed to create database: {}", e);
@@ -375,6 +374,7 @@ impl MySqlSink {
                     select COLUMN_NAME from information_schema.columns where EXTRA = 'STORED GENERATED' AND TABLE_SCHEMA = ? AND TABLE_NAME = ?;
                 "#;
         let stored_cols: Vec<String> = sqlx::query(stored_cols_sql)
+            .persistent(false)
             .bind(database)
             .bind(table_name)
             .fetch_all(pool)
@@ -396,6 +396,7 @@ impl MySqlSink {
                     select COLUMN_NAME from information_schema.columns where TABLE_SCHEMA = ? AND TABLE_NAME = ?;
                 "#;
         let cols: Vec<String> = sqlx::query(stored_cols_sql)
+            .persistent(false)
             .bind(database)
             .bind(table_name)
             .fetch_all(pool)
@@ -500,7 +501,7 @@ impl MySqlSink {
         columns: &'a [String],
         inserts: &'a [common::case_insensitive_hash_map::CaseInsensitiveHashMap],
     ) -> Query<'a, MySql, MySqlArguments> {
-        let mut query = sqlx::query(sql);
+        let mut query = sqlx::query(sql).persistent(false);
         for row in inserts {
             for col in columns {
                 let x = row.get(col);
@@ -566,7 +567,7 @@ impl MySqlSink {
         sql: &'a str,
         deletes: &'a [String],
     ) -> Query<'a, MySql, MySqlArguments> {
-        let mut query = sqlx::query(sql);
+        let mut query = sqlx::query(sql).persistent(false);
         for pk in deletes {
             query = query.bind(pk);
         }
@@ -686,7 +687,7 @@ impl Sink for MySqlSink {
     async fn connect(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         // 测试连接
         for pool in self.target_pools.values() {
-            sqlx::query("SELECT 1").execute(pool).await?;
+            pool.execute("SELECT 1").await?;
         }
         info!("Connected to MySQL via SQLx");
         Ok(())

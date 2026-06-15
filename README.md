@@ -149,6 +149,7 @@ export CONFIG_PATH=/path/to/config.yaml
 | `except_table_name_prefix` | 排除指定前缀的表，多个前缀用逗号分隔。 |
 | `server_id` | Binlog replication server id，必须与 MySQL 集群中其他 server id 不重复。 |
 | `ssl_mode` | MySQL SSL模式，透传为SQLx连接参数 `ssl-mode`。可选：`disabled`、`preferred`、`required`、`verify_ca`、`verify_identity`；默认 `disabled`。如果源库/目标库必须使用SSL，请显式设置为 `required` 或证书校验模式。 |
+| `statement_cache_capacity` | MySQL prepared statement 缓存容量，透传为 SQLx 连接参数 `statement-cache-capacity`；设为 `"0"` 可关闭缓存。MySQL 报 `Can't create more than max_prepared_stmt_count statements` 时，可先断开旧连接或临时调大 `max_prepared_stmt_count` 后重启同步进程。 |
 
 主键列会从 MySQL 表结构自动识别；参与同步的表需要单一 `bigint`/`bigint unsigned` 主键。MeiliSearch 目标端的 `meili_table_pk` 仍需单独配置为索引主键字段。
 

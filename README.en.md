@@ -148,6 +148,7 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 | `table_name` | Table name; use a single table, comma-separated names, or `"*"` for automatic discovery. `"*"` selects tables with one `bigint`/`bigint unsigned` primary key and no foreign-key dependency. |
 | `except_table_name_prefix` | Exclude tables by prefix; use comma-separated prefixes. |
 | `server_id` | Binlog replication server id. It must be unique in the MySQL topology. |
+| `statement_cache_capacity` | MySQL prepared statement cache capacity, passed through as SQLx `statement-cache-capacity`; set it to `"0"` to disable caching. If MySQL reports `Can't create more than max_prepared_stmt_count statements`, disconnect old clients or temporarily raise `max_prepared_stmt_count`, then restart the sync process. |
 
 The primary-key column is detected from the MySQL table schema automatically. Synchronized source tables need exactly one `bigint`/`bigint unsigned` primary key. `meili_table_pk` is still required for the MeiliSearch sink because it defines the target index primary key.
 
