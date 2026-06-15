@@ -11,7 +11,7 @@ use common::schema::{
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value,
     database_table_key, get_mysql_pool_by_url, mysql_connection_url_from_config,
-    mysql_row_to_hashmap,
+    mysql_row_text_value,
 };
 use sqlx::mysql::{MySqlArguments, MySqlQueryResult};
 use sqlx::query::Query;
@@ -122,8 +122,7 @@ impl MySqlSink {
                 .unwrap_or_default();
                 let exists_set: HashSet<String> = rows
                     .iter()
-                    .map(mysql_row_to_hashmap)
-                    .map(|row| row.get("COLUMN_NAME").resolve_string().to_ascii_lowercase())
+                    .map(|row| mysql_row_text_value(row, "COLUMN_NAME").to_ascii_lowercase())
                     .collect();
 
                 let defs = extract_mysql_create_table_column_definitions(
@@ -178,10 +177,10 @@ impl MySqlSink {
                 .unwrap_or_default();
 
                 let mut sink_meta: HashMap<String, (String, bool)> = HashMap::new();
-                for r in rows.iter().map(mysql_row_to_hashmap) {
-                    let name = r.get("COLUMN_NAME").resolve_string();
-                    let typ = r.get("COLUMN_TYPE").resolve_string();
-                    let is_nullable = r.get("IS_NULLABLE").resolve_string();
+                for row in rows.iter() {
+                    let name = mysql_row_text_value(row, "COLUMN_NAME");
+                    let typ = mysql_row_text_value(row, "COLUMN_TYPE");
+                    let is_nullable = mysql_row_text_value(row, "IS_NULLABLE");
                     sink_meta.insert(
                         name.to_ascii_lowercase(),
                         (
@@ -396,8 +395,7 @@ impl MySqlSink {
             .await
             .unwrap()
             .iter()
-            .map(mysql_row_to_hashmap)
-            .map(|row| row.get("COLUMN_NAME").resolve_string())
+            .map(|row| mysql_row_text_value(row, "COLUMN_NAME"))
             .collect();
         stored_cols
     }
@@ -418,8 +416,7 @@ impl MySqlSink {
             .await
             .unwrap()
             .iter()
-            .map(mysql_row_to_hashmap)
-            .map(|row| row.get("COLUMN_NAME").resolve_string())
+            .map(|row| mysql_row_text_value(row, "COLUMN_NAME"))
             .collect();
         cols
     }

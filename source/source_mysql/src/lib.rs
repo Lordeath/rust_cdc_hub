@@ -10,7 +10,8 @@ use common::runtime_progress;
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value,
     database_table_key, get_mysql_pool_by_url_with_max_connections,
-    mysql_connection_url_from_config, mysql_row_to_hashmap, redact_connection_url_password,
+    mysql_connection_url_from_config, mysql_row_text_value, mysql_row_to_hashmap,
+    redact_connection_url_password,
 };
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
@@ -192,12 +193,7 @@ impl MysqlSourceConfig {
                     .await
                     .expect("query failed")
                     .into_iter()
-                    .map(|row| mysql_row_to_hashmap(&row))
-                    .map(|row| {
-                        row.get("table_name")
-                            // .unwrap_or_else(|| panic!("table_name not found"))
-                            .resolve_string()
-                    })
+                    .map(|row| mysql_row_text_value(&row, "table_name"))
                     // .map(|row| row.table_name)
                     .collect();
                 info!("get all tables from {}: {:?}", database, tables);

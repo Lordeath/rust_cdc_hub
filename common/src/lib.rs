@@ -983,6 +983,15 @@ pub fn mysql_row_to_hashmap(row: &MySqlRow) -> CaseInsensitiveHashMap {
     CaseInsensitiveHashMap::new(result)
 }
 
+pub fn mysql_row_text_value(row: &MySqlRow, column_name: &str) -> String {
+    row.try_get::<String, _>(column_name)
+        .or_else(|_| {
+            row.try_get::<Vec<u8>, _>(column_name)
+                .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        })
+        .unwrap_or_else(|e| panic!("读取MySQL文本列失败: {} {}", column_name, e))
+}
+
 pub async fn get_mysql_pool_by_url(
     connection_url: &str,
     from: &str,
