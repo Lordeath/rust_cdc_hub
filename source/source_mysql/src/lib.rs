@@ -357,6 +357,64 @@ pub struct ColumnInfoFromMysql {
     pub data_type: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitPkCursor {
+    Start,
+    Signed(i64),
+    Unsigned(u64),
+}
+
+impl InitPkCursor {
+    fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::Int8(v) => Some(Self::Signed(*v as i64)),
+            Value::Int16(v) => Some(Self::Signed(*v as i64)),
+            Value::Int32(v) => Some(Self::Signed(*v as i64)),
+            Value::Int64(v) => Some(Self::Signed(*v)),
+            Value::UnsignedInt8(v) => Some(Self::Unsigned(*v as u64)),
+            Value::UnsignedInt16(v) => Some(Self::Unsigned(*v as u64)),
+            Value::UnsignedInt32(v) => Some(Self::Unsigned(*v as u64)),
+            Value::UnsignedInt64(v) => Some(Self::Unsigned(*v)),
+            _ => None,
+        }
+    }
+
+    fn sql_literal(&self) -> Option<String> {
+        match self {
+            Self::Start => None,
+            Self::Signed(v) => Some(v.to_string()),
+            Self::Unsigned(v) => Some(v.to_string()),
+        }
+    }
+
+    fn display_value(&self) -> String {
+        self.sql_literal().unwrap_or_else(|| "START".to_string())
+    }
+
+    fn advance(&mut self, next: Self) {
+        match (*self, next) {
+            (Self::Start, _) => *self = next,
+            (Self::Signed(current), Self::Signed(next_value)) if next_value > current => {
+                *self = next
+            }
+            (Self::Unsigned(current), Self::Unsigned(next_value)) if next_value > current => {
+                *self = next
+            }
+            (Self::Signed(current), Self::Unsigned(next_value))
+                if current < 0 || next_value > current as u64 =>
+            {
+                *self = next
+            }
+            (Self::Unsigned(current), Self::Signed(next_value))
+                if next_value >= 0 && (next_value as u64) > current =>
+            {
+                *self = next
+            }
+            _ => {}
+        }
+    }
+}
+
 impl MysqlSourceConfigDetail {
     #[inline]
     fn source_table_key(&self, table_name: &str) -> String {
@@ -401,26 +459,32 @@ impl MysqlSourceConfigDetail {
         &self,
         table_name: &str,
         pk_column: &str,
-        id: i64,
+        cursor: &InitPkCursor,
         executor: &mut Transaction<'_, MySql>,
     ) -> Vec<DataBuffer> {
+        let where_clause = cursor
+            .sql_literal()
+            .map(|id| format!("where {} > {}", quote_mysql_identifier(pk_column), id))
+            .unwrap_or_default();
         let sql = format!(
             r#"
                 select *
                 FROM {}
-                where {} > {}
+                {}
                 order by {}
                 limit {}
             "#,
             qualified_mysql_table_name(&self.database, table_name),
-            quote_mysql_identifier(pk_column),
-            id,
+            where_clause,
             quote_mysql_identifier(pk_column),
             self.batchsize
         );
         debug!(
             "extract_init_data: [{}.{}] {} {}",
-            self.database, table_name, pk_column, id
+            self.database,
+            table_name,
+            pk_column,
+            cursor.display_value()
         );
         // 查询 Row，而不是 HashMap
         let rows: Vec<MySqlRow> = sqlx::query(&sql)
@@ -432,7 +496,7 @@ impl MysqlSourceConfigDetail {
             self.database,
             table_name,
             pk_column,
-            id,
+            cursor.display_value(),
             rows.len()
         );
         let mut result: Vec<DataBuffer> = vec![];
@@ -698,10 +762,10 @@ impl MySQLSource {
             runtime_progress::begin_table_initialization(&progress_label).await;
             let start = Instant::now();
             let mut count = 0;
-            let mut id: i64 = i64::MIN;
+            let mut cursor = InitPkCursor::Start;
             loop {
                 let data_buffer_list: Vec<DataBuffer> = config
-                    .extract_init_data(&table_name, &pk_column, id, &mut tx)
+                    .extract_init_data(&table_name, &pk_column, &cursor, &mut tx)
                     .await;
                 let len = data_buffer_list.len();
                 for data_buffer in data_buffer_list {
@@ -712,12 +776,12 @@ impl MySQLSource {
                     )
                     .await;
                     let this_id = data_buffer.after.get(&pk_column);
-                    let next_id = match this_id {
-                        Value::Int64(x) => *x,
-                        _ => {
-                            panic!("pk_column not found");
-                        }
-                    };
+                    let next_id = InitPkCursor::from_value(this_id).unwrap_or_else(|| {
+                        panic!(
+                            "pk_column value is not supported as init cursor: {}.{} {} {:?}",
+                            config.database, table_name, pk_column, this_id
+                        )
+                    });
                     let plugin_data = detail_with_plugin(&plugins, data_buffer).await;
                     if let Ok(item) = plugin_data {
                         Self::write_record_with_retry(&mut sink, &item, None).await;
@@ -725,12 +789,10 @@ impl MySQLSource {
                     } else {
                         runtime_progress::record_filtered(&progress_label).await;
                     }
-                    if next_id > id {
-                        id = next_id;
-                    }
+                    cursor.advance(next_id);
                 }
                 count += len;
-                debug!("当前最大id为 {}", id);
+                debug!("当前最大id为 {}", cursor.display_value());
                 if len != config.batchsize {
                     break;
                 }
@@ -1736,5 +1798,24 @@ mod tests {
             qualified_mysql_table_name("newsee-system", "ns_core_role_user"),
             "`newsee-system`.`ns_core_role_user`"
         );
+    }
+
+    #[test]
+    fn init_pk_cursor_supports_unsigned_bigint() {
+        let cursor = InitPkCursor::from_value(&Value::UnsignedInt64(42)).unwrap();
+
+        assert_eq!(cursor, InitPkCursor::Unsigned(42));
+        assert_eq!(cursor.sql_literal().as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn init_pk_cursor_advances_forward_only() {
+        let mut cursor = InitPkCursor::Start;
+
+        cursor.advance(InitPkCursor::Unsigned(10));
+        cursor.advance(InitPkCursor::Unsigned(8));
+        cursor.advance(InitPkCursor::Unsigned(12));
+
+        assert_eq!(cursor, InitPkCursor::Unsigned(12));
     }
 }

@@ -650,6 +650,7 @@ impl DamengSink {
             Value::Int32(v) => DamengParam::I32(*v),
             Value::Int64(v) => DamengParam::I64(*v),
             Value::UnsignedInt8(v) => DamengParam::I16(*v as i16),
+            Value::UnsignedInt16(v) => DamengParam::I32(*v as i32),
             Value::UnsignedInt32(v) => DamengParam::I64(*v as i64),
             Value::UnsignedInt64(v) => {
                 if *v <= i64::MAX as u64 {

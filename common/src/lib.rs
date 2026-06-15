@@ -502,6 +502,7 @@ pub enum Value {
     Int32(i32),
     Int64(i64),
     UnsignedInt8(u8),
+    UnsignedInt16(u16),
     UnsignedInt32(u32),
     UnsignedInt64(u64),
     // A 32 bit floating point number
@@ -545,6 +546,7 @@ impl Value {
             Value::Int32(s) => s.to_string(),
             Value::Int64(s) => s.to_string(),
             Value::UnsignedInt8(s) => s.to_string(),
+            Value::UnsignedInt16(s) => s.to_string(),
             Value::UnsignedInt32(s) => s.to_string(),
             Value::UnsignedInt64(s) => s.to_string(),
             Value::Float(s) => s.to_string(),
@@ -618,6 +620,7 @@ impl Serialize for Value {
             Value::Year(v) => serializer.serialize_u16(*v),
             Value::Bit(v) => serializer.serialize_u64(*v),
             Value::UnsignedInt8(v) => serializer.serialize_u8(*v),
+            Value::UnsignedInt16(v) => serializer.serialize_u16(*v),
             Value::UnsignedInt32(v) => serializer.serialize_u32(*v),
             Value::UnsignedInt64(v) => serializer.serialize_u64(*v),
         }
@@ -814,6 +817,58 @@ pub fn mysql_row_to_hashmap(row: &MySqlRow) -> CaseInsensitiveHashMap {
                         error!("{}", e);
                         panic!("类型转换失败: {}", column.type_info().name());
                     }
+                },
+                "SMALLINT" => match row.try_get::<i16, _>(name.as_str()) {
+                    Ok(v) => Value::Int16(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "SMALLINT UNSIGNED" => match row.try_get::<u16, _>(name.as_str()) {
+                    Ok(v) => Value::UnsignedInt16(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "MEDIUMINT" => match row.try_get::<i32, _>(name.as_str()) {
+                    Ok(v) => Value::Int32(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "MEDIUMINT UNSIGNED" => match row.try_get::<u32, _>(name.as_str()) {
+                    Ok(v) => Value::UnsignedInt32(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "YEAR" => match row.try_get::<u16, _>(name.as_str()) {
+                    Ok(v) => Value::Year(v),
+                    Err(e) => {
+                        error!("类型转换失败: {}", column.type_info().name());
+                        error!("{}", e);
+                        panic!("类型转换失败: {}", column.type_info().name());
+                    }
+                },
+                "BIT" => match row.try_get::<u64, _>(name.as_str()) {
+                    Ok(v) => Value::Bit(v),
+                    Err(e) => match row.try_get::<bool, _>(name.as_str()) {
+                        Ok(v) => Value::Bit(u64::from(v)),
+                        Err(bool_err) => {
+                            error!("类型转换失败: {}", column.type_info().name());
+                            error!("{}", e);
+                            error!("{}", bool_err);
+                            panic!("类型转换失败: {}", column.type_info().name());
+                        }
+                    },
                 },
                 "DATE" => match row.try_get::<NaiveDate, _>(name.as_str()) {
                     Ok(v) => Value::String(v.to_string()),
@@ -1133,6 +1188,13 @@ mod tests {
     fn test_resolve_string_int() {
         let v = Value::Int32(123);
         assert_eq!(v.resolve_string(), "123");
+    }
+
+    #[test]
+    fn test_resolve_string_unsigned_int16() {
+        let v = Value::UnsignedInt16(65535);
+        assert_eq!(v.resolve_string(), "65535");
+        assert_eq!(serde_json::to_string(&v).unwrap(), "65535");
     }
 
     #[test]
