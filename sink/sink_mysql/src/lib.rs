@@ -526,6 +526,8 @@ impl MySqlSink {
                         query = query.bind("null");
                     } else if let Value::Blob(bytes) = x {
                         query = query.bind(bytes.to_vec());
+                    } else if let Value::Bit(v) = x {
+                        query = query.bind(*v);
                     } else {
                         query = query.bind(x.resolve_string());
                     }
@@ -982,5 +984,11 @@ mod tests {
         ];
 
         assert!(MySqlSink::validate_merged_target_schema(&tables).is_ok());
+    }
+
+    #[test]
+    fn bit_values_resolve_as_numeric_text() {
+        assert_eq!(Value::Bit(1).resolve_string(), "1");
+        assert_eq!(Value::Bit(0).resolve_string(), "0");
     }
 }
