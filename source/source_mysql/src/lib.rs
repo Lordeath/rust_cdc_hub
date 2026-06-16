@@ -15,6 +15,7 @@ use common::{
 };
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
+use mysql_binlog_connector_rust::column::column_type::ColumnType;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
 use mysql_binlog_connector_rust::column::json::json_binary::JsonBinary;
 use mysql_binlog_connector_rust::event::event_data::EventData;
@@ -70,6 +71,28 @@ struct BinlogTableColumnInfo {
     table_name: String,
     column_count: usize,
     row_column_names: Option<Vec<Option<String>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MysqlBinlogTypeCategory {
+    Tiny,
+    Short,
+    Int24,
+    Long,
+    LongLong,
+    Float,
+    Double,
+    Decimal,
+    Date,
+    Time,
+    Timestamp,
+    DateTime,
+    Year,
+    String,
+    Blob,
+    Json,
+    Bit,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1030,6 +1053,230 @@ fn focus_column_positions(columns: &[String]) -> Vec<(&'static str, Option<usize
         .collect()
 }
 
+fn binlog_type_category(column_type: u8) -> MysqlBinlogTypeCategory {
+    match ColumnType::from_code(column_type) {
+        ColumnType::Tiny => MysqlBinlogTypeCategory::Tiny,
+        ColumnType::Short => MysqlBinlogTypeCategory::Short,
+        ColumnType::Int24 => MysqlBinlogTypeCategory::Int24,
+        ColumnType::Long => MysqlBinlogTypeCategory::Long,
+        ColumnType::LongLong => MysqlBinlogTypeCategory::LongLong,
+        ColumnType::Float => MysqlBinlogTypeCategory::Float,
+        ColumnType::Double => MysqlBinlogTypeCategory::Double,
+        ColumnType::Decimal | ColumnType::NewDecimal => MysqlBinlogTypeCategory::Decimal,
+        ColumnType::Date => MysqlBinlogTypeCategory::Date,
+        ColumnType::Time | ColumnType::Time2 => MysqlBinlogTypeCategory::Time,
+        ColumnType::TimeStamp | ColumnType::TimeStamp2 => MysqlBinlogTypeCategory::Timestamp,
+        ColumnType::DateTime | ColumnType::DateTime2 => MysqlBinlogTypeCategory::DateTime,
+        ColumnType::Year => MysqlBinlogTypeCategory::Year,
+        ColumnType::VarChar | ColumnType::VarString | ColumnType::String => {
+            MysqlBinlogTypeCategory::String
+        }
+        ColumnType::Blob
+        | ColumnType::TinyBlob
+        | ColumnType::MediumBlob
+        | ColumnType::LongBlob
+        | ColumnType::Geometry => MysqlBinlogTypeCategory::Blob,
+        ColumnType::Json => MysqlBinlogTypeCategory::Json,
+        ColumnType::Bit => MysqlBinlogTypeCategory::Bit,
+        _ => MysqlBinlogTypeCategory::Unknown,
+    }
+}
+
+fn create_table_column_type_category(column_definition: &str) -> MysqlBinlogTypeCategory {
+    let line = column_definition.trim();
+    let Some(second_tick) = line[1..].find('`').map(|i| i + 1) else {
+        return MysqlBinlogTypeCategory::Unknown;
+    };
+    let type_definition = line[(second_tick + 1)..].trim_start();
+    let type_name = type_definition
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or_default()
+        .trim_matches('`')
+        .to_ascii_lowercase();
+
+    match type_name.as_str() {
+        "bool" | "boolean" | "tinyint" => MysqlBinlogTypeCategory::Tiny,
+        "smallint" => MysqlBinlogTypeCategory::Short,
+        "mediumint" => MysqlBinlogTypeCategory::Int24,
+        "int" | "integer" => MysqlBinlogTypeCategory::Long,
+        "bigint" | "serial" => MysqlBinlogTypeCategory::LongLong,
+        "float" => MysqlBinlogTypeCategory::Float,
+        "double" | "real" => MysqlBinlogTypeCategory::Double,
+        "decimal" | "dec" | "fixed" | "numeric" => MysqlBinlogTypeCategory::Decimal,
+        "date" => MysqlBinlogTypeCategory::Date,
+        "time" => MysqlBinlogTypeCategory::Time,
+        "timestamp" => MysqlBinlogTypeCategory::Timestamp,
+        "datetime" => MysqlBinlogTypeCategory::DateTime,
+        "year" => MysqlBinlogTypeCategory::Year,
+        "char" | "varchar" | "binary" | "varbinary" | "enum" | "set" => {
+            MysqlBinlogTypeCategory::String
+        }
+        "json" => MysqlBinlogTypeCategory::Json,
+        name if name.ends_with("text") || name.ends_with("blob") => MysqlBinlogTypeCategory::Blob,
+        "bit" => MysqlBinlogTypeCategory::Bit,
+        _ => MysqlBinlogTypeCategory::Unknown,
+    }
+}
+
+fn infer_single_hidden_column_position_by_types(
+    visible_type_categories: &[MysqlBinlogTypeCategory],
+    row_column_types: &[u8],
+) -> Option<usize> {
+    if row_column_types.len() != visible_type_categories.len() + 1 {
+        return None;
+    }
+
+    let mut candidates = vec![];
+    for hidden_ordinal in 0..row_column_types.len() {
+        let mut matched = 0usize;
+        let mut mismatched = false;
+        for (row_ordinal, row_column_type) in row_column_types.iter().enumerate() {
+            if row_ordinal == hidden_ordinal {
+                continue;
+            }
+            let visible_ordinal = if row_ordinal < hidden_ordinal {
+                row_ordinal
+            } else {
+                row_ordinal - 1
+            };
+            let expected = visible_type_categories[visible_ordinal];
+            let actual = binlog_type_category(*row_column_type);
+            if expected == MysqlBinlogTypeCategory::Unknown
+                || actual == MysqlBinlogTypeCategory::Unknown
+            {
+                continue;
+            }
+            if expected != actual {
+                mismatched = true;
+                break;
+            }
+            matched += 1;
+        }
+
+        if !mismatched {
+            candidates.push((hidden_ordinal, matched));
+        }
+    }
+
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    match candidates.as_slice() {
+        [(hidden_ordinal, _)] => Some(*hidden_ordinal),
+        [(hidden_ordinal, best_score), (_, second_score), ..] if best_score > second_score => {
+            Some(*hidden_ordinal)
+        }
+        _ => None,
+    }
+}
+
+fn hidden_column_position_matches_types(
+    hidden_ordinal: usize,
+    visible_type_categories: &[MysqlBinlogTypeCategory],
+    row_column_types: &[u8],
+) -> bool {
+    if row_column_types.len() != visible_type_categories.len() + 1
+        || hidden_ordinal >= row_column_types.len()
+    {
+        return false;
+    }
+
+    for (row_ordinal, row_column_type) in row_column_types.iter().enumerate() {
+        if row_ordinal == hidden_ordinal {
+            continue;
+        }
+        let visible_ordinal = if row_ordinal < hidden_ordinal {
+            row_ordinal
+        } else {
+            row_ordinal - 1
+        };
+        let expected = visible_type_categories[visible_ordinal];
+        let actual = binlog_type_category(*row_column_type);
+        if expected == MysqlBinlogTypeCategory::Unknown
+            || actual == MysqlBinlogTypeCategory::Unknown
+        {
+            continue;
+        }
+        if expected != actual {
+            return false;
+        }
+    }
+    true
+}
+
+fn functional_index_hidden_column_positions(
+    create_table_sql: &str,
+    columns: &[String],
+) -> Vec<usize> {
+    let mut result = vec![];
+    for raw_line in create_table_sql.lines() {
+        let line = raw_line.trim();
+        let line_lower = line.to_ascii_lowercase();
+        if line.starts_with('`') || !line_lower.contains("((") {
+            continue;
+        }
+        if !(line_lower.starts_with("key ")
+            || line_lower.starts_with("index ")
+            || line_lower.starts_with("unique key ")
+            || line_lower.starts_with("unique index ")
+            || line_lower.starts_with("constraint "))
+        {
+            continue;
+        }
+
+        let Some(expression_start) = line.find("((") else {
+            continue;
+        };
+        let expression = &line[expression_start..];
+        let referenced_ordinals = backtick_identifiers(expression)
+            .into_iter()
+            .filter_map(|identifier| {
+                columns
+                    .iter()
+                    .position(|column| column.eq_ignore_ascii_case(identifier.as_str()))
+            })
+            .collect::<Vec<_>>();
+        let Some(max_referenced_ordinal) = referenced_ordinals.into_iter().max() else {
+            continue;
+        };
+        let hidden_ordinal = max_referenced_ordinal + 1;
+        if !result.contains(&hidden_ordinal) {
+            result.push(hidden_ordinal);
+        }
+    }
+    result
+}
+
+fn backtick_identifiers(text: &str) -> Vec<String> {
+    let mut result = vec![];
+    let mut remaining = text;
+    while let Some(start) = remaining.find('`') {
+        let after_start = &remaining[(start + 1)..];
+        let Some(end) = after_start.find('`') else {
+            break;
+        };
+        result.push(after_start[..end].to_string());
+        remaining = &after_start[(end + 1)..];
+    }
+    result
+}
+
+fn row_column_names_with_hidden_position(
+    columns: Vec<String>,
+    row_column_count: usize,
+    hidden_ordinal: usize,
+) -> Vec<Option<String>> {
+    let mut columns = columns.into_iter();
+    (0..row_column_count)
+        .map(|ordinal| {
+            if ordinal == hidden_ordinal {
+                None
+            } else {
+                columns.next()
+            }
+        })
+        .collect()
+}
+
 fn reconcile_row_column_names(
     table_label: &str,
     mut column_names: Vec<Option<String>>,
@@ -1121,6 +1368,29 @@ fn create_table_columns_for_table(
         .unwrap_or_default()
 }
 
+fn create_table_column_lines_for_table(
+    config: &MysqlSourceConfigDetail,
+    table_name: &str,
+) -> Vec<(String, String)> {
+    config
+        .table_info_list
+        .iter()
+        .find(|table_info| table_info.table_name.eq_ignore_ascii_case(table_name))
+        .map(|table_info| column_lines_from_create_table_sql(table_info.create_table_sql.as_str()))
+        .unwrap_or_default()
+}
+
+fn create_table_sql_for_table<'a>(
+    config: &'a MysqlSourceConfigDetail,
+    table_name: &str,
+) -> Option<&'a str> {
+    config
+        .table_info_list
+        .iter()
+        .find(|table_info| table_info.table_name.eq_ignore_ascii_case(table_name))
+        .map(|table_info| table_info.create_table_sql.as_str())
+}
+
 async fn current_table_columns_for_row(
     table_name: &str,
     row_column_count: usize,
@@ -1162,7 +1432,12 @@ async fn resolve_table_map_column_info(
         return info;
     }
 
-    let create_table_columns = create_table_columns_for_table(config, info.table_name.as_str());
+    let create_table_column_lines =
+        create_table_column_lines_for_table(config, info.table_name.as_str());
+    let create_table_columns = create_table_column_lines
+        .iter()
+        .map(|(column_name, _)| column_name.clone())
+        .collect::<Vec<_>>();
     if create_table_columns.len() == info.column_count {
         let table_label = database_table_key(info.database_name.as_str(), info.table_name.as_str());
         warn!(
@@ -1171,6 +1446,61 @@ async fn resolve_table_map_column_info(
         );
         info.row_column_names = Some(create_table_columns.into_iter().map(Some).collect());
         return info;
+    }
+    if create_table_columns.len() + 1 == info.column_count {
+        let visible_type_categories = create_table_column_lines
+            .iter()
+            .map(|(_, column_definition)| {
+                create_table_column_type_category(column_definition.as_str())
+            })
+            .collect::<Vec<_>>();
+        let functional_hidden_ordinals =
+            create_table_sql_for_table(config, info.table_name.as_str())
+                .map(|create_table_sql| {
+                    functional_index_hidden_column_positions(
+                        create_table_sql,
+                        create_table_columns.as_slice(),
+                    )
+                    .into_iter()
+                    .filter(|hidden_ordinal| {
+                        hidden_column_position_matches_types(
+                            *hidden_ordinal,
+                            &visible_type_categories,
+                            &event.column_types,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+        let hidden_ordinal = if functional_hidden_ordinals.len() == 1 {
+            functional_hidden_ordinals.first().copied()
+        } else {
+            infer_single_hidden_column_position_by_types(
+                &visible_type_categories,
+                &event.column_types,
+            )
+        };
+        if let Some(hidden_ordinal) = hidden_ordinal {
+            let table_label =
+                database_table_key(info.database_name.as_str(), info.table_name.as_str());
+            warn!(
+                "MySQL binlog TableMap缺少列名元数据 table={} row_columns={} \
+                 create_table_columns={}; 根据TableMap列类型推断隐藏列位置 hidden_ordinal={} \
+                 functional_hidden_ordinals={:?} focus_positions={:?}",
+                table_label,
+                info.column_count,
+                create_table_columns.len(),
+                hidden_ordinal,
+                functional_hidden_ordinals,
+                focus_column_positions(&create_table_columns)
+            );
+            info.row_column_names = Some(row_column_names_with_hidden_position(
+                create_table_columns,
+                info.column_count,
+                hidden_ordinal,
+            ));
+            return info;
+        }
     }
     if !create_table_columns.is_empty() {
         let table_label = database_table_key(info.database_name.as_str(), info.table_name.as_str());
@@ -2386,6 +2716,105 @@ mod tests {
                 "checkTime".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn infers_hidden_column_position_by_table_map_types() {
+        let create_table_sql = r#"CREATE TABLE `charge_customerchargedetail` (
+  `bankCollectionLock` int(11) DEFAULT '0',
+  `checkTime` datetime DEFAULT NULL,
+  `uuid` varchar(64) DEFAULT NULL,
+  `beforePrice` decimal(10,2) DEFAULT NULL,
+  `settleDate` date DEFAULT NULL,
+  PRIMARY KEY (`uuid`)
+)"#;
+        let column_lines = column_lines_from_create_table_sql(create_table_sql);
+        let visible_type_categories = column_lines
+            .iter()
+            .map(|(_, column_definition)| {
+                create_table_column_type_category(column_definition.as_str())
+            })
+            .collect::<Vec<_>>();
+        let row_column_types = vec![
+            ColumnType::Long as u8,
+            ColumnType::DateTime2 as u8,
+            ColumnType::VarChar as u8,
+            ColumnType::Long as u8,
+            ColumnType::NewDecimal as u8,
+            ColumnType::Date as u8,
+        ];
+
+        assert_eq!(
+            infer_single_hidden_column_position_by_types(
+                &visible_type_categories,
+                &row_column_types
+            ),
+            Some(3)
+        );
+
+        let row_column_names = row_column_names_with_hidden_position(
+            column_lines
+                .into_iter()
+                .map(|(column_name, _)| column_name)
+                .collect(),
+            row_column_types.len(),
+            3,
+        );
+        assert_eq!(
+            row_column_names,
+            vec![
+                Some("bankCollectionLock".to_string()),
+                Some("checkTime".to_string()),
+                Some("uuid".to_string()),
+                None,
+                Some("beforePrice".to_string()),
+                Some("settleDate".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn functional_index_position_disambiguates_hidden_string_column() {
+        let create_table_sql = r#"CREATE TABLE `charge_customerchargedetail` (
+  `bankCollectionLock` int(11) DEFAULT '0',
+  `checkTime` datetime DEFAULT NULL,
+  `uuid` varchar(64) DEFAULT NULL,
+  `beforePrice` decimal(10,2) DEFAULT NULL,
+  `settleDate` date DEFAULT NULL,
+  KEY `idx_uuid_lower` ((lower(`uuid`)))
+)"#;
+        let column_lines = column_lines_from_create_table_sql(create_table_sql);
+        let columns = column_lines
+            .iter()
+            .map(|(column_name, _)| column_name.clone())
+            .collect::<Vec<_>>();
+        let visible_type_categories = column_lines
+            .iter()
+            .map(|(_, column_definition)| {
+                create_table_column_type_category(column_definition.as_str())
+            })
+            .collect::<Vec<_>>();
+        let row_column_types = vec![
+            ColumnType::Long as u8,
+            ColumnType::DateTime2 as u8,
+            ColumnType::VarChar as u8,
+            ColumnType::VarChar as u8,
+            ColumnType::NewDecimal as u8,
+            ColumnType::Date as u8,
+        ];
+
+        let candidates = functional_index_hidden_column_positions(create_table_sql, &columns)
+            .into_iter()
+            .filter(|hidden_ordinal| {
+                hidden_column_position_matches_types(
+                    *hidden_ordinal,
+                    &visible_type_categories,
+                    &row_column_types,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(candidates, vec![3]);
     }
 
     #[tokio::test]
