@@ -19,6 +19,7 @@ use mysql_binlog_connector_rust::column::column_value::ColumnValue;
 use mysql_binlog_connector_rust::column::json::json_binary::JsonBinary;
 use mysql_binlog_connector_rust::event::event_data::EventData;
 use mysql_binlog_connector_rust::event::row_event::RowEvent;
+use mysql_binlog_connector_rust::event::table_map_event::TableMapEvent;
 use regex::Regex;
 use serde::Deserialize;
 use serde::Serialize;
@@ -32,7 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 pub struct MySQLSource {
     streams: Vec<Option<BinlogStream>>,
@@ -61,6 +62,14 @@ struct MysqlStreamGroup {
     source_indices: Vec<usize>,
     start_binlog_filename: Option<String>,
     start_binlog_position: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct BinlogTableColumnInfo {
+    database_name: String,
+    table_name: String,
+    column_count: usize,
+    column_names: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -838,6 +847,113 @@ impl MySQLSource {
     }
 }
 
+fn binlog_table_column_info(event: &TableMapEvent) -> BinlogTableColumnInfo {
+    BinlogTableColumnInfo {
+        database_name: event.database_name.clone(),
+        table_name: event.table_name.clone(),
+        column_count: event.column_types.len(),
+        column_names: table_map_column_names(event),
+    }
+}
+
+fn table_map_column_names(event: &TableMapEvent) -> Option<Vec<String>> {
+    let metadata = event.table_metadata.as_ref()?;
+    if metadata.columns.len() != event.column_types.len() {
+        return None;
+    }
+
+    let column_names: Option<Vec<String>> = metadata
+        .columns
+        .iter()
+        .map(|column| column.column_name.clone())
+        .collect();
+    column_names.filter(|names| names.iter().all(|name| !name.is_empty()))
+}
+
+fn reconcile_row_columns(
+    table_label: &str,
+    mut columns: Vec<String>,
+    row_column_count: usize,
+    column_source: &str,
+) -> Vec<String> {
+    if columns.len() == row_column_count {
+        return columns;
+    }
+
+    warn!(
+        "MySQL binlog row列数与{}列数不一致 table={} row_columns={} {}_columns={}; \
+         将按可匹配列解析，多余字段值会被忽略。若字段不是尾部新增/删除，请重新初始化该表",
+        column_source,
+        table_label,
+        row_column_count,
+        column_source,
+        columns.len()
+    );
+    if columns.len() > row_column_count {
+        columns.truncate(row_column_count);
+    }
+    columns
+}
+
+async fn current_table_columns_for_row(
+    table_name: &str,
+    row_column_count: usize,
+    columns_map: &Mutex<CaseInsensitiveHashMapVecString>,
+    config: &MysqlSourceConfigDetail,
+    pool: &Pool<MySql>,
+) -> Vec<String> {
+    let table_key = config.source_table_key(table_name);
+    let mut columns = columns_map.lock().await.get(table_key.as_str());
+    if columns.is_empty() || columns.len() != row_column_count {
+        let columns_new = config.fill_table_column(table_name, pool).await;
+        columns = columns_new.clone();
+        columns_map.lock().await.insert(table_key, columns_new);
+    }
+    columns
+}
+
+async fn resolve_table_map_column_info(
+    event: &TableMapEvent,
+    existing: Option<&BinlogTableColumnInfo>,
+    columns_map: &Mutex<CaseInsensitiveHashMapVecString>,
+    config: &MysqlSourceConfigDetail,
+    pool: &Pool<MySql>,
+) -> BinlogTableColumnInfo {
+    let mut info = binlog_table_column_info(event);
+    if info.column_names.is_some() {
+        return info;
+    }
+
+    if let Some(existing) = existing
+        && existing
+            .database_name
+            .eq_ignore_ascii_case(&info.database_name)
+        && existing.table_name.eq_ignore_ascii_case(&info.table_name)
+        && existing.column_count == info.column_count
+        && existing.column_names.is_some()
+    {
+        info.column_names = existing.column_names.clone();
+        return info;
+    }
+
+    let current_columns = current_table_columns_for_row(
+        info.table_name.as_str(),
+        info.column_count,
+        columns_map,
+        config,
+        pool,
+    )
+    .await;
+    let table_label = database_table_key(info.database_name.as_str(), info.table_name.as_str());
+    info.column_names = Some(reconcile_row_columns(
+        table_label.as_str(),
+        current_columns,
+        info.column_count,
+        "当前表结构",
+    ));
+    info
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResumePosition {
     Latest,
@@ -1065,6 +1181,8 @@ impl Source for MySQLSource {
         // 这里获取列名
         let mut table_map = HashMap::new();
         let mut table_database_map = HashMap::new();
+        let mut table_column_info_map: HashMap<(usize, u64), BinlogTableColumnInfo> =
+            HashMap::new();
         let mut last_checkpoint_save = Instant::now();
         loop {
             if last_checkpoint_save.elapsed().as_secs() >= 5 {
@@ -1083,11 +1201,30 @@ impl Source for MySQLSource {
                                     event.binlog_filename.clone();
                             }
                             EventData::TableMap(event) => {
+                                let key = (i, event.table_id);
+                                let column_info = match self.source_index_for_event(
+                                    i,
+                                    event.database_name.as_str(),
+                                    event.table_name.as_str(),
+                                ) {
+                                    Some(source_index) => {
+                                        resolve_table_map_column_info(
+                                            &event,
+                                            table_column_info_map.get(&key),
+                                            &columns,
+                                            &self.mysql_source[source_index],
+                                            &self.pools[source_index],
+                                        )
+                                        .await
+                                    }
+                                    None => binlog_table_column_info(&event),
+                                };
                                 let table_name = event.table_name;
                                 let table_id = event.table_id;
                                 let database_name = event.database_name;
                                 table_map.insert((i, table_id), table_name);
                                 table_database_map.insert((i, table_id), database_name);
+                                table_column_info_map.insert(key, column_info);
                             }
                             EventData::WriteRows(event) => {
                                 let table_name = table_map
@@ -1118,6 +1255,8 @@ impl Source for MySQLSource {
                                     database_name.as_str(),
                                     table_name.as_str(),
                                 );
+                                let binlog_columns =
+                                    table_column_info_map.get(&(i, event.table_id)).cloned();
                                 let mut to_modify = self.checkpoint_entities.lock().await
                                     [source_index]
                                     .lock()
@@ -1154,6 +1293,7 @@ impl Source for MySQLSource {
                                             &mut columns,
                                             config,
                                             pool,
+                                            binlog_columns.as_ref(),
                                         )
                                         .await;
                                         let op = Operation::CREATE(false);
@@ -1244,6 +1384,8 @@ impl Source for MySQLSource {
                                     database_name.as_str(),
                                     table_name.as_str(),
                                 );
+                                let binlog_columns =
+                                    table_column_info_map.get(&(i, event.table_id)).cloned();
                                 let mut to_modify = self.checkpoint_entities.lock().await
                                     [source_index]
                                     .lock()
@@ -1277,6 +1419,7 @@ impl Source for MySQLSource {
                                             &mut columns,
                                             config,
                                             pool,
+                                            binlog_columns.as_ref(),
                                         )
                                         .await;
                                         let after: CaseInsensitiveHashMap =
@@ -1369,6 +1512,8 @@ impl Source for MySQLSource {
                                     database_name.as_str(),
                                     table_name.as_str(),
                                 );
+                                let binlog_columns =
+                                    table_column_info_map.get(&(i, event.table_id)).cloned();
                                 let mut to_modify = self.checkpoint_entities.lock().await
                                     [source_index]
                                     .lock()
@@ -1402,6 +1547,7 @@ impl Source for MySQLSource {
                                             &mut columns,
                                             config,
                                             pool,
+                                            binlog_columns.as_ref(),
                                         )
                                         .await;
                                         let after: CaseInsensitiveHashMap = parse_row(
@@ -1410,6 +1556,7 @@ impl Source for MySQLSource {
                                             &mut columns,
                                             config,
                                             pool,
+                                            binlog_columns.as_ref(),
                                         )
                                         .await;
                                         let op = Operation::UPDATE;
@@ -1590,30 +1737,61 @@ impl Source for MySQLSource {
 async fn parse_row(
     row: RowEvent,
     table_name: &str,
-    columns_map: &mut Mutex<CaseInsensitiveHashMapVecString>,
+    columns_map: &Mutex<CaseInsensitiveHashMapVecString>,
     config: &MysqlSourceConfigDetail,
     pool: &mut Pool<MySql>,
+    binlog_columns: Option<&BinlogTableColumnInfo>,
 ) -> CaseInsensitiveHashMap {
     let mut data: HashMap<String, Value> = HashMap::new();
-    let mut index = 0;
     let table_key = config.source_table_key(table_name);
-    let mut columns = columns_map.lock().await.get(table_key.as_str());
-    if columns.len() != row.column_values.len() {
-        let columns_new = config.fill_table_column(table_name, pool).await;
-        columns.clear();
-        columns.extend(columns_new);
-        columns_map
-            .lock()
-            .await
-            .insert(table_key.clone(), columns.clone());
-    }
-    if columns.len() != row.column_values.len() {
-        panic!("columns length not equal to column_values length");
-    }
+    let row_column_count = row.column_values.len();
+    let columns = if let Some(binlog_columns) = binlog_columns {
+        if binlog_columns.column_count != row_column_count {
+            warn!(
+                "MySQL TableMap列数与RowEvent列数不一致 table={} table_map_columns={} row_columns={}",
+                table_key, binlog_columns.column_count, row_column_count
+            );
+        }
+        if let Some(column_names) = binlog_columns.column_names.as_ref() {
+            reconcile_row_columns(
+                table_key.as_str(),
+                column_names.clone(),
+                row_column_count,
+                "binlog TableMap",
+            )
+        } else {
+            let current_columns = current_table_columns_for_row(
+                table_name,
+                row_column_count,
+                columns_map,
+                config,
+                pool,
+            )
+            .await;
+            reconcile_row_columns(
+                table_key.as_str(),
+                current_columns,
+                row_column_count,
+                "当前表结构",
+            )
+        }
+    } else {
+        let current_columns =
+            current_table_columns_for_row(table_name, row_column_count, columns_map, config, pool)
+                .await;
+        reconcile_row_columns(
+            table_key.as_str(),
+            current_columns,
+            row_column_count,
+            "当前表结构",
+        )
+    };
 
-    for column_value in row.column_values {
+    for (index, column_value) in row.column_values.into_iter().enumerate() {
         // TODO 这里可能存在问题，直接用顺序的索引来获取column_name，会导致字段对不上
-        let column_name = columns[index].clone();
+        let Some(column_name) = columns.get(index).cloned() else {
+            continue;
+        };
         match column_value {
             ColumnValue::None => {
                 data.insert(column_name, Value::None);
@@ -1698,8 +1876,6 @@ async fn parse_row(
                 panic!("unsupported column value type")
             }
         }
-
-        index += 1;
     }
     CaseInsensitiveHashMap::new(data)
 }
@@ -1707,6 +1883,9 @@ async fn parse_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mysql_binlog_connector_rust::event::table_map::table_metadata::{
+        ColumnMetadata, TableMetadata,
+    };
 
     fn mk_entity(
         is_new: bool,
@@ -1722,6 +1901,127 @@ mod tests {
             checkpoint_filepath: "x".to_string(),
             table: table.to_string(),
         }
+    }
+
+    fn table_map_event_with_column_names(names: Vec<Option<&str>>) -> TableMapEvent {
+        let columns = names
+            .iter()
+            .map(|name| ColumnMetadata {
+                column_name: name.map(str::to_string),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        TableMapEvent {
+            table_id: 1,
+            database_name: "source_db".to_string(),
+            table_name: "orders".to_string(),
+            column_types: vec![3; columns.len()],
+            column_metas: vec![0; columns.len()],
+            null_bits: vec![false; columns.len()],
+            table_metadata: Some(TableMetadata {
+                default_charset: None,
+                enum_and_set_default_charset: None,
+                columns,
+            }),
+        }
+    }
+
+    #[test]
+    fn table_map_column_names_reads_complete_metadata() {
+        let event = table_map_event_with_column_names(vec![Some("id"), Some("name")]);
+
+        assert_eq!(
+            table_map_column_names(&event),
+            Some(vec!["id".to_string(), "name".to_string()])
+        );
+    }
+
+    #[test]
+    fn table_map_column_names_requires_complete_names() {
+        let event = table_map_event_with_column_names(vec![Some("id"), None]);
+
+        assert_eq!(table_map_column_names(&event), None);
+    }
+
+    #[test]
+    fn reconcile_row_columns_truncates_extra_columns() {
+        let columns = vec![
+            "id".to_string(),
+            "name".to_string(),
+            "created_at".to_string(),
+        ];
+
+        assert_eq!(
+            reconcile_row_columns("source_db.orders", columns, 2, "当前表结构"),
+            vec!["id".to_string(), "name".to_string()]
+        );
+    }
+
+    #[test]
+    fn reconcile_row_columns_keeps_short_columns() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+
+        assert_eq!(
+            reconcile_row_columns("source_db.orders", columns.clone(), 3, "当前表结构"),
+            columns
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_row_uses_binlog_columns_without_schema_lookup() {
+        let config = MysqlSourceConfigDetail {
+            username: "".to_string(),
+            password: "".to_string(),
+            host: "".to_string(),
+            port: "".to_string(),
+            database: "source_db".to_string(),
+            target_database: "target_db".to_string(),
+            server_id: 1,
+            connection_url: "".to_string(),
+            table_info_list: vec![],
+            batchsize: 100,
+            start_binlog_filename: None,
+            start_binlog_position: None,
+        };
+        let mut pool =
+            sqlx::Pool::<sqlx::MySql>::connect_lazy("mysql://root:password@localhost/source_db")
+                .unwrap();
+        let columns_map = Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg());
+        let binlog_columns = BinlogTableColumnInfo {
+            database_name: "source_db".to_string(),
+            table_name: "orders".to_string(),
+            column_count: 3,
+            column_names: Some(vec![
+                "id".to_string(),
+                "name".to_string(),
+                "created_at".to_string(),
+            ]),
+        };
+        let row = RowEvent {
+            column_values: vec![
+                ColumnValue::Long(7),
+                ColumnValue::String(b"order-7".to_vec()),
+            ],
+        };
+
+        let parsed = parse_row(
+            row,
+            "orders",
+            &columns_map,
+            &config,
+            &mut pool,
+            Some(&binlog_columns),
+        )
+        .await;
+
+        assert_eq!(parsed.len(), 2);
+        assert!(matches!(parsed.get("id"), &Value::Int32(7)));
+        match parsed.get("name") {
+            Value::String(name) => assert_eq!(name, "order-7"),
+            other => panic!("unexpected name value: {:?}", other),
+        }
+        assert!(parsed.get("created_at").is_none());
     }
 
     #[test]
