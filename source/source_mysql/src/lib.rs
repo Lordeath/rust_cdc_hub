@@ -897,6 +897,7 @@ fn align_current_columns_to_row_columns(
     columns: Vec<String>,
     row_column_count: usize,
     visibility: Option<Vec<bool>>,
+    generated_columns: &[(usize, String)],
     column_source: &str,
 ) -> Vec<Option<String>> {
     if columns.len() == row_column_count {
@@ -923,6 +924,36 @@ fn align_current_columns_to_row_columns(
             column_source,
             columns.len()
         );
+    }
+
+    if columns.len() + generated_columns.len() == row_column_count
+        && generated_columns
+            .iter()
+            .all(|(ordinal, _)| *ordinal < row_column_count)
+    {
+        warn!(
+            "MySQL binlog row列数与{}列数不一致 table={} row_columns={} {}_columns={}; \
+             根据SHOW CREATE TABLE中的生成列位置跳过: {:?}",
+            column_source,
+            table_label,
+            row_column_count,
+            column_source,
+            columns.len(),
+            generated_columns
+        );
+        let mut columns = columns.into_iter();
+        return (0..row_column_count)
+            .map(|ordinal| {
+                if generated_columns
+                    .iter()
+                    .any(|(generated_ordinal, _)| *generated_ordinal == ordinal)
+                {
+                    None
+                } else {
+                    columns.next()
+                }
+            })
+            .collect();
     }
 
     warn!(
@@ -968,6 +999,44 @@ fn reconcile_row_column_names(
         column_names.resize(row_column_count, None);
     }
     column_names
+}
+
+fn generated_columns_from_create_table_sql(create_table_sql: &str) -> Vec<(usize, String)> {
+    let mut result = vec![];
+    let mut ordinal = 0usize;
+    for raw_line in create_table_sql.lines() {
+        let line = raw_line.trim();
+        if !line.starts_with('`') {
+            continue;
+        }
+        let Some(second_tick) = line[1..].find('`').map(|i| i + 1) else {
+            continue;
+        };
+        let column_name = line[1..second_tick].to_string();
+        let line_lower = line.to_ascii_lowercase();
+        if line_lower.contains("generated always")
+            || line_lower.contains("stored generated")
+            || line_lower.contains("virtual generated")
+        {
+            result.push((ordinal, column_name));
+        }
+        ordinal += 1;
+    }
+    result
+}
+
+fn generated_columns_for_table(
+    config: &MysqlSourceConfigDetail,
+    table_name: &str,
+) -> Vec<(usize, String)> {
+    config
+        .table_info_list
+        .iter()
+        .find(|table_info| table_info.table_name.eq_ignore_ascii_case(table_name))
+        .map(|table_info| {
+            generated_columns_from_create_table_sql(table_info.create_table_sql.as_str())
+        })
+        .unwrap_or_default()
 }
 
 async fn current_table_columns_for_row(
@@ -1025,6 +1094,7 @@ async fn resolve_table_map_column_info(
         current_columns,
         info.column_count,
         table_map_column_visibility(event),
+        &generated_columns_for_table(config, info.table_name.as_str()),
         "当前表结构",
     ));
     info
@@ -1849,6 +1919,7 @@ async fn parse_row(
                 current_columns,
                 row_column_count,
                 None,
+                &generated_columns_for_table(config, table_name),
                 "当前表结构",
             )
         }
@@ -1861,6 +1932,7 @@ async fn parse_row(
             current_columns,
             row_column_count,
             None,
+            &generated_columns_for_table(config, table_name),
             "当前表结构",
         )
     };
@@ -2061,6 +2133,7 @@ mod tests {
                 columns,
                 2,
                 None,
+                &[],
                 "当前表结构"
             ),
             vec![Some("id".to_string()), Some("name".to_string())]
@@ -2077,6 +2150,7 @@ mod tests {
                 columns,
                 3,
                 None,
+                &[],
                 "当前表结构"
             ),
             vec![Some("id".to_string()), Some("name".to_string()), None]
@@ -2094,9 +2168,52 @@ mod tests {
                 columns,
                 3,
                 table_map_column_visibility(&event),
+                &[],
                 "当前表结构"
             ),
             vec![Some("id".to_string()), None, Some("settleDate".to_string())]
+        );
+    }
+
+    #[test]
+    fn align_current_columns_uses_generated_columns_from_show_create_table() {
+        let columns = vec![
+            "path".to_string(),
+            "HouseId".to_string(),
+            "settleDate".to_string(),
+        ];
+
+        assert_eq!(
+            align_current_columns_to_row_columns(
+                "source_db.orders",
+                columns,
+                4,
+                None,
+                &[(2, "fullPath".to_string())],
+                "当前表结构"
+            ),
+            vec![
+                Some("path".to_string()),
+                Some("HouseId".to_string()),
+                None,
+                Some("settleDate".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn generated_columns_from_create_table_sql_reads_ordinals() {
+        let create_table_sql = r#"CREATE TABLE `charge_customerchargedetail` (
+  `path` varchar(100) DEFAULT NULL,
+  `HouseId` bigint(20) NOT NULL,
+  `fullPath` varchar(120) GENERATED ALWAYS AS (concat(`path`,`HouseId`,_utf8mb3'/')) STORED,
+  `settleDate` date DEFAULT NULL,
+  PRIMARY KEY (`HouseId`)
+)"#;
+
+        assert_eq!(
+            generated_columns_from_create_table_sql(create_table_sql),
+            vec![(2, "fullPath".to_string())]
         );
     }
 

@@ -495,6 +495,7 @@ impl MySqlSink {
             Ok(ok) => Ok(ok),
             Err(err) => {
                 error!("Failed to execute query: {} 进行重试, sql: {}", err, sql);
+                Self::log_upsert_debug_rows(table_name, columns, inserts);
                 let new_pool =
                     get_mysql_pool_by_url(connection_url, "sql执行遇到报错，尝试重新获取连接")
                         .await
@@ -505,6 +506,64 @@ impl MySqlSink {
                     .await
                     .map_err(|e| e.to_string())
             }
+        }
+    }
+
+    fn log_upsert_debug_rows(
+        table_name: &str,
+        columns: &[String],
+        inserts: &[common::case_insensitive_hash_map::CaseInsensitiveHashMap],
+    ) {
+        let mut debug_columns: Vec<String> = vec![];
+        let mut seen = HashSet::new();
+        let preferred_columns = [
+            "Id",
+            "path",
+            "HouseId",
+            "fullPath",
+            "buildingName",
+            "Sequence",
+            "settleDate",
+            "ShouldChargeDate",
+            "stage",
+            "standrdId",
+        ];
+
+        for preferred in preferred_columns {
+            if let Some(column) = columns
+                .iter()
+                .find(|column| column.eq_ignore_ascii_case(preferred))
+                && seen.insert(column.to_ascii_lowercase())
+            {
+                debug_columns.push(column.clone());
+            }
+        }
+
+        if let Some(settle_date_index) = columns
+            .iter()
+            .position(|column| column.eq_ignore_ascii_case("settleDate"))
+        {
+            let start = settle_date_index.saturating_sub(5);
+            let end = (settle_date_index + 5).min(columns.len().saturating_sub(1));
+            for column in &columns[start..=end] {
+                if seen.insert(column.to_ascii_lowercase()) {
+                    debug_columns.push(column.clone());
+                }
+            }
+        }
+
+        for (row_index, row) in inserts.iter().take(3).enumerate() {
+            let values = debug_columns
+                .iter()
+                .map(|column| format!("{}={:?}", column, row.get(column)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            error!(
+                "MySQL UPSERT debug table={} row={} values: {}",
+                table_name,
+                row_index + 1,
+                values
+            );
         }
     }
 
