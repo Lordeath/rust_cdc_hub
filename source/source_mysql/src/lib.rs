@@ -1004,15 +1004,7 @@ fn reconcile_row_column_names(
 fn generated_columns_from_create_table_sql(create_table_sql: &str) -> Vec<(usize, String)> {
     let mut result = vec![];
     let mut ordinal = 0usize;
-    for raw_line in create_table_sql.lines() {
-        let line = raw_line.trim();
-        if !line.starts_with('`') {
-            continue;
-        }
-        let Some(second_tick) = line[1..].find('`').map(|i| i + 1) else {
-            continue;
-        };
-        let column_name = line[1..second_tick].to_string();
+    for (column_name, line) in column_lines_from_create_table_sql(create_table_sql) {
         let line_lower = line.to_ascii_lowercase();
         if line_lower.contains("generated always")
             || line_lower.contains("stored generated")
@@ -1021,6 +1013,28 @@ fn generated_columns_from_create_table_sql(create_table_sql: &str) -> Vec<(usize
             result.push((ordinal, column_name));
         }
         ordinal += 1;
+    }
+    result
+}
+
+fn column_names_from_create_table_sql(create_table_sql: &str) -> Vec<String> {
+    column_lines_from_create_table_sql(create_table_sql)
+        .into_iter()
+        .map(|(column_name, _)| column_name)
+        .collect()
+}
+
+fn column_lines_from_create_table_sql(create_table_sql: &str) -> Vec<(String, String)> {
+    let mut result = vec![];
+    for raw_line in create_table_sql.lines() {
+        let line = raw_line.trim();
+        if !line.starts_with('`') {
+            continue;
+        }
+        let Some(second_tick) = line[1..].find('`').map(|i| i + 1) else {
+            continue;
+        };
+        result.push((line[1..second_tick].to_string(), line.to_string()));
     }
     result
 }
@@ -1036,6 +1050,18 @@ fn generated_columns_for_table(
         .map(|table_info| {
             generated_columns_from_create_table_sql(table_info.create_table_sql.as_str())
         })
+        .unwrap_or_default()
+}
+
+fn create_table_columns_for_table(
+    config: &MysqlSourceConfigDetail,
+    table_name: &str,
+) -> Vec<String> {
+    config
+        .table_info_list
+        .iter()
+        .find(|table_info| table_info.table_name.eq_ignore_ascii_case(table_name))
+        .map(|table_info| column_names_from_create_table_sql(table_info.create_table_sql.as_str()))
         .unwrap_or_default()
 }
 
@@ -1077,6 +1103,17 @@ async fn resolve_table_map_column_info(
         && existing.row_column_names.is_some()
     {
         info.row_column_names = existing.row_column_names.clone();
+        return info;
+    }
+
+    let create_table_columns = create_table_columns_for_table(config, info.table_name.as_str());
+    if create_table_columns.len() == info.column_count {
+        let table_label = database_table_key(info.database_name.as_str(), info.table_name.as_str());
+        warn!(
+            "MySQL binlog TableMap缺少列名元数据 table={} row_columns={}; 使用SHOW CREATE TABLE完整列顺序对齐",
+            table_label, info.column_count
+        );
+        info.row_column_names = Some(create_table_columns.into_iter().map(Some).collect());
         return info;
     }
 
@@ -1906,6 +1943,33 @@ async fn parse_row(
                 "binlog TableMap",
             )
         } else {
+            let create_table_columns = create_table_columns_for_table(config, table_name);
+            if create_table_columns.len() == row_column_count {
+                create_table_columns.into_iter().map(Some).collect()
+            } else {
+                let current_columns = current_table_columns_for_row(
+                    table_name,
+                    row_column_count,
+                    columns_map,
+                    config,
+                    pool,
+                )
+                .await;
+                align_current_columns_to_row_columns(
+                    table_key.as_str(),
+                    current_columns,
+                    row_column_count,
+                    None,
+                    &generated_columns_for_table(config, table_name),
+                    "当前表结构",
+                )
+            }
+        }
+    } else {
+        let create_table_columns = create_table_columns_for_table(config, table_name);
+        if create_table_columns.len() == row_column_count {
+            create_table_columns.into_iter().map(Some).collect()
+        } else {
             let current_columns = current_table_columns_for_row(
                 table_name,
                 row_column_count,
@@ -1923,18 +1987,6 @@ async fn parse_row(
                 "当前表结构",
             )
         }
-    } else {
-        let current_columns =
-            current_table_columns_for_row(table_name, row_column_count, columns_map, config, pool)
-                .await;
-        align_current_columns_to_row_columns(
-            table_key.as_str(),
-            current_columns,
-            row_column_count,
-            None,
-            &generated_columns_for_table(config, table_name),
-            "当前表结构",
-        )
     };
 
     for (index, column_value) in row.column_values.into_iter().enumerate() {
@@ -2214,6 +2266,29 @@ mod tests {
         assert_eq!(
             generated_columns_from_create_table_sql(create_table_sql),
             vec![(2, "fullPath".to_string())]
+        );
+    }
+
+    #[test]
+    fn column_names_from_create_table_sql_keeps_generated_columns() {
+        let create_table_sql = r#"CREATE TABLE `charge_customerchargedetail` (
+  `path` varchar(100) DEFAULT NULL,
+  `HouseId` bigint(20) NOT NULL,
+  `fullPath` varchar(120) GENERATED ALWAYS AS (concat(`path`,`HouseId`,_utf8mb3'/')) STORED,
+  `bankCollectionLock` int(11) DEFAULT '0',
+  `checkTime` datetime DEFAULT NULL,
+  PRIMARY KEY (`HouseId`)
+)"#;
+
+        assert_eq!(
+            column_names_from_create_table_sql(create_table_sql),
+            vec![
+                "path".to_string(),
+                "HouseId".to_string(),
+                "fullPath".to_string(),
+                "bankCollectionLock".to_string(),
+                "checkTime".to_string()
+            ]
         );
     }
 
