@@ -124,7 +124,7 @@ export CONFIG_PATH=/path/to/config.yaml
 | `sink_type` | 是 | Sink 类型：`MySQL`、`Starrocks`、`MeiliSearch`、`Dameng`、`Print`。 |
 | `source_config` | 是 | Source 连接与同步配置列表。 |
 | `sink_config` | 是 | Sink 连接与写入配置列表。 |
-| `multi_mode` | 否 | 多库同步模式配置，默认关闭；第一版仅支持 MySQL → MySQL。 |
+| `multi_mode` | 否 | 多库同步模式配置，默认关闭；当前支持 MySQL → MySQL/Dameng。 |
 | `auto_create_database` | 否 | 是否自动建库，默认 `true`。 |
 | `auto_create_table` | 否 | 是否自动建表，默认 `true`。 |
 | `auto_add_column` | 否 | 是否自动加字段。 |
@@ -153,9 +153,9 @@ export CONFIG_PATH=/path/to/config.yaml
 
 主键列会从 MySQL 表结构自动识别；参与同步的表需要单一 `bigint`/`bigint unsigned` 主键。MeiliSearch 目标端的 `meili_table_pk` 仍需单独配置为索引主键字段。
 
-### 多库同步模式（MySQL → MySQL）
+### 多库同步模式（MySQL → MySQL/Dameng）
 
-`multi_mode.open: true` 后，单个 `source_config[0].database` 可以用逗号配置多个源库，单个 `sink_config[0].database` 可以用逗号配置目标库清单；`database_route` 必须显式覆盖每个源库。
+`multi_mode.open: true` 后，单个 `source_config[0].database` 可以用逗号配置多个源库，单个 `sink_config[0].database` 可以用逗号配置目标库清单；达梦目标端也可以用 `sink_config[0].schema` 配置目标 schema 清单，若配置了 `schema` 会优先作为达梦目标清单。`database_route` 必须显式覆盖每个源库。
 
 ```yaml
 source_type: MySQL
@@ -186,7 +186,7 @@ multi_mode:
       sink: newsee-system-test
 ```
 
-多库模式下只创建一个 binlog stream 读取同一 host 的 binlog；初始化阶段按源库并行抽取，`init_parallelism` 默认 `4`。表过滤规则（`table_name`、`include_table_regex`、`exclude_table_regex`、`except_table_name_prefix`）对所有源库共用。允许多个源库路由到同一个目标库/表，但源表主键、字段和字段类型必须一致。
+多库模式下只创建一个 binlog stream 读取同一 host 的 binlog；初始化阶段按源库并行抽取，`init_parallelism` 默认 `4`。表过滤规则（`table_name`、`include_table_regex`、`exclude_table_regex`、`except_table_name_prefix`）对所有源库共用。允许多个源库路由到同一个目标库/schema 下的同名表，但源表主键、字段和字段类型必须一致。
 
 ### MySQL → MySQL 示例
 
@@ -265,7 +265,7 @@ auto_create_table: true
 auto_add_column: true
 ```
 
-达梦是单库多模式模型，`sink_config.database`/`sink_config.schema` 会作为目标 schema 使用；开启 `auto_create_database` 时会执行 `CREATE SCHEMA`，然后切换到该 schema 再自动建表/补列。
+达梦是单库多模式模型，`sink_config.database`/`sink_config.schema` 会作为目标 schema 使用；开启 `auto_create_database` 时会执行 `CREATE SCHEMA`，然后切换到该 schema 再自动建表/补列。多库模式下，`database_route[].sink` 表示目标 schema，写入、建表、补列和 `IDENTITY_INSERT` 状态都会按目标 schema 隔离。
 
 ### MySQL → Print 示例
 

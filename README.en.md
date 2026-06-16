@@ -124,7 +124,7 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 | `sink_type` | Yes | Sink type: `MySQL`, `Starrocks`, `MeiliSearch`, `Dameng`, or `Print`. |
 | `source_config` | Yes | Source connection and sync settings. |
 | `sink_config` | Yes | Sink connection and write settings. |
-| `multi_mode` | No | Multi-database sync mode. Disabled by default; first version supports MySQL → MySQL only. |
+| `multi_mode` | No | Multi-database sync mode. Disabled by default; currently supports MySQL → MySQL/Dameng. |
 | `auto_create_database` | No | Create target databases automatically. Defaults to `true`. |
 | `auto_create_table` | No | Create target tables automatically. Defaults to `true`. |
 | `auto_add_column` | No | Add missing target columns automatically. |
@@ -152,9 +152,9 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 
 The primary-key column is detected from the MySQL table schema automatically. Synchronized source tables need exactly one `bigint`/`bigint unsigned` primary key. `meili_table_pk` is still required for the MeiliSearch sink because it defines the target index primary key.
 
-### Multi-database sync mode (MySQL → MySQL)
+### Multi-database sync mode (MySQL → MySQL/Dameng)
 
-When `multi_mode.open: true`, `source_config[0].database` may contain comma-separated source databases and `sink_config[0].database` may contain a comma-separated target database allow-list. `database_route` must explicitly cover every source database.
+When `multi_mode.open: true`, `source_config[0].database` may contain comma-separated source databases and `sink_config[0].database` may contain a comma-separated target database allow-list. For Dameng, `sink_config[0].schema` may also contain the comma-separated target schema allow-list; when `schema` is configured, it is preferred as the Dameng target list. `database_route` must explicitly cover every source database.
 
 ```yaml
 source_type: MySQL
@@ -185,7 +185,7 @@ multi_mode:
       sink: newsee-system-test
 ```
 
-Multi mode uses one binlog stream for the same source host and initializes source databases in parallel. `init_parallelism` defaults to `4`. Table filters (`table_name`, `include_table_regex`, `exclude_table_regex`, `except_table_name_prefix`) are shared by all source databases. Multiple source databases may route to the same target database/table, but their primary key, columns, and column types must match.
+Multi mode uses one binlog stream for the same source host and initializes source databases in parallel. `init_parallelism` defaults to `4`. Table filters (`table_name`, `include_table_regex`, `exclude_table_regex`, `except_table_name_prefix`) are shared by all source databases. Multiple source databases may route to the same target database/schema and table, but their primary key, columns, and column types must match.
 
 ### MySQL → MySQL example
 
@@ -264,7 +264,7 @@ auto_create_table: true
 auto_add_column: true
 ```
 
-Dameng uses a single-database, multi-schema model. `sink_config.database`/`sink_config.schema` is treated as the target schema; when `auto_create_database` is enabled, the sink runs `CREATE SCHEMA`, switches to that schema, and then creates tables/adds columns as needed.
+Dameng uses a single-database, multi-schema model. `sink_config.database`/`sink_config.schema` is treated as the target schema; when `auto_create_database` is enabled, the sink runs `CREATE SCHEMA`, switches to that schema, and then creates tables/adds columns as needed. In multi mode, `database_route[].sink` is the target schema, and writes, table creation, column migration, and `IDENTITY_INSERT` state are isolated by target schema.
 
 ### MySQL → Print example
 

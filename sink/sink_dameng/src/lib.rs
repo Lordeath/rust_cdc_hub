@@ -8,7 +8,10 @@ use common::schema::{
     extract_mysql_create_table_column_definitions, mysql_column_allows_null_from_definition,
     mysql_column_is_auto_increment_from_definition, mysql_type_token_from_column_definition,
 };
-use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value};
+use common::{
+    CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value,
+    database_table_key,
+};
 use dameng::Client;
 use dameng::ToDmValue;
 use dameng_types::DmValue;
@@ -85,7 +88,7 @@ impl DamengSink {
         let port = config.first_sink("port").parse::<u16>().unwrap_or(5236);
         let username = config.first_sink_not_blank("username");
         let password = config.first_sink_not_blank("password");
-        let schema = {
+        let configured_schema = {
             let schema = config.first_sink("schema");
             if schema.is_empty() {
                 config.first_sink("database")
@@ -93,6 +96,14 @@ impl DamengSink {
                 schema
             }
         };
+        let schema = config
+            .sink_databases()
+            .into_iter()
+            .find(|schema| !schema.trim().is_empty())
+            .unwrap_or(configured_schema);
+        if let Err(e) = Self::validate_merged_target_schema(&table_info_list, schema.as_str()) {
+            panic!("{}", e);
+        }
 
         let client = Self::connect_client(&host, port, &username, &password)
             .unwrap_or_else(|e| panic!("Failed to connect to Dameng: {}", e));
@@ -153,41 +164,55 @@ impl DamengSink {
 
     async fn ensure_schema(&self) -> Result<(), String> {
         for table_info in &self.table_info_list {
-            self.ensure_table(table_info).await.map_err(|e| {
-                format!(
-                    "Dameng ensure table failed: {} {}",
-                    table_info.table_name, e
-                )
-            })?;
-            self.ensure_columns(table_info).await.map_err(|e| {
-                format!(
-                    "Dameng ensure columns failed: {} {}",
-                    table_info.table_name, e
-                )
-            })?;
+            let schema = Self::table_info_target_schema(table_info, self.schema.as_str());
+            self.ensure_table(schema.as_str(), table_info)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Dameng ensure table failed: {} {}",
+                        Self::target_table_key(schema.as_str(), table_info.table_name.as_str()),
+                        e
+                    )
+                })?;
+            self.ensure_columns(schema.as_str(), table_info)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Dameng ensure columns failed: {} {}",
+                        Self::target_table_key(schema.as_str(), table_info.table_name.as_str()),
+                        e
+                    )
+                })?;
         }
         Ok(())
     }
 
     async fn ensure_database(&self) -> Result<(), String> {
-        if self.schema.is_empty() {
+        for schema in self.target_schemas() {
+            self.ensure_database_schema(schema.as_str()).await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_database_schema(&self, schema: &str) -> Result<(), String> {
+        if schema.is_empty() {
             return Ok(());
         }
 
-        let set_schema_sql = Self::set_schema_sql(self.schema.as_str());
+        let set_schema_sql = Self::set_schema_sql(schema);
         match self.execute(set_schema_sql.as_str()).await {
             Ok(_) => return Ok(()),
             Err(e) if !self.auto_create_database => {
                 return Err(format!(
                     "target schema {} is unavailable and auto_create_database is false: {}",
-                    self.schema, e
+                    schema, e
                 ));
             }
             Err(set_schema_error) => {
-                let create_schema_sql = Self::create_schema_sql(self.schema.as_str());
+                let create_schema_sql = Self::create_schema_sql(schema);
                 match self.execute(create_schema_sql.as_str()).await {
                     Ok(_) => {
-                        info!("Dameng auto create schema success: {}", self.schema);
+                        info!("Dameng auto create schema success: {}", schema);
                     }
                     Err(create_schema_error) => match self.execute(set_schema_sql.as_str()).await {
                         Ok(_) => return Ok(()),
@@ -205,11 +230,14 @@ impl DamengSink {
         }
     }
 
-    async fn ensure_table(&self, table_info: &TableInfoVo) -> Result<(), String> {
+    async fn ensure_table(&self, schema: &str, table_info: &TableInfoVo) -> Result<(), String> {
         if !self.auto_create_table {
             return Ok(());
         }
-        if self.table_exists(table_info.table_name.as_str()).await? {
+        if self
+            .table_exists(schema, table_info.table_name.as_str())
+            .await?
+        {
             return Ok(());
         }
 
@@ -249,28 +277,28 @@ impl DamengSink {
         ));
         let sql = format!(
             "CREATE TABLE {} ({})",
-            self.qualified_table(table_info.table_name.as_str()),
+            Self::qualified_table(schema, table_info.table_name.as_str()),
             cols_sql.join(", ")
         );
         self.execute(sql.as_str()).await?;
         info!(
             "Dameng auto create table success: {}",
-            table_info.table_name
+            Self::target_table_key(schema, table_info.table_name.as_str())
         );
         Ok(())
     }
 
-    async fn ensure_columns(&self, table_info: &TableInfoVo) -> Result<(), String> {
+    async fn ensure_columns(&self, schema: &str, table_info: &TableInfoVo) -> Result<(), String> {
         if !self.auto_add_column && !self.auto_modify_column {
             return Ok(());
         }
         let existing_cols = self
-            .existing_columns(table_info.table_name.as_str())
+            .existing_columns(schema, table_info.table_name.as_str())
             .await?;
         if existing_cols.is_empty() {
             warn!(
                 "Dameng target table metadata is empty, skip column check: {} auto_create_table={} auto_add_column={} auto_modify_column={}",
-                table_info.table_name,
+                Self::target_table_key(schema, table_info.table_name.as_str()),
                 self.auto_create_table,
                 self.auto_add_column,
                 self.auto_modify_column
@@ -297,7 +325,7 @@ impl DamengSink {
                 if dameng_type.eq_ignore_ascii_case("CLOB") || should_modify {
                     info!(
                         "Dameng column check: {}.{} existing={} data_length={} char_length={} expected={} auto_modify={}",
-                        table_info.table_name,
+                        Self::target_table_key(schema, table_info.table_name.as_str()),
                         src_col,
                         existing_col.data_type,
                         existing_col.data_length,
@@ -309,7 +337,7 @@ impl DamengSink {
                 if should_modify && !self.auto_modify_column {
                     return Err(format!(
                         "Dameng column type mismatch and auto_modify_column is false: {}.{} existing={} data_length={} char_length={} expected={}",
-                        table_info.table_name,
+                        Self::target_table_key(schema, table_info.table_name.as_str()),
                         src_col,
                         existing_col.data_type,
                         existing_col.data_length,
@@ -320,7 +348,7 @@ impl DamengSink {
                 if should_modify {
                     let sql = format!(
                         "ALTER TABLE {} MODIFY {} {} {}",
-                        self.qualified_table(table_info.table_name.as_str()),
+                        Self::qualified_table(schema, table_info.table_name.as_str()),
                         Self::quote_ident(src_col),
                         dameng_type,
                         nullable_sql
@@ -328,12 +356,15 @@ impl DamengSink {
                     match self.execute(sql.as_str()).await {
                         Ok(_) => info!(
                             "Dameng auto modify column success: {} {}",
-                            table_info.table_name, src_col
+                            Self::target_table_key(schema, table_info.table_name.as_str()),
+                            src_col
                         ),
                         Err(e) => {
                             let msg = format!(
                                 "Dameng auto modify column failed: {} {} {}",
-                                table_info.table_name, src_col, e
+                                Self::target_table_key(schema, table_info.table_name.as_str()),
+                                src_col,
+                                e
                             );
                             error!("{}", msg);
                             return Err(msg);
@@ -347,7 +378,7 @@ impl DamengSink {
             }
             let sql = format!(
                 "ALTER TABLE {} ADD {} {} {}",
-                self.qualified_table(table_info.table_name.as_str()),
+                Self::qualified_table(schema, table_info.table_name.as_str()),
                 Self::quote_ident(src_col),
                 dameng_type,
                 nullable_sql
@@ -355,12 +386,15 @@ impl DamengSink {
             match self.execute(sql.as_str()).await {
                 Ok(_) => info!(
                     "Dameng auto add column success: {} {}",
-                    table_info.table_name, src_col
+                    Self::target_table_key(schema, table_info.table_name.as_str()),
+                    src_col
                 ),
                 Err(e) => {
                     let msg = format!(
                         "Dameng auto add column failed: {} {} {}",
-                        table_info.table_name, src_col, e
+                        Self::target_table_key(schema, table_info.table_name.as_str()),
+                        src_col,
+                        e
                     );
                     error!("{}", msg);
                     return Err(msg);
@@ -370,8 +404,8 @@ impl DamengSink {
         Ok(())
     }
 
-    async fn table_exists(&self, table_name: &str) -> Result<bool, String> {
-        let sql = if self.schema.is_empty() {
+    async fn table_exists(&self, schema: &str, table_name: &str) -> Result<bool, String> {
+        let sql = if schema.is_empty() {
             format!(
                 "SELECT COUNT(*) FROM USER_TABLES WHERE {}",
                 Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
@@ -379,7 +413,7 @@ impl DamengSink {
         } else {
             format!(
                 "SELECT COUNT(*) FROM ALL_TABLES WHERE {} AND {}",
-                Self::eq_original_or_upper_sql("OWNER", &self.schema),
+                Self::eq_original_or_upper_sql("OWNER", schema),
                 Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
             )
         };
@@ -393,9 +427,10 @@ impl DamengSink {
 
     async fn existing_columns(
         &self,
+        schema: &str,
         table_name: &str,
     ) -> Result<HashMap<String, DamengColumnInfo>, String> {
-        let sql = if self.schema.is_empty() {
+        let sql = if schema.is_empty() {
             format!(
                 "SELECT LISTAGG(COLUMN_NAME || ':' || DATA_TYPE || ':' || DATA_LENGTH || ':' || CHAR_LENGTH, '|') WITHIN GROUP (ORDER BY COLUMN_ID) FROM USER_TAB_COLUMNS WHERE {}",
                 Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
@@ -403,7 +438,7 @@ impl DamengSink {
         } else {
             format!(
                 "SELECT LISTAGG(COLUMN_NAME || ':' || DATA_TYPE || ':' || DATA_LENGTH || ':' || CHAR_LENGTH, '|') WITHIN GROUP (ORDER BY COLUMN_ID) FROM ALL_TAB_COLUMNS WHERE {} AND {}",
-                Self::eq_original_or_upper_sql("OWNER", &self.schema),
+                Self::eq_original_or_upper_sql("OWNER", schema),
                 Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
             )
         };
@@ -552,8 +587,8 @@ impl DamengSink {
         Self::is_identity_insert_required_error(error) || Self::is_duplicate_key_error(error)
     }
 
-    fn identity_insert_cache_key(table_name: &str) -> String {
-        table_name.to_ascii_lowercase()
+    fn identity_insert_cache_key(table_key: &str) -> String {
+        table_key.to_ascii_lowercase()
     }
 
     fn identity_insert_sql(qualified_table: &str, enabled: bool) -> String {
@@ -574,9 +609,14 @@ impl DamengSink {
             .map(|_| ())
     }
 
-    async fn ensure_identity_insert_enabled(&self, table_name: &str) -> Result<(), String> {
-        let key = Self::identity_insert_cache_key(table_name);
-        let qualified_table = self.qualified_table(table_name);
+    async fn ensure_identity_insert_enabled(
+        &self,
+        schema: &str,
+        table_name: &str,
+        table_key: &str,
+    ) -> Result<(), String> {
+        let key = Self::identity_insert_cache_key(table_key);
+        let qualified_table = Self::qualified_table(schema, table_name);
         let mut active = self.active_identity_insert_table.lock().await;
         if active
             .as_ref()
@@ -618,10 +658,6 @@ impl DamengSink {
             .to_string()
     }
 
-    fn quote_ident(identifier: &str) -> String {
-        format!("\"{}\"", identifier.replace('"', "\"\""))
-    }
-
     fn create_schema_sql(schema: &str) -> String {
         format!("CREATE SCHEMA {}", Self::quote_ident(schema))
     }
@@ -630,13 +666,55 @@ impl DamengSink {
         format!("SET SCHEMA {}", Self::quote_ident(schema))
     }
 
-    fn qualified_table(&self, table_name: &str) -> String {
-        if self.schema.is_empty() {
+    fn table_info_target_schema(table_info: &TableInfoVo, fallback: &str) -> String {
+        if table_info.target_database.trim().is_empty() {
+            fallback.to_string()
+        } else {
+            table_info.target_database.clone()
+        }
+    }
+
+    fn record_target_schema(&self, record: &DataBuffer) -> String {
+        if record.target_database.trim().is_empty() {
+            self.schema.clone()
+        } else {
+            record.target_database.clone()
+        }
+    }
+
+    fn target_table_key(schema: &str, table_name: &str) -> String {
+        database_table_key(schema, table_name)
+    }
+
+    fn target_schemas(&self) -> Vec<String> {
+        let mut schemas = Vec::new();
+        let mut seen = HashSet::new();
+        if !self.schema.trim().is_empty() && seen.insert(self.schema.to_ascii_lowercase()) {
+            schemas.push(self.schema.clone());
+        }
+        for table_info in &self.table_info_list {
+            let schema = Self::table_info_target_schema(table_info, self.schema.as_str());
+            if schema.trim().is_empty() {
+                continue;
+            }
+            if seen.insert(schema.to_ascii_lowercase()) {
+                schemas.push(schema);
+            }
+        }
+        schemas
+    }
+
+    fn quote_ident(identifier: &str) -> String {
+        format!("\"{}\"", identifier.replace('"', "\"\""))
+    }
+
+    fn qualified_table(schema: &str, table_name: &str) -> String {
+        if schema.is_empty() {
             Self::quote_ident(table_name)
         } else {
             format!(
                 "{}.{}",
-                Self::quote_ident(&self.schema),
+                Self::quote_ident(schema),
                 Self::quote_ident(table_name)
             )
         }
@@ -782,6 +860,66 @@ impl DamengSink {
         }
     }
 
+    fn validate_merged_target_schema(
+        table_info_list: &[TableInfoVo],
+        fallback_schema: &str,
+    ) -> Result<(), String> {
+        let mut signatures: HashMap<String, (String, Vec<(String, String)>)> = HashMap::new();
+        for table_info in table_info_list {
+            let schema = Self::table_info_target_schema(table_info, fallback_schema);
+            let target_key =
+                Self::target_table_key(schema.as_str(), table_info.table_name.as_str())
+                    .to_ascii_lowercase();
+            let signature = Self::table_schema_signature(table_info);
+            match signatures.get(&target_key) {
+                None => {
+                    signatures.insert(
+                        target_key,
+                        (table_info.pk_column.to_ascii_lowercase(), signature),
+                    );
+                }
+                Some((pk, existing_signature)) => {
+                    if !pk.eq_ignore_ascii_case(table_info.pk_column.as_str())
+                        || existing_signature != &signature
+                    {
+                        return Err(format!(
+                            "Dameng multi_mode target table schema mismatch: {}",
+                            Self::target_table_key(schema.as_str(), table_info.table_name.as_str())
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn table_schema_signature(table_info: &TableInfoVo) -> Vec<(String, String)> {
+        let defs =
+            extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
+        table_info
+            .columns
+            .iter()
+            .map(|column| {
+                let key = column.to_ascii_lowercase();
+                let type_token = defs
+                    .get(&key)
+                    .and_then(|def| {
+                        let mysql_type = mysql_type_token_from_column_definition(def.as_str())?;
+                        let auto_increment = column
+                            .eq_ignore_ascii_case(table_info.pk_column.as_str())
+                            && mysql_column_is_auto_increment_from_definition(def.as_str());
+                        Some(Self::map_mysql_type_to_dameng_for_column(
+                            mysql_type.as_str(),
+                            auto_increment,
+                        ))
+                    })
+                    .unwrap_or_else(|| "__missing_definition__".to_string())
+                    .to_ascii_lowercase();
+                (key, type_token)
+            })
+            .collect()
+    }
+
     fn map_mysql_char_type_to_dameng(
         dameng_type: &str,
         mysql_type_token: &str,
@@ -877,16 +1015,30 @@ impl Sink for DamengSink {
             .start_timer();
 
         if !*self.initialized.read().await {
+            let mut inserted_tables = HashSet::new();
             for table_info in &self.table_info_list {
+                let schema = Self::table_info_target_schema(table_info, self.schema.as_str());
+                let table_key =
+                    Self::target_table_key(schema.as_str(), table_info.table_name.as_str());
+                if !inserted_tables.insert(table_key.to_ascii_lowercase()) {
+                    continue;
+                }
                 self.table_info_cache
                     .lock()
                     .await
-                    .insert(table_info.table_name.clone(), table_info.clone());
+                    .insert(table_key, table_info.clone());
             }
             let mut col_info = CaseInsensitiveHashMapVecString::new_with_no_arg();
+            let mut inserted_columns = HashSet::new();
             for table_info in &self.table_info_list {
+                let schema = Self::table_info_target_schema(table_info, self.schema.as_str());
+                let table_key =
+                    Self::target_table_key(schema.as_str(), table_info.table_name.as_str());
+                if !inserted_columns.insert(table_key.to_ascii_lowercase()) {
+                    continue;
+                }
                 for col in &table_info.columns {
-                    col_info.entry_insert(table_info.table_name.as_str(), col.clone());
+                    col_info.entry_insert(table_key.as_str(), col.clone());
                 }
             }
             *self.columns_cache.lock().await = col_info;
@@ -912,8 +1064,10 @@ impl Sink for DamengSink {
         let mut flush_result = Ok(());
         for record in batch {
             cache_for_roll_back.push(record.clone());
+            let schema = self.record_target_schema(&record);
             let table_name = record.table_name.clone();
-            let pk_name = self.get_pk_name_from_cache(table_name.as_str()).await;
+            let table_key = Self::target_table_key(schema.as_str(), table_name.as_str());
+            let pk_name = self.get_pk_name_from_cache(table_key.as_str()).await;
             let op_str = match record.op {
                 Operation::CREATE(_) => "create",
                 Operation::UPDATE => "update",
@@ -921,14 +1075,16 @@ impl Sink for DamengSink {
                 _ => "other",
             };
             SINK_EVENTS_TOTAL
-                .with_label_values(&["dameng", &table_name, op_str])
+                .with_label_values(&["dameng", table_key.as_str(), op_str])
                 .inc();
 
             let result = match record.op {
                 Operation::CREATE(true) => {
-                    let columns = columns_cache.get(table_name.as_str());
+                    let columns = columns_cache.get(table_key.as_str());
                     self.insert_or_update_record(
+                        schema.as_str(),
                         table_name.as_str(),
+                        table_key.as_str(),
                         pk_name.as_str(),
                         &columns,
                         &record,
@@ -936,13 +1092,26 @@ impl Sink for DamengSink {
                     .await
                 }
                 Operation::CREATE(false) | Operation::UPDATE => {
-                    let columns = columns_cache.get(table_name.as_str());
-                    self.upsert_record(table_name.as_str(), pk_name.as_str(), &columns, &record)
-                        .await
+                    let columns = columns_cache.get(table_key.as_str());
+                    self.upsert_record(
+                        schema.as_str(),
+                        table_name.as_str(),
+                        table_key.as_str(),
+                        pk_name.as_str(),
+                        &columns,
+                        &record,
+                    )
+                    .await
                 }
                 Operation::DELETE => {
-                    self.delete_record(table_name.as_str(), pk_name.as_str(), &record)
-                        .await
+                    self.delete_record(
+                        schema.as_str(),
+                        table_name.as_str(),
+                        table_key.as_str(),
+                        pk_name.as_str(),
+                        &record,
+                    )
+                    .await
                 }
                 _ => Err(format!("unexpected operation {:?}", record.op)),
             };
@@ -1000,46 +1169,54 @@ impl Sink for DamengSink {
 impl DamengSink {
     async fn upsert_record(
         &self,
+        schema: &str,
         table_name: &str,
+        table_key: &str,
         pk_name: &str,
         columns: &[String],
         record: &DataBuffer,
     ) -> Result<(), String> {
         if columns.is_empty() {
-            return Err(format!("columns is empty: {}", table_name));
+            return Err(format!("columns is empty: {}", table_key));
         }
         let affected = self
-            .update_record(table_name, pk_name, columns, record)
+            .update_record(schema, table_name, table_key, pk_name, columns, record)
             .await?;
         if affected > 0 {
             return Ok(());
         }
 
-        self.insert_record(table_name, columns, record).await
+        self.insert_record(schema, table_name, table_key, columns, record)
+            .await
     }
 
     async fn insert_or_update_record(
         &self,
+        schema: &str,
         table_name: &str,
+        table_key: &str,
         pk_name: &str,
         columns: &[String],
         record: &DataBuffer,
     ) -> Result<(), String> {
         if columns.is_empty() {
-            return Err(format!("columns is empty: {}", table_name));
+            return Err(format!("columns is empty: {}", table_key));
         }
-        match self.insert_record(table_name, columns, record).await {
+        match self
+            .insert_record(schema, table_name, table_key, columns, record)
+            .await
+        {
             Ok(_) => Ok(()),
             Err(e) if Self::is_duplicate_key_error(e.as_str()) => {
                 let affected = self
-                    .update_record(table_name, pk_name, columns, record)
+                    .update_record(schema, table_name, table_key, pk_name, columns, record)
                     .await?;
                 if affected > 0 {
                     Ok(())
                 } else {
                     Err(format!(
                         "Dameng insert duplicate fallback update affected 0 rows: {}",
-                        table_name
+                        table_key
                     ))
                 }
             }
@@ -1049,16 +1226,18 @@ impl DamengSink {
 
     async fn update_record(
         &self,
+        schema: &str,
         table_name: &str,
+        table_key: &str,
         pk_name: &str,
         columns: &[String],
         record: &DataBuffer,
     ) -> Result<u64, String> {
         let pk = record.get_pk(pk_name);
         if pk.is_none() {
-            return Err(format!("pk is empty: {}.{}", table_name, pk_name));
+            return Err(format!("pk is empty: {}.{}", table_key, pk_name));
         }
-        let table_info = self.table_info_cache.lock().await.get(table_name);
+        let table_info = self.table_info_cache.lock().await.get(table_key);
 
         let update_columns = columns
             .iter()
@@ -1081,7 +1260,7 @@ impl DamengSink {
             .join(", ");
         let update_sql = format!(
             "UPDATE {} SET {} WHERE {} = ?",
-            self.qualified_table(table_name),
+            Self::qualified_table(schema, table_name),
             set_sql,
             Self::quote_ident(pk_name)
         );
@@ -1097,11 +1276,13 @@ impl DamengSink {
 
     async fn insert_record(
         &self,
+        schema: &str,
         table_name: &str,
+        table_key: &str,
         columns: &[String],
         record: &DataBuffer,
     ) -> Result<(), String> {
-        let table_info = self.table_info_cache.lock().await.get(table_name);
+        let table_info = self.table_info_cache.lock().await.get(table_key);
         let cols_sql = columns
             .iter()
             .map(|c| Self::quote_ident(c))
@@ -1114,7 +1295,7 @@ impl DamengSink {
             .join(", ");
         let insert_sql = format!(
             "INSERT INTO {} ({}) VALUES ({})",
-            self.qualified_table(table_name),
+            Self::qualified_table(schema, table_name),
             cols_sql,
             placeholders
         );
@@ -1124,15 +1305,21 @@ impl DamengSink {
             .collect::<Vec<_>>();
         debug!("Dameng INSERT: {}", insert_sql);
 
-        let identity_insert_cache_key = Self::identity_insert_cache_key(table_name);
+        let identity_insert_cache_key = Self::identity_insert_cache_key(table_key);
         let use_identity_insert = self
             .identity_insert_tables
             .lock()
             .await
             .contains(identity_insert_cache_key.as_str());
         if use_identity_insert {
-            self.insert_with_identity_insert(table_name, insert_sql.as_str(), &insert_params)
-                .await?;
+            self.insert_with_identity_insert(
+                schema,
+                table_name,
+                table_key,
+                insert_sql.as_str(),
+                &insert_params,
+            )
+            .await?;
             return Ok(());
         }
 
@@ -1146,8 +1333,14 @@ impl DamengSink {
                     .lock()
                     .await
                     .insert(identity_insert_cache_key);
-                self.insert_with_identity_insert(table_name, insert_sql.as_str(), &insert_params)
-                    .await?;
+                self.insert_with_identity_insert(
+                    schema,
+                    table_name,
+                    table_key,
+                    insert_sql.as_str(),
+                    &insert_params,
+                )
+                .await?;
             }
             Err(e) => return Err(e),
         }
@@ -1156,11 +1349,14 @@ impl DamengSink {
 
     async fn insert_with_identity_insert(
         &self,
+        schema: &str,
         table_name: &str,
+        table_key: &str,
         insert_sql: &str,
         insert_params: &[DamengParam],
     ) -> Result<(), String> {
-        self.ensure_identity_insert_enabled(table_name).await?;
+        self.ensure_identity_insert_enabled(schema, table_name, table_key)
+            .await?;
         match self
             .execute_insert_with_params(insert_sql, insert_params)
             .await
@@ -1168,7 +1364,8 @@ impl DamengSink {
             Ok(_) => Ok(()),
             Err(e) if Self::is_identity_insert_required_error(e.as_str()) => {
                 self.clear_active_identity_insert_state().await;
-                self.ensure_identity_insert_enabled(table_name).await?;
+                self.ensure_identity_insert_enabled(schema, table_name, table_key)
+                    .await?;
                 self.execute_insert_with_params(insert_sql, insert_params)
                     .await
                     .map(|_| ())
@@ -1179,7 +1376,9 @@ impl DamengSink {
 
     async fn delete_record(
         &self,
+        schema: &str,
         table_name: &str,
+        _table_key: &str,
         pk_name: &str,
         record: &DataBuffer,
     ) -> Result<(), String> {
@@ -1189,7 +1388,7 @@ impl DamengSink {
         }
         let sql = format!(
             "DELETE FROM {} WHERE {} = ?",
-            self.qualified_table(table_name),
+            Self::qualified_table(schema, table_name),
             Self::quote_ident(pk_name)
         );
         let params = vec![Self::value_to_param(pk)];
@@ -1207,6 +1406,20 @@ mod tests {
 
     use super::DamengSink;
 
+    fn table_info(target_schema: &str, column_type: &str) -> TableInfoVo {
+        TableInfoVo {
+            source_database: "source_db".to_string(),
+            target_database: target_schema.to_string(),
+            table_name: "orders".to_string(),
+            pk_column: "id".to_string(),
+            create_table_sql: format!(
+                "CREATE TABLE `orders` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `name` {} DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB",
+                column_type
+            ),
+            columns: vec!["id".to_string(), "name".to_string()],
+        }
+    }
+
     #[test]
     fn schema_sql_quotes_identifiers() {
         assert_eq!(
@@ -1220,6 +1433,19 @@ mod tests {
         assert_eq!(
             DamengSink::create_schema_sql("target\"schema"),
             "CREATE SCHEMA \"target\"\"schema\""
+        );
+    }
+
+    #[test]
+    fn qualified_table_uses_target_schema() {
+        assert_eq!(
+            DamengSink::qualified_table("TARGET_SCHEMA", "orders"),
+            "\"TARGET_SCHEMA\".\"orders\""
+        );
+        assert_eq!(DamengSink::qualified_table("", "orders"), "\"orders\"");
+        assert_eq!(
+            DamengSink::target_table_key("TARGET_SCHEMA", "orders"),
+            "TARGET_SCHEMA.orders"
         );
     }
 
@@ -1309,6 +1535,14 @@ mod tests {
     }
 
     #[test]
+    fn identity_insert_cache_key_includes_schema_when_present() {
+        assert_eq!(
+            DamengSink::identity_insert_cache_key("TARGET_SCHEMA.Ns_Core_Funcinfo"),
+            "target_schema.ns_core_funcinfo"
+        );
+    }
+
+    #[test]
     fn identity_insert_sql_uses_qualified_table() {
         assert_eq!(
             DamengSink::identity_insert_sql("\"S\".\"T\"", true),
@@ -1318,6 +1552,38 @@ mod tests {
             DamengSink::identity_insert_sql("\"S\".\"T\"", false),
             "SET IDENTITY_INSERT \"S\".\"T\" OFF"
         );
+    }
+
+    #[test]
+    fn merged_target_schema_allows_identical_tables() {
+        let tables = vec![
+            table_info("DST_SCHEMA", "varchar(64)"),
+            table_info("DST_SCHEMA", "varchar(64)"),
+        ];
+
+        assert!(DamengSink::validate_merged_target_schema(&tables, "").is_ok());
+    }
+
+    #[test]
+    fn merged_target_schema_rejects_type_mismatch_in_same_schema() {
+        let tables = vec![
+            table_info("DST_SCHEMA", "varchar(64)"),
+            table_info("DST_SCHEMA", "varchar(128)"),
+        ];
+
+        let err = DamengSink::validate_merged_target_schema(&tables, "").unwrap_err();
+
+        assert!(err.contains("schema mismatch"));
+    }
+
+    #[test]
+    fn merged_target_schema_allows_same_table_in_different_schemas() {
+        let tables = vec![
+            table_info("DST_A", "varchar(64)"),
+            table_info("DST_B", "varchar(128)"),
+        ];
+
+        assert!(DamengSink::validate_merged_target_schema(&tables, "").is_ok());
     }
 
     #[test]

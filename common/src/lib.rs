@@ -221,7 +221,10 @@ impl CdcConfig {
                     )
                 });
         }
-        self.first_sink("database")
+        self.sink_databases()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.first_sink("database"))
     }
 
     pub fn split_csv_value(value: &str) -> Vec<String> {
@@ -243,20 +246,31 @@ impl CdcConfig {
     }
 
     pub fn sink_databases(&self) -> Vec<String> {
+        let sink_database = if matches!(self.sink_type, SinkType::Dameng) {
+            let schema = self.first_sink("schema");
+            if schema.trim().is_empty() {
+                self.first_sink("database")
+            } else {
+                schema
+            }
+        } else {
+            self.first_sink("database")
+        };
         if self.multi_mode_open() {
-            return Self::split_csv_value(self.first_sink("database").as_str());
+            return Self::split_csv_value(sink_database.as_str());
         }
-        vec![self.first_sink("database")]
+        vec![sink_database]
     }
 
     pub fn validate_multi_mode(&self) -> Result<(), String> {
         if !self.multi_mode_open() {
             return Ok(());
         }
-        if !matches!(self.source_type, SourceType::MySQL)
-            || !matches!(self.sink_type, SinkType::MySQL)
-        {
-            return Err("multi_mode 第一版只支持 MySQL -> MySQL".to_string());
+        if !matches!(self.source_type, SourceType::MySQL) {
+            return Err("multi_mode 当前只支持 MySQL source".to_string());
+        }
+        if !matches!(self.sink_type, SinkType::MySQL | SinkType::Dameng) {
+            return Err("multi_mode 当前只支持 MySQL -> MySQL/Dameng".to_string());
         }
         if self.source_config.len() != 1 {
             return Err(
@@ -266,7 +280,7 @@ impl CdcConfig {
         }
         if self.sink_config.len() != 1 {
             return Err(
-                "multi_mode 第一版只支持单个 sink_config，通过 database 逗号分隔多个目标库"
+                "multi_mode 只支持单个 sink_config，通过 database/schema 逗号分隔多个目标库"
                     .to_string(),
             );
         }
@@ -1374,6 +1388,43 @@ mod tests {
             vec!["src_a".to_string(), "src_b".to_string()]
         );
         assert_eq!(config.target_database_for_source("src_b"), "dst_b");
+    }
+
+    #[test]
+    fn test_multi_mode_validate_allows_dameng_sink_schema_list() {
+        let mut config = multi_mode_config();
+        config.sink_type = SinkType::Dameng;
+        config.sink_config[0].insert("database".to_string(), "physical_db".to_string());
+        config.sink_config[0].insert("schema".to_string(), "dst_a,dst_b".to_string());
+
+        assert!(config.validate_multi_mode().is_ok());
+        assert_eq!(
+            config.sink_databases(),
+            vec!["dst_a".to_string(), "dst_b".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_dameng_target_database_prefers_schema_when_not_multi_mode() {
+        let mut config = multi_mode_config();
+        config.sink_type = SinkType::Dameng;
+        config.multi_mode = None;
+        config.source_config[0].insert("database".to_string(), "src".to_string());
+        config.sink_config[0].insert("database".to_string(), "physical_db".to_string());
+        config.sink_config[0].insert("schema".to_string(), "target_schema".to_string());
+
+        assert_eq!(config.sink_databases(), vec!["target_schema".to_string()]);
+        assert_eq!(config.target_database_for_source("src"), "target_schema");
+    }
+
+    #[test]
+    fn test_multi_mode_validate_rejects_unsupported_sink() {
+        let mut config = multi_mode_config();
+        config.sink_type = SinkType::Print;
+
+        let err = config.validate_multi_mode().unwrap_err();
+
+        assert!(err.contains("MySQL/Dameng"));
     }
 
     #[test]
