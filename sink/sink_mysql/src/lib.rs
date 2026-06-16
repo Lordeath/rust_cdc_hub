@@ -495,7 +495,12 @@ impl MySqlSink {
             Ok(ok) => Ok(ok),
             Err(err) => {
                 error!("Failed to execute query: {} 进行重试, sql: {}", err, sql);
-                Self::log_upsert_debug_rows(table_name, columns, inserts);
+                let error_message = err.to_string();
+                Self::log_upsert_debug_rows(table_name, columns, inserts, error_message.as_str());
+                if let Some(error_column) = mysql_error_column_name(error_message.as_str()) {
+                    Self::log_target_column_metadata(pool, database, table_name, &error_column)
+                        .await;
+                }
                 let new_pool =
                     get_mysql_pool_by_url(connection_url, "sql执行遇到报错，尝试重新获取连接")
                         .await
@@ -513,6 +518,7 @@ impl MySqlSink {
         table_name: &str,
         columns: &[String],
         inserts: &[common::case_insensitive_hash_map::CaseInsensitiveHashMap],
+        error_message: &str,
     ) {
         let mut debug_columns: Vec<String> = vec![];
         let mut seen = HashSet::new();
@@ -521,6 +527,9 @@ impl MySqlSink {
             "path",
             "HouseId",
             "fullPath",
+            "BadDebtDate",
+            "bankCollectionLock",
+            "beforePrice",
             "buildingName",
             "Sequence",
             "settleDate",
@@ -539,17 +548,25 @@ impl MySqlSink {
             }
         }
 
-        if let Some(settle_date_index) = columns
-            .iter()
-            .position(|column| column.eq_ignore_ascii_case("settleDate"))
-        {
-            let start = settle_date_index.saturating_sub(5);
-            let end = (settle_date_index + 5).min(columns.len().saturating_sub(1));
-            for column in &columns[start..=end] {
-                if seen.insert(column.to_ascii_lowercase()) {
-                    debug_columns.push(column.clone());
-                }
+        let focus_columns = ["settleDate", "bankCollectionLock"];
+        for focus_column in focus_columns {
+            Self::push_debug_columns_around(columns, focus_column, &mut seen, &mut debug_columns);
+        }
+
+        if let Some(error_column) = mysql_error_column_name(error_message) {
+            if let Some(column) = columns
+                .iter()
+                .find(|column| column.eq_ignore_ascii_case(error_column.as_str()))
+                && seen.insert(column.to_ascii_lowercase())
+            {
+                debug_columns.push(column.clone());
             }
+            Self::push_debug_columns_around(
+                columns,
+                error_column.as_str(),
+                &mut seen,
+                &mut debug_columns,
+            );
         }
 
         for (row_index, row) in inserts.iter().take(3).enumerate() {
@@ -559,11 +576,85 @@ impl MySqlSink {
                 .collect::<Vec<_>>()
                 .join(", ");
             error!(
-                "MySQL UPSERT debug table={} row={} values: {}",
+                "MySQL UPSERT debug table={} row={} error_column={:?} values: {}",
                 table_name,
                 row_index + 1,
+                mysql_error_column_name(error_message),
                 values
             );
+        }
+    }
+
+    fn push_debug_columns_around(
+        columns: &[String],
+        focus_column: &str,
+        seen: &mut HashSet<String>,
+        debug_columns: &mut Vec<String>,
+    ) {
+        if let Some(focus_index) = columns
+            .iter()
+            .position(|column| column.eq_ignore_ascii_case(focus_column))
+        {
+            let start = focus_index.saturating_sub(5);
+            let end = (focus_index + 5).min(columns.len().saturating_sub(1));
+            for column in &columns[start..=end] {
+                if seen.insert(column.to_ascii_lowercase()) {
+                    debug_columns.push(column.clone());
+                }
+            }
+        }
+    }
+
+    async fn log_target_column_metadata(
+        pool: &Pool<MySql>,
+        database: &str,
+        table_name: &str,
+        column_name: &str,
+    ) {
+        let sql = r#"
+            SELECT
+                COLUMN_NAME,
+                COLUMN_TYPE,
+                IS_NULLABLE,
+                COALESCE(COLUMN_DEFAULT, '<NULL>') AS COLUMN_DEFAULT,
+                EXTRA
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = ?
+              AND TABLE_NAME = ?
+              AND COLUMN_NAME = ?
+        "#;
+        match sqlx::query(sql)
+            .persistent(false)
+            .bind(database)
+            .bind(table_name)
+            .bind(column_name)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(Some(row)) => {
+                error!(
+                    "MySQL UPSERT target column metadata table={}.{} column={} type={} nullable={} default={} extra={}",
+                    database,
+                    table_name,
+                    mysql_row_text_value(&row, "COLUMN_NAME"),
+                    mysql_row_text_value(&row, "COLUMN_TYPE"),
+                    mysql_row_text_value(&row, "IS_NULLABLE"),
+                    mysql_row_text_value(&row, "COLUMN_DEFAULT"),
+                    mysql_row_text_value(&row, "EXTRA")
+                );
+            }
+            Ok(None) => {
+                error!(
+                    "MySQL UPSERT target column metadata not found table={}.{} column={}",
+                    database, table_name, column_name
+                );
+            }
+            Err(e) => {
+                error!(
+                    "MySQL UPSERT target column metadata query failed table={}.{} column={} error={}",
+                    database, table_name, column_name, e
+                );
+            }
         }
     }
 
@@ -985,6 +1076,14 @@ impl Sink for MySqlSink {
     }
 }
 
+fn mysql_error_column_name(message: &str) -> Option<String> {
+    let marker = "for column '";
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1049,5 +1148,16 @@ mod tests {
     fn bit_values_resolve_as_numeric_text() {
         assert_eq!(Value::Bit(1).resolve_string(), "1");
         assert_eq!(Value::Bit(0).resolve_string(), "0");
+    }
+
+    #[test]
+    fn mysql_error_column_name_extracts_column() {
+        assert_eq!(
+            mysql_error_column_name(
+                "error returned from database: 1265 (01000): Data truncated for column 'bankCollectionLock' at row 1"
+            )
+            .as_deref(),
+            Some("bankCollectionLock")
+        );
     }
 }
