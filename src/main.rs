@@ -1424,6 +1424,15 @@ const translations = {
     auto_create_table: '自动建表',
     auto_add_column: '自动加字段',
     auto_modify_column: '自动改字段',
+    status_running: '运行中',
+    status_initializing: '初始化中',
+    status_degraded: '异常',
+    status_unknown: '未知',
+    status_ui_error: '界面错误',
+    phase_running: '运行中',
+    phase_initializing: '初始化中',
+    phase_cdc: '增量同步',
+    phase_done: '已完成',
     started: 'started',
     last_flush: 'last flush',
     last_restart: 'last restart',
@@ -1498,6 +1507,15 @@ const translations = {
     auto_create_table: 'Auto Create Table',
     auto_add_column: 'Auto Add Column',
     auto_modify_column: 'Auto Modify Column',
+    status_running: 'Running',
+    status_initializing: 'Initializing',
+    status_degraded: 'Degraded',
+    status_unknown: 'Unknown',
+    status_ui_error: 'UI Error',
+    phase_running: 'Running',
+    phase_initializing: 'Initializing',
+    phase_cdc: 'CDC',
+    phase_done: 'Done',
     started: 'started',
     last_flush: 'last flush',
     last_restart: 'last restart',
@@ -1567,6 +1585,16 @@ function kvRow(key, value) {
 }
 function displayFilterColumn(columnName) {
   return columnName === '__no_matched_filter_column__' ? t('no_matched_filter_column') : (columnName || '-');
+}
+function displayStatus(status) {
+  const value = status || 'unknown';
+  const key = `status_${String(value).replace(/[^a-zA-Z0-9]+/g, '_').toLowerCase()}`;
+  return translations[currentLang]?.[key] || translations.zh[key] || value;
+}
+function displayPhase(phase) {
+  const value = phase || '-';
+  const key = `phase_${String(value).replace(/[^a-zA-Z0-9]+/g, '_').toLowerCase()}`;
+  return translations[currentLang]?.[key] || translations.zh[key] || value;
 }
 function sortValue(item, key) {
   if (key === 'column_name') return displayFilterColumn(item.column_name);
@@ -1685,7 +1713,7 @@ function renderSyncProgressTable(tables, now) {
   const rows = sortRows(rowsWithDurations, 'syncProgress')
     .map((table) => `<tr class="${table.phase === 'initializing' ? 'phase-initializing' : ''}">
       <td>${escapeHtml(table.table_name || '-')}</td>
-      <td>${escapeHtml(table.phase || '-')}</td>
+      <td>${escapeHtml(displayPhase(table.phase))}</td>
       <td>${escapeHtml(table.initialization_duration_label)}</td>
       <td>${escapeHtml(table.read_total ?? 0)}</td>
       <td>${escapeHtml(table.synced_total ?? 0)}</td>
@@ -1761,7 +1789,7 @@ function renderStatusData(data) {
     const initializing = data.status === 'initializing';
     el('statusPill').classList.toggle('degraded', degraded);
     el('statusPill').classList.toggle('initializing', initializing);
-    setText('statusText', data.status || 'unknown');
+    setText('statusText', displayStatus(data.status));
     setText('sourceType', cfg.source_type);
     setText('sinkType', cfg.sink_type);
     setText('uptime', fmtDuration(data.uptime_seconds));
@@ -1772,7 +1800,7 @@ function renderStatusData(data) {
     setText('lastRestart', `${t('last_restart')}: ${fmtTs(data.last_source_restart_at)}`);
     setText('configScale', `${cfg.source_count ?? 0} → ${cfg.sink_count ?? 0}`);
     setText('pluginCount', `${t('plugins')}: ${cfg.plugin_count ?? 0}`);
-    setText('progressState', progress.initializing ? 'initializing' : (progressTables.length > 0 ? 'cdc' : 'running'));
+    setText('progressState', displayPhase(progress.initializing ? 'initializing' : (progressTables.length > 0 ? 'cdc' : 'running')));
     setText('progressTable', progress.current_table || '-');
     setText('progressReadSynced', `${progressRead} / ${progressSynced}`);
     setText('progressFiltered', progressFiltered);
@@ -1813,7 +1841,7 @@ async function loadStatus() {
     renderStatusData(data);
   } catch (err) {
     el('statusPill').classList.add('degraded');
-    setText('statusText', 'ui-error');
+    setText('statusText', t('status_ui_error'));
     el('errorBox').textContent = `${t('load_status_failed')}: ${err.message}`;
     el('errorBox').classList.remove('empty');
   }
@@ -2569,6 +2597,10 @@ plugins:
         assert!(s.contains("onclick=\"setTableSort"));
         assert!(s.contains("position: sticky"));
         assert!(s.contains("phase-initializing"));
+        assert!(s.contains("status_running: '运行中'"));
+        assert!(s.contains("phase_initializing: '初始化中'"));
+        assert!(s.contains("function displayStatus"));
+        assert!(s.contains("function displayPhase"));
         assert!(s.contains("rawJson"));
         assert!(!s.contains("id=\"pluginFilterSection\""));
         assert!(!s.contains("数据库拆分</a>"));
