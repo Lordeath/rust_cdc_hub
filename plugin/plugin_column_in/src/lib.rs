@@ -76,11 +76,7 @@ impl Plugin for PluginColumnIn {
             result,
         )
         .await;
-        if result {
-            Ok(data_buffer)
-        } else {
-            Err(())
-        }
+        if result { Ok(data_buffer) } else { Err(()) }
     }
 }
 
