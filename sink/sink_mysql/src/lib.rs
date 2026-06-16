@@ -19,6 +19,7 @@ use sqlx::{Executor, MySql, Pool, Row};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
+use std::fmt::Write as _;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tracing::log::trace;
@@ -406,36 +407,52 @@ impl MySqlSink {
         source_pool: &Pool<MySql>,
         source_database: &str,
     ) -> Result<Vec<MySqlRoutineDefinition>, String> {
-        let routine_rows = sqlx::query(
+        let routine_sql = format!(
             r#"
             SELECT ROUTINE_NAME
             FROM information_schema.ROUTINES
-            WHERE ROUTINE_SCHEMA = ?
+            WHERE ROUTINE_SCHEMA = {}
               AND ROUTINE_TYPE = 'PROCEDURE'
             ORDER BY ROUTINE_NAME
             "#,
-        )
-        .persistent(false)
-        .bind(source_database)
-        .fetch_all(source_pool)
-        .await
-        .map_err(|e| e.to_string())?;
+            Self::mysql_utf8mb4_string_expr(source_database)
+        );
+        let routine_rows = sqlx::raw_sql(routine_sql.as_str())
+            .fetch_all(source_pool)
+            .await
+            .map_err(|e| format!("{}: {}", routine_sql, e))?;
 
         let mut routines = Vec::with_capacity(routine_rows.len());
         for row in routine_rows {
             let name = mysql_row_text_value(&row, "ROUTINE_NAME");
-            let show_sql = format!(
-                "SHOW CREATE PROCEDURE {}",
-                Self::qualified_routine_name(source_database, name.as_str())
-            );
-            let create_row = sqlx::query(show_sql.as_str())
-                .persistent(false)
+            let show_sql = Self::show_create_procedure_sql(source_database, name.as_str());
+            let create_row = sqlx::raw_sql(show_sql.as_str())
                 .fetch_one(source_pool)
                 .await
                 .map_err(|e| format!("{}: {}", show_sql, e))?;
             routines.push(Self::parse_show_create_procedure_row(&name, &create_row)?);
         }
         Ok(routines)
+    }
+
+    fn show_create_procedure_sql(source_database: &str, routine_name: &str) -> String {
+        format!(
+            "SHOW CREATE PROCEDURE {}",
+            Self::qualified_routine_name(source_database, routine_name)
+        )
+    }
+
+    fn mysql_utf8mb4_string_expr(value: &str) -> String {
+        if value.is_empty() {
+            return "''".to_string();
+        }
+        let mut sql = String::with_capacity("CONVERT(0x USING utf8mb4)".len() + value.len() * 2);
+        sql.push_str("CONVERT(0x");
+        for byte in value.as_bytes() {
+            let _ = write!(&mut sql, "{:02X}", byte);
+        }
+        sql.push_str(" USING utf8mb4)");
+        sql
     }
 
     fn parse_show_create_procedure_row(
@@ -480,8 +497,7 @@ impl MySqlSink {
         }
 
         let mut conn = target_pool.acquire().await.map_err(|e| e.to_string())?;
-        let original_sql_mode = sqlx::query("SELECT @@SESSION.sql_mode AS sql_mode")
-            .persistent(false)
+        let original_sql_mode = sqlx::raw_sql("SELECT @@SESSION.sql_mode AS sql_mode")
             .fetch_one(&mut *conn)
             .await
             .map_err(|e| e.to_string())
@@ -493,13 +509,15 @@ impl MySqlSink {
 
         let sync_result = async {
             let use_sql = format!("USE {}", Self::quote_mysql_identifier(target_database));
-            (&mut *conn)
-                .execute(use_sql.as_str())
+            sqlx::raw_sql(use_sql.as_str())
+                .execute(&mut *conn)
                 .await
                 .map_err(|e| e.to_string())?;
-            sqlx::query("SET SESSION sql_mode = ?")
-                .persistent(false)
-                .bind(routine.sql_mode.as_str())
+            let set_sql_mode = format!(
+                "SET SESSION sql_mode = {}",
+                Self::mysql_utf8mb4_string_expr(routine.sql_mode.as_str())
+            );
+            sqlx::raw_sql(set_sql_mode.as_str())
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -508,13 +526,13 @@ impl MySqlSink {
                     "DROP PROCEDURE IF EXISTS {}",
                     Self::qualified_routine_name(target_database, routine.name.as_str())
                 );
-                (&mut *conn)
-                    .execute(drop_sql.as_str())
+                sqlx::raw_sql(drop_sql.as_str())
+                    .execute(&mut *conn)
                     .await
                     .map_err(|e| e.to_string())?;
             }
-            (&mut *conn)
-                .execute(routine.create_sql.as_str())
+            sqlx::raw_sql(routine.create_sql.as_str())
+                .execute(&mut *conn)
                 .await
                 .map_err(|e| {
                     format!(
@@ -524,9 +542,11 @@ impl MySqlSink {
                 })
         }
         .await;
-        let restore_result = sqlx::query("SET SESSION sql_mode = ?")
-            .persistent(false)
-            .bind(original_sql_mode.as_str())
+        let restore_sql_mode = format!(
+            "SET SESSION sql_mode = {}",
+            Self::mysql_utf8mb4_string_expr(original_sql_mode.as_str())
+        );
+        let restore_result = sqlx::raw_sql(restore_sql_mode.as_str())
             .execute(&mut *conn)
             .await
             .map(|_| ())
@@ -554,21 +574,21 @@ impl MySqlSink {
         target_database: &str,
         routine_name: &str,
     ) -> Result<bool, String> {
-        let row = sqlx::query(
+        let sql = format!(
             r#"
             SELECT COUNT(*) AS cnt
             FROM information_schema.ROUTINES
-            WHERE ROUTINE_SCHEMA = ?
+            WHERE ROUTINE_SCHEMA = {}
               AND ROUTINE_TYPE = 'PROCEDURE'
-              AND ROUTINE_NAME = ?
+              AND ROUTINE_NAME = {}
             "#,
-        )
-        .persistent(false)
-        .bind(target_database)
-        .bind(routine_name)
-        .fetch_one(target_pool)
-        .await
-        .map_err(|e| e.to_string())?;
+            Self::mysql_utf8mb4_string_expr(target_database),
+            Self::mysql_utf8mb4_string_expr(routine_name)
+        );
+        let row = sqlx::raw_sql(sql.as_str())
+            .fetch_one(target_pool)
+            .await
+            .map_err(|e| format!("{}: {}", sql, e))?;
         let count = row
             .try_get::<i64, _>("cnt")
             .or_else(|_| row.try_get::<i64, _>(0))
@@ -1479,6 +1499,23 @@ mod tests {
         ];
 
         assert!(MySqlSink::validate_merged_target_schema(&tables).is_ok());
+    }
+
+    #[test]
+    fn mysql_utf8mb4_string_expr_uses_hex_literal() {
+        assert_eq!(
+            MySqlSink::mysql_utf8mb4_string_expr("newsee-backlog"),
+            "CONVERT(0x6E65777365652D6261636B6C6F67 USING utf8mb4)"
+        );
+        assert_eq!(MySqlSink::mysql_utf8mb4_string_expr(""), "''");
+    }
+
+    #[test]
+    fn show_create_procedure_sql_quotes_database_and_routine() {
+        assert_eq!(
+            MySqlSink::show_create_procedure_sql("source-db", "sync`demo"),
+            "SHOW CREATE PROCEDURE `source-db`.`sync``demo`"
+        );
     }
 
     #[test]
