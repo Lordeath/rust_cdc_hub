@@ -129,6 +129,8 @@ export CONFIG_PATH=/path/to/config.yaml
 | `auto_create_table` | 否 | 是否自动建表，默认 `true`。 |
 | `auto_add_column` | 否 | 是否自动加字段。 |
 | `auto_modify_column` | 否 | 是否自动修改字段。 |
+| `sync_stored_procedure` | 否 | MySQL → MySQL 时是否同步源库存储过程，默认 `false`；也兼容 `sync_stored_procedures`。 |
+| `overwrite_stored_procedure` | 否 | 同步存储过程时，目标库已存在同名过程是否先删除再重建，默认 `false`；也兼容 `overwrite_stored_procedures`。 |
 | `plugins` | 否 | 插件配置列表。 |
 | `source_batch_size` | 否 | Source 批量读取/处理大小。 |
 | `sink_batch_size` | 否 | Sink 批量写入大小。 |
@@ -213,10 +215,14 @@ sink_config:
 auto_create_database: true
 auto_create_table: true
 auto_add_column: true
+sync_stored_procedure: false
+overwrite_stored_procedure: false
 log_level: info
 enable_ui: true
 ui_port: 8080
 ```
+
+开启 `sync_stored_procedure` 后，MySQL sink 初始化时会按源库到目标库的路由同步 `PROCEDURE`。目标库已有同名过程且 `overwrite_stored_procedure: false` 时会跳过；设为 `true` 时会执行 `DROP PROCEDURE IF EXISTS` 后重建。同步前会从 `SHOW CREATE PROCEDURE` 结果里去掉 `DEFINER=\`user\`@\`host\``，避免把源库用户带到目标库。
 
 ### MySQL → MeiliSearch 示例
 

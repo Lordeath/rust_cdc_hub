@@ -133,6 +133,10 @@ pub struct CdcConfig {
     pub auto_create_table: Option<bool>,
     pub auto_add_column: Option<bool>,
     pub auto_modify_column: Option<bool>,
+    #[serde(alias = "sync_stored_procedures")]
+    pub sync_stored_procedure: Option<bool>,
+    #[serde(alias = "overwrite_stored_procedures")]
+    pub overwrite_stored_procedure: Option<bool>,
     pub plugins: Option<Vec<PluginConfig>>,
     pub source_batch_size: Option<usize>,
     pub sink_batch_size: Option<usize>,
@@ -206,6 +210,14 @@ impl CdcConfig {
             }
         }
         result
+    }
+
+    pub fn sync_stored_procedure_enabled(&self) -> bool {
+        self.sync_stored_procedure.unwrap_or(false)
+    }
+
+    pub fn overwrite_stored_procedure_enabled(&self) -> bool {
+        self.overwrite_stored_procedure.unwrap_or(false)
     }
 
     pub fn target_database_for_source(&self, source_database: &str) -> String {
@@ -1367,6 +1379,8 @@ mod tests {
             auto_create_table: None,
             auto_add_column: None,
             auto_modify_column: None,
+            sync_stored_procedure: None,
+            overwrite_stored_procedure: None,
             plugins: None,
             source_batch_size: None,
             sink_batch_size: None,
@@ -1415,6 +1429,28 @@ mod tests {
 
         assert_eq!(config.sink_databases(), vec!["target_schema".to_string()]);
         assert_eq!(config.target_database_for_source("src"), "target_schema");
+    }
+
+    #[test]
+    fn test_stored_procedure_flags_default_false_and_parse_aliases() {
+        let default_config = multi_mode_config();
+        assert!(!default_config.sync_stored_procedure_enabled());
+        assert!(!default_config.overwrite_stored_procedure_enabled());
+
+        let config: CdcConfig = serde_json::from_str(
+            r#"{
+                "source_type": "MySQL",
+                "sink_type": "MySQL",
+                "source_config": [{}],
+                "sink_config": [{}],
+                "sync_stored_procedures": true,
+                "overwrite_stored_procedures": true
+            }"#,
+        )
+        .unwrap();
+
+        assert!(config.sync_stored_procedure_enabled());
+        assert!(config.overwrite_stored_procedure_enabled());
     }
 
     #[test]

@@ -13,9 +13,9 @@ use common::{
     database_table_key, get_mysql_pool_by_url, mysql_connection_url_from_config,
     mysql_row_text_value,
 };
-use sqlx::mysql::{MySqlArguments, MySqlQueryResult};
+use sqlx::mysql::{MySqlArguments, MySqlQueryResult, MySqlRow};
 use sqlx::query::Query;
-use sqlx::{Executor, MySql, Pool};
+use sqlx::{Executor, MySql, Pool, Row};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
@@ -23,6 +23,13 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tracing::log::trace;
 use tracing::{debug, error, info};
+
+#[derive(Debug, Clone)]
+struct MySqlRoutineDefinition {
+    name: String,
+    create_sql: String,
+    sql_mode: String,
+}
 
 pub struct MySqlSink {
     primary_database: String,
@@ -65,6 +72,12 @@ impl MySqlSink {
             };
             target_pools.insert(database.to_ascii_lowercase(), pool);
             connection_urls.insert(database.to_ascii_lowercase(), connection_url);
+        }
+
+        if config.sync_stored_procedure_enabled() {
+            Self::sync_stored_procedures(config, &target_pools, primary_database.as_str())
+                .await
+                .unwrap_or_else(|e| panic!("MySQL sync stored procedure failed: {}", e));
         }
 
         let mut target_tables: HashMap<String, TableInfoVo> = HashMap::new();
@@ -323,6 +336,330 @@ impl MySqlSink {
             Self::quote_mysql_identifier(database),
             Self::quote_mysql_identifier(table_name)
         )
+    }
+
+    fn qualified_routine_name(database: &str, routine_name: &str) -> String {
+        Self::qualified_table_name(database, routine_name)
+    }
+
+    async fn sync_stored_procedures(
+        config: &CdcConfig,
+        target_pools: &HashMap<String, Pool<MySql>>,
+        primary_database: &str,
+    ) -> Result<(), String> {
+        let overwrite = config.overwrite_stored_procedure_enabled();
+        let source_databases = config.source_databases();
+        for (source_index, source_database) in source_databases.iter().enumerate() {
+            if source_database.trim().is_empty() {
+                continue;
+            }
+            let source_config_index = if config.multi_mode_open() {
+                0
+            } else {
+                source_index
+            };
+            let target_database = if config.multi_mode_open() {
+                config.target_database_for_source(source_database)
+            } else {
+                primary_database.to_string()
+            };
+            let target_pool = target_pools
+                .get(target_database.to_ascii_lowercase().as_str())
+                .ok_or_else(|| format!("target database pool not found: {}", target_database))?;
+            let source_url = mysql_connection_url_from_config(
+                &config.source_config[source_config_index],
+                Some(source_database),
+            );
+            let source_pool =
+                get_mysql_pool_by_url(&source_url, "mysql sink 同步存储过程-读取源库存储过程")
+                    .await?;
+            let routines = Self::fetch_source_stored_procedures(&source_pool, source_database)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "fetch source stored procedures failed: {} {}",
+                        source_database, e
+                    )
+                })?;
+            if routines.is_empty() {
+                info!(
+                    "MySQL source stored procedure not found: {}",
+                    source_database
+                );
+                continue;
+            }
+            for routine in routines {
+                Self::sync_one_stored_procedure(
+                    target_pool,
+                    source_database,
+                    target_database.as_str(),
+                    &routine,
+                    overwrite,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn fetch_source_stored_procedures(
+        source_pool: &Pool<MySql>,
+        source_database: &str,
+    ) -> Result<Vec<MySqlRoutineDefinition>, String> {
+        let routine_rows = sqlx::query(
+            r#"
+            SELECT ROUTINE_NAME
+            FROM information_schema.ROUTINES
+            WHERE ROUTINE_SCHEMA = ?
+              AND ROUTINE_TYPE = 'PROCEDURE'
+            ORDER BY ROUTINE_NAME
+            "#,
+        )
+        .persistent(false)
+        .bind(source_database)
+        .fetch_all(source_pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let mut routines = Vec::with_capacity(routine_rows.len());
+        for row in routine_rows {
+            let name = mysql_row_text_value(&row, "ROUTINE_NAME");
+            let show_sql = format!(
+                "SHOW CREATE PROCEDURE {}",
+                Self::qualified_routine_name(source_database, name.as_str())
+            );
+            let create_row = sqlx::query(show_sql.as_str())
+                .persistent(false)
+                .fetch_one(source_pool)
+                .await
+                .map_err(|e| format!("{}: {}", show_sql, e))?;
+            routines.push(Self::parse_show_create_procedure_row(&name, &create_row)?);
+        }
+        Ok(routines)
+    }
+
+    fn parse_show_create_procedure_row(
+        fallback_name: &str,
+        row: &MySqlRow,
+    ) -> Result<MySqlRoutineDefinition, String> {
+        let name = row
+            .try_get::<String, _>("Procedure")
+            .or_else(|_| row.try_get::<String, _>(0))
+            .unwrap_or_else(|_| fallback_name.to_string());
+        let sql_mode = row
+            .try_get::<String, _>("sql_mode")
+            .or_else(|_| row.try_get::<String, _>(1))
+            .unwrap_or_default();
+        let create_sql = row
+            .try_get::<String, _>("Create Procedure")
+            .or_else(|_| row.try_get::<String, _>(2))
+            .map_err(|e| format!("SHOW CREATE PROCEDURE 读取 Create Procedure 失败: {}", e))?;
+        Ok(MySqlRoutineDefinition {
+            name,
+            create_sql: Self::strip_create_procedure_definer(create_sql.as_str()),
+            sql_mode,
+        })
+    }
+
+    async fn sync_one_stored_procedure(
+        target_pool: &Pool<MySql>,
+        source_database: &str,
+        target_database: &str,
+        routine: &MySqlRoutineDefinition,
+        overwrite: bool,
+    ) -> Result<(), String> {
+        let exists =
+            Self::target_stored_procedure_exists(target_pool, target_database, &routine.name)
+                .await?;
+        if exists && !overwrite {
+            info!(
+                "MySQL stored procedure exists, skip: {}.{} -> {}.{}",
+                source_database, routine.name, target_database, routine.name
+            );
+            return Ok(());
+        }
+
+        let mut conn = target_pool.acquire().await.map_err(|e| e.to_string())?;
+        let original_sql_mode = sqlx::query("SELECT @@SESSION.sql_mode AS sql_mode")
+            .persistent(false)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| e.to_string())
+            .map(|row| {
+                row.try_get::<String, _>("sql_mode")
+                    .or_else(|_| row.try_get::<String, _>(0))
+                    .unwrap_or_default()
+            })?;
+
+        let sync_result = async {
+            let use_sql = format!("USE {}", Self::quote_mysql_identifier(target_database));
+            (&mut *conn)
+                .execute(use_sql.as_str())
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("SET SESSION sql_mode = ?")
+                .persistent(false)
+                .bind(routine.sql_mode.as_str())
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| e.to_string())?;
+            if exists {
+                let drop_sql = format!(
+                    "DROP PROCEDURE IF EXISTS {}",
+                    Self::qualified_routine_name(target_database, routine.name.as_str())
+                );
+                (&mut *conn)
+                    .execute(drop_sql.as_str())
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            (&mut *conn)
+                .execute(routine.create_sql.as_str())
+                .await
+                .map_err(|e| {
+                    format!(
+                        "create stored procedure failed: {}.{} {}",
+                        target_database, routine.name, e
+                    )
+                })
+        }
+        .await;
+        let restore_result = sqlx::query("SET SESSION sql_mode = ?")
+            .persistent(false)
+            .bind(original_sql_mode.as_str())
+            .execute(&mut *conn)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        match (sync_result, restore_result) {
+            (Ok(_), Ok(_)) => {}
+            (Err(e), Ok(_)) => return Err(e),
+            (Ok(_), Err(e)) => return Err(format!("restore target sql_mode failed: {}", e)),
+            (Err(e), Err(restore_error)) => {
+                return Err(format!(
+                    "{}; restore target sql_mode failed: {}",
+                    e, restore_error
+                ));
+            }
+        }
+        info!(
+            "MySQL sync stored procedure success: {}.{} -> {}.{} overwrite={}",
+            source_database, routine.name, target_database, routine.name, overwrite
+        );
+        Ok(())
+    }
+
+    async fn target_stored_procedure_exists(
+        target_pool: &Pool<MySql>,
+        target_database: &str,
+        routine_name: &str,
+    ) -> Result<bool, String> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) AS cnt
+            FROM information_schema.ROUTINES
+            WHERE ROUTINE_SCHEMA = ?
+              AND ROUTINE_TYPE = 'PROCEDURE'
+              AND ROUTINE_NAME = ?
+            "#,
+        )
+        .persistent(false)
+        .bind(target_database)
+        .bind(routine_name)
+        .fetch_one(target_pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let count = row
+            .try_get::<i64, _>("cnt")
+            .or_else(|_| row.try_get::<i64, _>(0))
+            .or_else(|_| row.try_get::<u64, _>("cnt").map(|v| v as i64))
+            .or_else(|_| row.try_get::<u64, _>(0).map(|v| v as i64))
+            .unwrap_or(0);
+        Ok(count > 0)
+    }
+
+    fn strip_create_procedure_definer(create_sql: &str) -> String {
+        let sql = create_sql.trim_start();
+        if !Self::starts_with_keyword(sql, 0, "CREATE") {
+            return create_sql.to_string();
+        }
+        let mut pos = Self::skip_ascii_whitespace(sql, "CREATE".len());
+        if !Self::starts_with_keyword(sql, pos, "DEFINER") {
+            return create_sql.to_string();
+        }
+        pos = Self::skip_ascii_whitespace(sql, pos + "DEFINER".len());
+        if sql.as_bytes().get(pos) != Some(&b'=') {
+            return create_sql.to_string();
+        }
+        let Some(routine_keyword_pos) =
+            Self::find_keyword_outside_quotes(sql, pos + 1, "PROCEDURE")
+        else {
+            return create_sql.to_string();
+        };
+        format!("CREATE {}", sql[routine_keyword_pos..].trim_start())
+    }
+
+    fn skip_ascii_whitespace(value: &str, mut pos: usize) -> usize {
+        while value
+            .as_bytes()
+            .get(pos)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            pos += 1;
+        }
+        pos
+    }
+
+    fn starts_with_keyword(value: &str, pos: usize, keyword: &str) -> bool {
+        let bytes = value.as_bytes();
+        let keyword_bytes = keyword.as_bytes();
+        if pos + keyword_bytes.len() > bytes.len() {
+            return false;
+        }
+        if !bytes[pos..pos + keyword_bytes.len()].eq_ignore_ascii_case(keyword_bytes) {
+            return false;
+        }
+        let before_ok = pos == 0 || !Self::is_ascii_identifier_byte(bytes[pos - 1]);
+        let after_pos = pos + keyword_bytes.len();
+        let after_ok =
+            after_pos >= bytes.len() || !Self::is_ascii_identifier_byte(bytes[after_pos]);
+        before_ok && after_ok
+    }
+
+    fn find_keyword_outside_quotes(value: &str, start: usize, keyword: &str) -> Option<usize> {
+        let bytes = value.as_bytes();
+        let mut quote = None;
+        let mut pos = start;
+        while pos < bytes.len() {
+            let byte = bytes[pos];
+            if let Some(quote_byte) = quote {
+                if byte == quote_byte {
+                    if bytes.get(pos + 1) == Some(&quote_byte) {
+                        pos += 2;
+                    } else {
+                        quote = None;
+                        pos += 1;
+                    }
+                } else {
+                    pos += 1;
+                }
+                continue;
+            }
+            if matches!(byte, b'`' | b'\'' | b'"') {
+                quote = Some(byte);
+                pos += 1;
+                continue;
+            }
+            if Self::starts_with_keyword(value, pos, keyword) {
+                return Some(pos);
+            }
+            pos += 1;
+        }
+        None
+    }
+
+    fn is_ascii_identifier_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
     }
 
     fn validate_merged_target_schema(table_info_list: &[TableInfoVo]) -> Result<(), String> {
@@ -1142,6 +1479,37 @@ mod tests {
         ];
 
         assert!(MySqlSink::validate_merged_target_schema(&tables).is_ok());
+    }
+
+    #[test]
+    fn strips_create_procedure_definer() {
+        let sql = "CREATE DEFINER=`source_user`@`%` PROCEDURE `sync_demo`() BEGIN SELECT 1; END";
+
+        assert_eq!(
+            MySqlSink::strip_create_procedure_definer(sql),
+            "CREATE PROCEDURE `sync_demo`() BEGIN SELECT 1; END"
+        );
+    }
+
+    #[test]
+    fn strips_create_procedure_definer_with_spaces_inside_quotes() {
+        let sql = "CREATE DEFINER=`source user`@`host name` PROCEDURE `sync_demo`() SQL SECURITY DEFINER BEGIN SELECT 'PROCEDURE'; END";
+
+        let stripped = MySqlSink::strip_create_procedure_definer(sql);
+
+        assert_eq!(
+            stripped,
+            "CREATE PROCEDURE `sync_demo`() SQL SECURITY DEFINER BEGIN SELECT 'PROCEDURE'; END"
+        );
+        assert!(!stripped.contains("source user"));
+        assert!(stripped.contains("SQL SECURITY DEFINER"));
+    }
+
+    #[test]
+    fn strip_create_procedure_definer_leaves_sql_without_definer() {
+        let sql = "CREATE PROCEDURE `sync_demo`() BEGIN SELECT 1; END";
+
+        assert_eq!(MySqlSink::strip_create_procedure_definer(sql), sql);
     }
 
     #[test]
