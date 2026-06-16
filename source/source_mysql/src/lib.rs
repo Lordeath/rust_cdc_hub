@@ -69,7 +69,7 @@ struct BinlogTableColumnInfo {
     database_name: String,
     table_name: String,
     column_count: usize,
-    column_names: Option<Vec<String>>,
+    row_column_names: Option<Vec<Option<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -852,7 +852,8 @@ fn binlog_table_column_info(event: &TableMapEvent) -> BinlogTableColumnInfo {
         database_name: event.database_name.clone(),
         table_name: event.table_name.clone(),
         column_count: event.column_types.len(),
-        column_names: table_map_column_names(event),
+        row_column_names: table_map_column_names(event)
+            .map(|names| names.into_iter().map(Some).collect()),
     }
 }
 
@@ -870,29 +871,103 @@ fn table_map_column_names(event: &TableMapEvent) -> Option<Vec<String>> {
     column_names.filter(|names| names.iter().all(|name| !name.is_empty()))
 }
 
-fn reconcile_row_columns(
+fn table_map_column_visibility(event: &TableMapEvent) -> Option<Vec<bool>> {
+    let metadata = event.table_metadata.as_ref()?;
+    if metadata.columns.len() != event.column_types.len() {
+        return None;
+    }
+
+    let mut has_visibility_metadata = false;
+    let visibility = metadata
+        .columns
+        .iter()
+        .map(|column| match column.is_visible {
+            Some(is_visible) => {
+                has_visibility_metadata = true;
+                is_visible
+            }
+            None => true,
+        })
+        .collect::<Vec<_>>();
+    has_visibility_metadata.then_some(visibility)
+}
+
+fn align_current_columns_to_row_columns(
     table_label: &str,
-    mut columns: Vec<String>,
+    columns: Vec<String>,
     row_column_count: usize,
+    visibility: Option<Vec<bool>>,
     column_source: &str,
-) -> Vec<String> {
+) -> Vec<Option<String>> {
     if columns.len() == row_column_count {
-        return columns;
+        return columns.into_iter().map(Some).collect();
+    }
+
+    if let Some(visibility) = visibility
+        && visibility.len() == row_column_count
+    {
+        let visible_count = visibility.iter().filter(|visible| **visible).count();
+        if visible_count == columns.len() {
+            let mut columns = columns.into_iter();
+            return visibility
+                .into_iter()
+                .map(|visible| if visible { columns.next() } else { None })
+                .collect();
+        }
+        warn!(
+            "MySQL binlog TableMap可见列数与{}列数不一致 table={} row_columns={} visible_columns={} {}_columns={}",
+            column_source,
+            table_label,
+            row_column_count,
+            visible_count,
+            column_source,
+            columns.len()
+        );
     }
 
     warn!(
         "MySQL binlog row列数与{}列数不一致 table={} row_columns={} {}_columns={}; \
-         将按可匹配列解析，多余字段值会被忽略。若字段不是尾部新增/删除，请重新初始化该表",
+         将按可匹配列解析，多余字段值会被忽略。若缺少的是隐藏列且TableMap没有visibility元数据，字段仍可能错位",
         column_source,
         table_label,
         row_column_count,
         column_source,
         columns.len()
     );
+    let mut columns = columns.into_iter().map(Some).collect::<Vec<_>>();
     if columns.len() > row_column_count {
         columns.truncate(row_column_count);
+    } else {
+        columns.resize(row_column_count, None);
     }
     columns
+}
+
+fn reconcile_row_column_names(
+    table_label: &str,
+    mut column_names: Vec<Option<String>>,
+    row_column_count: usize,
+    column_source: &str,
+) -> Vec<Option<String>> {
+    if column_names.len() == row_column_count {
+        return column_names;
+    }
+
+    warn!(
+        "MySQL binlog row列数与{}列数不一致 table={} row_columns={} {}_columns={}; \
+         将按可匹配列解析，多余字段值会被忽略",
+        column_source,
+        table_label,
+        row_column_count,
+        column_source,
+        column_names.len()
+    );
+    if column_names.len() > row_column_count {
+        column_names.truncate(row_column_count);
+    } else {
+        column_names.resize(row_column_count, None);
+    }
+    column_names
 }
 
 async fn current_table_columns_for_row(
@@ -920,7 +995,7 @@ async fn resolve_table_map_column_info(
     pool: &Pool<MySql>,
 ) -> BinlogTableColumnInfo {
     let mut info = binlog_table_column_info(event);
-    if info.column_names.is_some() {
+    if info.row_column_names.is_some() {
         return info;
     }
 
@@ -930,9 +1005,9 @@ async fn resolve_table_map_column_info(
             .eq_ignore_ascii_case(&info.database_name)
         && existing.table_name.eq_ignore_ascii_case(&info.table_name)
         && existing.column_count == info.column_count
-        && existing.column_names.is_some()
+        && existing.row_column_names.is_some()
     {
-        info.column_names = existing.column_names.clone();
+        info.row_column_names = existing.row_column_names.clone();
         return info;
     }
 
@@ -945,10 +1020,11 @@ async fn resolve_table_map_column_info(
     )
     .await;
     let table_label = database_table_key(info.database_name.as_str(), info.table_name.as_str());
-    info.column_names = Some(reconcile_row_columns(
+    info.row_column_names = Some(align_current_columns_to_row_columns(
         table_label.as_str(),
         current_columns,
         info.column_count,
+        table_map_column_visibility(event),
         "当前表结构",
     ));
     info
@@ -1745,17 +1821,17 @@ async fn parse_row(
     let mut data: HashMap<String, Value> = HashMap::new();
     let table_key = config.source_table_key(table_name);
     let row_column_count = row.column_values.len();
-    let columns = if let Some(binlog_columns) = binlog_columns {
+    let row_column_names = if let Some(binlog_columns) = binlog_columns {
         if binlog_columns.column_count != row_column_count {
             warn!(
                 "MySQL TableMap列数与RowEvent列数不一致 table={} table_map_columns={} row_columns={}",
                 table_key, binlog_columns.column_count, row_column_count
             );
         }
-        if let Some(column_names) = binlog_columns.column_names.as_ref() {
-            reconcile_row_columns(
+        if let Some(row_column_names) = binlog_columns.row_column_names.as_ref() {
+            reconcile_row_column_names(
                 table_key.as_str(),
-                column_names.clone(),
+                row_column_names.clone(),
                 row_column_count,
                 "binlog TableMap",
             )
@@ -1768,10 +1844,11 @@ async fn parse_row(
                 pool,
             )
             .await;
-            reconcile_row_columns(
+            align_current_columns_to_row_columns(
                 table_key.as_str(),
                 current_columns,
                 row_column_count,
+                None,
                 "当前表结构",
             )
         }
@@ -1779,17 +1856,18 @@ async fn parse_row(
         let current_columns =
             current_table_columns_for_row(table_name, row_column_count, columns_map, config, pool)
                 .await;
-        reconcile_row_columns(
+        align_current_columns_to_row_columns(
             table_key.as_str(),
             current_columns,
             row_column_count,
+            None,
             "当前表结构",
         )
     };
 
     for (index, column_value) in row.column_values.into_iter().enumerate() {
         // TODO 这里可能存在问题，直接用顺序的索引来获取column_name，会导致字段对不上
-        let Some(column_name) = columns.get(index).cloned() else {
+        let Some(Some(column_name)) = row_column_names.get(index).cloned() else {
             continue;
         };
         match column_value {
@@ -1868,8 +1946,9 @@ async fn parse_row(
                 data.insert(column_name, value);
             }
             _ => {
-                columns
+                row_column_names
                     .iter()
+                    .flatten()
                     .for_each(|column_name| error!("column: {}", column_name));
                 error!("column_name: {:?}", column_name);
                 error!("column_value: {:?}", column_value);
@@ -1927,6 +2006,30 @@ mod tests {
         }
     }
 
+    fn table_map_event_with_visibility(visibility: Vec<Option<bool>>) -> TableMapEvent {
+        let columns = visibility
+            .iter()
+            .map(|is_visible| ColumnMetadata {
+                is_visible: *is_visible,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        TableMapEvent {
+            table_id: 1,
+            database_name: "source_db".to_string(),
+            table_name: "orders".to_string(),
+            column_types: vec![3; columns.len()],
+            column_metas: vec![0; columns.len()],
+            null_bits: vec![false; columns.len()],
+            table_metadata: Some(TableMetadata {
+                default_charset: None,
+                enum_and_set_default_charset: None,
+                columns,
+            }),
+        }
+    }
+
     #[test]
     fn table_map_column_names_reads_complete_metadata() {
         let event = table_map_event_with_column_names(vec![Some("id"), Some("name")]);
@@ -1945,7 +2048,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_row_columns_truncates_extra_columns() {
+    fn align_current_columns_truncates_extra_columns() {
         let columns = vec![
             "id".to_string(),
             "name".to_string(),
@@ -1953,18 +2056,47 @@ mod tests {
         ];
 
         assert_eq!(
-            reconcile_row_columns("source_db.orders", columns, 2, "当前表结构"),
-            vec!["id".to_string(), "name".to_string()]
+            align_current_columns_to_row_columns(
+                "source_db.orders",
+                columns,
+                2,
+                None,
+                "当前表结构"
+            ),
+            vec![Some("id".to_string()), Some("name".to_string())]
         );
     }
 
     #[test]
-    fn reconcile_row_columns_keeps_short_columns() {
+    fn align_current_columns_pads_short_columns() {
         let columns = vec!["id".to_string(), "name".to_string()];
 
         assert_eq!(
-            reconcile_row_columns("source_db.orders", columns.clone(), 3, "当前表结构"),
-            columns
+            align_current_columns_to_row_columns(
+                "source_db.orders",
+                columns,
+                3,
+                None,
+                "当前表结构"
+            ),
+            vec![Some("id".to_string()), Some("name".to_string()), None]
+        );
+    }
+
+    #[test]
+    fn align_current_columns_uses_table_map_visibility() {
+        let event = table_map_event_with_visibility(vec![Some(true), Some(false), Some(true)]);
+        let columns = vec!["id".to_string(), "settleDate".to_string()];
+
+        assert_eq!(
+            align_current_columns_to_row_columns(
+                "source_db.orders",
+                columns,
+                3,
+                table_map_column_visibility(&event),
+                "当前表结构"
+            ),
+            vec![Some("id".to_string()), None, Some("settleDate".to_string())]
         );
     }
 
@@ -1992,10 +2124,10 @@ mod tests {
             database_name: "source_db".to_string(),
             table_name: "orders".to_string(),
             column_count: 3,
-            column_names: Some(vec![
-                "id".to_string(),
-                "name".to_string(),
-                "created_at".to_string(),
+            row_column_names: Some(vec![
+                Some("id".to_string()),
+                Some("name".to_string()),
+                Some("created_at".to_string()),
             ]),
         };
         let row = RowEvent {
@@ -2022,6 +2154,62 @@ mod tests {
             other => panic!("unexpected name value: {:?}", other),
         }
         assert!(parsed.get("created_at").is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_row_skips_hidden_binlog_column_without_shifting_later_columns() {
+        let config = MysqlSourceConfigDetail {
+            username: "".to_string(),
+            password: "".to_string(),
+            host: "".to_string(),
+            port: "".to_string(),
+            database: "source_db".to_string(),
+            target_database: "target_db".to_string(),
+            server_id: 1,
+            connection_url: "".to_string(),
+            table_info_list: vec![],
+            batchsize: 100,
+            start_binlog_filename: None,
+            start_binlog_position: None,
+        };
+        let mut pool =
+            sqlx::Pool::<sqlx::MySql>::connect_lazy("mysql://root:password@localhost/source_db")
+                .unwrap();
+        let columns_map = Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg());
+        let binlog_columns = BinlogTableColumnInfo {
+            database_name: "source_db".to_string(),
+            table_name: "orders".to_string(),
+            column_count: 3,
+            row_column_names: Some(vec![
+                Some("id".to_string()),
+                None,
+                Some("settleDate".to_string()),
+            ]),
+        };
+        let row = RowEvent {
+            column_values: vec![
+                ColumnValue::Long(7),
+                ColumnValue::String(b"".to_vec()),
+                ColumnValue::Date("2026-06-16".to_string()),
+            ],
+        };
+
+        let parsed = parse_row(
+            row,
+            "orders",
+            &columns_map,
+            &config,
+            &mut pool,
+            Some(&binlog_columns),
+        )
+        .await;
+
+        assert_eq!(parsed.len(), 2);
+        assert!(matches!(parsed.get("id"), &Value::Int32(7)));
+        match parsed.get("settleDate") {
+            Value::Date(date) => assert_eq!(date, "2026-06-16"),
+            other => panic!("unexpected settleDate value: {:?}", other),
+        }
     }
 
     #[test]
