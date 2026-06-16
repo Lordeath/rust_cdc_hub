@@ -926,25 +926,27 @@ fn align_current_columns_to_row_columns(
         );
     }
 
-    if columns.len() + generated_columns.len() == row_column_count
-        && generated_columns
+    let missing_generated_columns =
+        generated_columns_missing_from_columns(generated_columns, &columns);
+    if columns.len() + missing_generated_columns.len() == row_column_count
+        && missing_generated_columns
             .iter()
             .all(|(ordinal, _)| *ordinal < row_column_count)
     {
         warn!(
             "MySQL binlog row列数与{}列数不一致 table={} row_columns={} {}_columns={}; \
-             根据SHOW CREATE TABLE中的生成列位置跳过: {:?}",
+             根据当前列集合中缺失的SHOW CREATE TABLE生成列位置跳过: {:?}",
             column_source,
             table_label,
             row_column_count,
             column_source,
             columns.len(),
-            generated_columns
+            missing_generated_columns
         );
         let mut columns = columns.into_iter();
         return (0..row_column_count)
             .map(|ordinal| {
-                if generated_columns
+                if missing_generated_columns
                     .iter()
                     .any(|(generated_ordinal, _)| *generated_ordinal == ordinal)
                 {
@@ -956,6 +958,19 @@ fn align_current_columns_to_row_columns(
             .collect();
     }
 
+    if !generated_columns.is_empty() {
+        warn!(
+            "MySQL binlog列对齐诊断 table={} row_columns={} {}_columns={} \
+             generated_columns={:?} missing_generated_columns={:?} focus_positions={:?}",
+            table_label,
+            row_column_count,
+            column_source,
+            columns.len(),
+            generated_columns,
+            missing_generated_columns,
+            focus_column_positions(&columns)
+        );
+    }
     warn!(
         "MySQL binlog row列数与{}列数不一致 table={} row_columns={} {}_columns={}; \
          将按可匹配列解析，多余字段值会被忽略。若缺少的是隐藏列且TableMap没有visibility元数据，字段仍可能错位",
@@ -972,6 +987,47 @@ fn align_current_columns_to_row_columns(
         columns.resize(row_column_count, None);
     }
     columns
+}
+
+fn generated_columns_missing_from_columns(
+    generated_columns: &[(usize, String)],
+    columns: &[String],
+) -> Vec<(usize, String)> {
+    generated_columns
+        .iter()
+        .filter(|(_, generated_column)| {
+            !columns
+                .iter()
+                .any(|column| column.eq_ignore_ascii_case(generated_column))
+        })
+        .cloned()
+        .collect()
+}
+
+fn focus_column_positions(columns: &[String]) -> Vec<(&'static str, Option<usize>)> {
+    const FOCUS_COLUMNS: &[&str] = &[
+        "path",
+        "HouseId",
+        "fullPath",
+        "bankCollectionLock",
+        "checkTime",
+        "CreateTime",
+        "settleDate",
+        "ShouldChargeDate",
+        "uuid",
+    ];
+
+    FOCUS_COLUMNS
+        .iter()
+        .map(|focus_column| {
+            (
+                *focus_column,
+                columns
+                    .iter()
+                    .position(|column| column.eq_ignore_ascii_case(focus_column)),
+            )
+        })
+        .collect()
 }
 
 fn reconcile_row_column_names(
@@ -1115,6 +1171,18 @@ async fn resolve_table_map_column_info(
         );
         info.row_column_names = Some(create_table_columns.into_iter().map(Some).collect());
         return info;
+    }
+    if !create_table_columns.is_empty() {
+        let table_label = database_table_key(info.database_name.as_str(), info.table_name.as_str());
+        warn!(
+            "MySQL binlog TableMap缺少列名元数据且SHOW CREATE TABLE列数不匹配 table={} \
+             row_columns={} create_table_columns={} generated_columns={:?} focus_positions={:?}",
+            table_label,
+            info.column_count,
+            create_table_columns.len(),
+            generated_columns_for_table(config, info.table_name.as_str()),
+            focus_column_positions(&create_table_columns)
+        );
     }
 
     let current_columns = current_table_columns_for_row(
@@ -2249,6 +2317,34 @@ mod tests {
                 Some("HouseId".to_string()),
                 None,
                 Some("settleDate".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn align_current_columns_keeps_present_generated_column() {
+        let columns = vec![
+            "path".to_string(),
+            "HouseId".to_string(),
+            "fullPath".to_string(),
+            "bankCollectionLock".to_string(),
+        ];
+
+        assert_eq!(
+            align_current_columns_to_row_columns(
+                "source_db.orders",
+                columns,
+                5,
+                None,
+                &[(2, "fullPath".to_string())],
+                "当前表结构"
+            ),
+            vec![
+                Some("path".to_string()),
+                Some("HouseId".to_string()),
+                Some("fullPath".to_string()),
+                Some("bankCollectionLock".to_string()),
+                None
             ]
         );
     }
