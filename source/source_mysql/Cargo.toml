@@ -2,6 +2,7 @@
 name = "source_mysql"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 mysql-binlog-connector-rust = "0.3.3"

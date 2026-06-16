@@ -486,4 +486,4 @@ cargo test -p common --verbose
 
 ## License
 
-请以仓库中的许可证文件为准；如果仓库尚未声明许可证，请在生产使用或分发前补充许可证信息。
+本项目使用 Apache License 2.0，详见 [LICENSE](LICENSE)。

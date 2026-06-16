@@ -12,10 +12,14 @@ members = [
     "plugin"
 ]
 
+[workspace.package]
+license = "Apache-2.0"
+
 [package]
 name = "rust_cdc_hub"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 common = { path = "common" }

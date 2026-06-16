@@ -447,4 +447,4 @@ To add a new Source or Sink:
 
 ## License
 
-Refer to the license file in this repository. If no license has been declared yet, add one before production usage or redistribution.
+This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
