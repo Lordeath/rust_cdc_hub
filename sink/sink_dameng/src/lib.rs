@@ -151,13 +151,8 @@ impl DamengSink {
     }
 
     async fn reconnect(&self) -> Result<(), String> {
-        let mut client =
-            Self::connect_client(&self.host, self.port, &self.username, &self.password)
-                .map_err(|e| e.to_string())?;
-        if !self.schema.is_empty() {
-            let _ =
-                client.execute(format!("SET SCHEMA {}", Self::quote_ident(&self.schema)).as_str());
-        }
+        let client = Self::connect_client(&self.host, self.port, &self.username, &self.password)
+            .map_err(|e| e.to_string())?;
         *self.client.lock().await = client;
         Ok(())
     }
@@ -199,35 +194,37 @@ impl DamengSink {
             return Ok(());
         }
 
-        let set_schema_sql = Self::set_schema_sql(schema);
-        match self.execute(set_schema_sql.as_str()).await {
-            Ok(_) => return Ok(()),
-            Err(e) if !self.auto_create_database => {
+        if self.schema_exists(schema).await? {
+            return Ok(());
+        }
+        if !self.auto_create_database {
+            return Err(format!(
+                "target schema {} is unavailable and auto_create_database is false",
+                schema
+            ));
+        }
+
+        let create_schema_sql = Self::create_schema_sql(schema);
+        match self.execute(create_schema_sql.as_str()).await {
+            Ok(_) => {}
+            Err(create_schema_error) => {
+                if self.schema_exists(schema).await.unwrap_or(false) {
+                    return Ok(());
+                }
                 return Err(format!(
-                    "target schema {} is unavailable and auto_create_database is false: {}",
-                    schema, e
+                    "create schema failed: {} {}",
+                    schema, create_schema_error
                 ));
             }
-            Err(set_schema_error) => {
-                let create_schema_sql = Self::create_schema_sql(schema);
-                match self.execute(create_schema_sql.as_str()).await {
-                    Ok(_) => {
-                        info!("Dameng auto create schema success: {}", schema);
-                    }
-                    Err(create_schema_error) => match self.execute(set_schema_sql.as_str()).await {
-                        Ok(_) => return Ok(()),
-                        Err(retry_set_schema_error) => {
-                            return Err(format!(
-                                "set schema failed: {}; create schema failed: {}; retry set schema failed: {}",
-                                set_schema_error, create_schema_error, retry_set_schema_error
-                            ));
-                        }
-                    },
-                }
-                self.execute(set_schema_sql.as_str()).await?;
-                Ok(())
-            }
         }
+        if !self.schema_exists(schema).await? {
+            return Err(format!(
+                "create schema succeeded but schema is not visible: {}",
+                schema
+            ));
+        }
+        info!("Dameng auto create schema success: {}", schema);
+        Ok(())
     }
 
     async fn ensure_table(&self, schema: &str, table_info: &TableInfoVo) -> Result<(), String> {
@@ -418,6 +415,17 @@ impl DamengSink {
             )
         };
         let rows = self.query(sql.as_str(), &[]).await?;
+        let count = rows
+            .first()
+            .and_then(|row| row.get::<i32>(0).ok())
+            .unwrap_or(0);
+        Ok(count > 0)
+    }
+
+    async fn schema_exists(&self, schema: &str) -> Result<bool, String> {
+        let rows = self
+            .query(Self::schema_exists_sql(schema).as_str(), &[])
+            .await?;
         let count = rows
             .first()
             .and_then(|row| row.get::<i32>(0).ok())
@@ -662,8 +670,11 @@ impl DamengSink {
         format!("CREATE SCHEMA {}", Self::quote_ident(schema))
     }
 
-    fn set_schema_sql(schema: &str) -> String {
-        format!("SET SCHEMA {}", Self::quote_ident(schema))
+    fn schema_exists_sql(schema: &str) -> String {
+        format!(
+            "SELECT COUNT(*) FROM SYSOBJECTS WHERE TYPE$ = 'SCH' AND {}",
+            Self::eq_original_or_upper_sql("NAME", schema)
+        )
     }
 
     fn table_info_target_schema(table_info: &TableInfoVo, fallback: &str) -> String {
@@ -1421,18 +1432,22 @@ mod tests {
     }
 
     #[test]
-    fn schema_sql_quotes_identifiers() {
+    fn schema_sql_quotes_identifiers_and_literals() {
         assert_eq!(
             DamengSink::create_schema_sql("TARGET_SCHEMA"),
             "CREATE SCHEMA \"TARGET_SCHEMA\""
         );
         assert_eq!(
-            DamengSink::set_schema_sql("TARGET_SCHEMA"),
-            "SET SCHEMA \"TARGET_SCHEMA\""
+            DamengSink::schema_exists_sql("TARGET_SCHEMA"),
+            "SELECT COUNT(*) FROM SYSOBJECTS WHERE TYPE$ = 'SCH' AND (NAME = 'TARGET_SCHEMA' OR NAME = 'TARGET_SCHEMA')"
         );
         assert_eq!(
             DamengSink::create_schema_sql("target\"schema"),
             "CREATE SCHEMA \"target\"\"schema\""
+        );
+        assert_eq!(
+            DamengSink::schema_exists_sql("newsee-bpm"),
+            "SELECT COUNT(*) FROM SYSOBJECTS WHERE TYPE$ = 'SCH' AND (NAME = 'newsee-bpm' OR NAME = 'NEWSEE-BPM')"
         );
     }
 
