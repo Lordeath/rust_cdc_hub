@@ -538,6 +538,10 @@ impl DamengSink {
     }
 
     async fn execute_with_params(&self, sql: &str, params: &[DamengParam]) -> Result<u64, String> {
+        if !sql.is_ascii() {
+            return self.execute_inline_params(sql, params, false).await;
+        }
+
         let first_result = {
             let mut client = self.client.lock().await;
             let refs = Self::param_refs(params);
@@ -562,6 +566,10 @@ impl DamengSink {
         sql: &str,
         params: &[DamengParam],
     ) -> Result<u64, String> {
+        if !sql.is_ascii() {
+            return self.execute_inline_params(sql, params, true).await;
+        }
+
         let first_result = {
             let mut client = self.client.lock().await;
             let refs = Self::param_refs(params);
@@ -585,6 +593,40 @@ impl DamengSink {
         }
     }
 
+    async fn execute_inline_params(
+        &self,
+        sql: &str,
+        params: &[DamengParam],
+        insert_control_flow_passthrough: bool,
+    ) -> Result<u64, String> {
+        let inline_sql = Self::inline_sql_params(sql, params)?;
+        let first_result = {
+            let mut client = self.client.lock().await;
+            client.execute(inline_sql.as_str())
+        };
+        match first_result {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let msg = e.to_string();
+                if insert_control_flow_passthrough
+                    && Self::is_insert_control_flow_error(msg.as_str())
+                {
+                    return Err(msg);
+                }
+                error!(
+                    "Dameng execute inline params failed, retrying: {} sql: {}",
+                    msg, sql
+                );
+                self.reconnect().await?;
+                self.client
+                    .lock()
+                    .await
+                    .execute(inline_sql.as_str())
+                    .map_err(|e| e.to_string())
+            }
+        }
+    }
+
     async fn query(&self, sql: &str, params: &[DamengParam]) -> Result<dameng::ResultSet, String> {
         let mut client = self.client.lock().await;
         let refs = Self::param_refs(params);
@@ -595,6 +637,78 @@ impl DamengSink {
 
     fn param_refs(params: &[DamengParam]) -> Vec<&dyn ToDmValue> {
         params.iter().map(|p| p as &dyn ToDmValue).collect()
+    }
+
+    fn inline_sql_params(sql: &str, params: &[DamengParam]) -> Result<String, String> {
+        let mut result = String::with_capacity(sql.len() + params.len() * 8);
+        let mut param_index = 0;
+        let mut quote: Option<char> = None;
+        let mut chars = sql.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if let Some(quote_char) = quote {
+                result.push(ch);
+                if ch == quote_char {
+                    if chars.peek() == Some(&quote_char) {
+                        result.push(chars.next().unwrap());
+                    } else {
+                        quote = None;
+                    }
+                }
+                continue;
+            }
+
+            match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    result.push(ch);
+                }
+                '?' => {
+                    let Some(param) = params.get(param_index) else {
+                        return Err(format!(
+                            "Dameng inline params placeholder count exceeds params: sql={}",
+                            sql
+                        ));
+                    };
+                    result.push_str(Self::dameng_param_sql_literal(param).as_str());
+                    param_index += 1;
+                }
+                _ => result.push(ch),
+            }
+        }
+
+        if param_index != params.len() {
+            return Err(format!(
+                "Dameng inline params count mismatch: placeholders={} params={} sql={}",
+                param_index,
+                params.len(),
+                sql
+            ));
+        }
+        Ok(result)
+    }
+
+    fn dameng_param_sql_literal(param: &DamengParam) -> String {
+        match param {
+            DamengParam::Null => "NULL".to_string(),
+            DamengParam::Bool(v) => {
+                if *v {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
+            }
+            DamengParam::I8(v) => v.to_string(),
+            DamengParam::I16(v) => v.to_string(),
+            DamengParam::I32(v) => v.to_string(),
+            DamengParam::I64(v) => v.to_string(),
+            DamengParam::F32(v) => v.to_string(),
+            DamengParam::F64(v) => v.to_string(),
+            DamengParam::Text(v) => Self::quote_literal(v),
+            DamengParam::Bytes(v) => {
+                format!("HEXTORAW({})", Self::quote_literal(&Self::bytes_to_hex(v)))
+            }
+        }
     }
 
     fn is_identity_insert_required_error(error: &str) -> bool {
@@ -1659,7 +1773,7 @@ mod tests {
     use dameng::ToDmValue;
     use dameng_types::DmValue;
 
-    use super::DamengSink;
+    use super::{DamengParam, DamengSink};
 
     fn table_info(target_schema: &str, column_type: &str) -> TableInfoVo {
         TableInfoVo {
@@ -1831,6 +1945,50 @@ mod tests {
         assert_eq!(
             DamengSink::value_to_param(&value).to_dm_value(),
             DmValue::Bytea(vec![0x1f, 0x8b, 0x08])
+        );
+    }
+
+    #[test]
+    fn inline_sql_params_replaces_placeholders_outside_quotes() {
+        let sql = "INSERT INTO \"S\".\"表\" (\"ID\", \"name\", \"raw\") VALUES (?, ?, HEXTORAW(?))";
+        let params = vec![
+            DamengParam::I64(7),
+            DamengParam::Text("达'鑫".to_string()),
+            DamengParam::Text("1F8B".to_string()),
+        ];
+
+        let inline_sql = DamengSink::inline_sql_params(sql, &params).unwrap();
+
+        assert_eq!(
+            inline_sql,
+            "INSERT INTO \"S\".\"表\" (\"ID\", \"name\", \"raw\") VALUES (7, '达''鑫', HEXTORAW('1F8B'))"
+        );
+    }
+
+    #[test]
+    fn inline_sql_params_keeps_question_marks_inside_literals_and_identifiers() {
+        let sql = "UPDATE \"S\".\"t?\" SET \"name\" = ? WHERE \"note\" = '?'";
+        let params = vec![DamengParam::Text("x".to_string())];
+
+        let inline_sql = DamengSink::inline_sql_params(sql, &params).unwrap();
+
+        assert_eq!(
+            inline_sql,
+            "UPDATE \"S\".\"t?\" SET \"name\" = 'x' WHERE \"note\" = '?'"
+        );
+    }
+
+    #[test]
+    fn inline_sql_params_renders_bytes_as_hextoraw() {
+        let inline_sql = DamengSink::inline_sql_params(
+            "INSERT INTO \"S\".\"T\" (\"b\") VALUES (?)",
+            &[DamengParam::Bytes(vec![0x1f, 0x8b])],
+        )
+        .unwrap();
+
+        assert_eq!(
+            inline_sql,
+            "INSERT INTO \"S\".\"T\" (\"b\") VALUES (HEXTORAW('1F8B'))"
         );
     }
 
