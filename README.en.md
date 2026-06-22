@@ -148,12 +148,12 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 | `host` / `port` | MySQL host and port. |
 | `username` / `password` | MySQL credentials. |
 | `database` | Source database name. |
-| `table_name` | Table name; use a single table, comma-separated names, or `"*"` for automatic discovery. By default, `"*"` selects tables with one `bigint`/`bigint unsigned` primary key and no foreign-key dependency. When top-level `sync_no_pk_table_schema: true` is enabled, no-primary-key `BASE TABLE`s are also included as schema-only tables. |
+| `table_name` | Table name; use a single table, comma-separated names, or `"*"` for automatic discovery. By default, `"*"` selects tables with one integer primary key and no foreign-key dependency. When top-level `sync_no_pk_table_schema: true` is enabled, no-primary-key `BASE TABLE`s are also included as schema-only tables. |
 | `except_table_name_prefix` | Exclude tables by prefix; use comma-separated prefixes. |
 | `server_id` | Binlog replication server id. It must be unique in the MySQL topology. |
 | `statement_cache_capacity` | MySQL prepared statement cache capacity, passed through as SQLx `statement-cache-capacity`; set it to `"0"` to disable caching. If MySQL reports `Can't create more than max_prepared_stmt_count statements`, disconnect old clients or temporarily raise `max_prepared_stmt_count`, then restart the sync process. |
 
-The primary-key column is detected from the MySQL table schema automatically. Tables that participate in data synchronization need exactly one `bigint`/`bigint unsigned` primary key. The `pk_column` config key is deprecated; configuration loading fails if it appears. `meili_table_pk` is still required for the MeiliSearch sink because it defines the target index primary key.
+The primary-key column is detected from the MySQL table schema automatically. Tables that participate in data synchronization need exactly one integer primary key (`tinyint`, `smallint`, `mediumint`, `int`, `bigint`, and their unsigned variants). The `pk_column` config key is deprecated; configuration loading fails if it appears. `meili_table_pk` is still required for the MeiliSearch sink because it defines the target index primary key.
 
 ### Multi-database sync mode (MySQL → MySQL/Dameng)
 

@@ -198,7 +198,7 @@ impl MysqlSourceConfig {
                     FROM information_schema.COLUMNS c
                     WHERE c.TABLE_SCHEMA = (SELECT DATABASE())
                       AND c.COLUMN_KEY = 'PRI'
-                      AND c.DATA_TYPE = 'bigint'
+                      AND c.DATA_TYPE IN ('tinyint', 'smallint', 'mediumint', 'int', 'bigint')
                       AND c.TABLE_NAME NOT IN (
                             SELECT TABLE_NAME
                             FROM information_schema.KEY_COLUMN_USAGE
@@ -216,7 +216,6 @@ impl MysqlSourceConfig {
                                 FROM information_schema.COLUMNS cc
                                 WHERE cc.TABLE_SCHEMA = (SELECT DATABASE())
                                     AND cc.COLUMN_KEY = 'PRI'
-                                    AND cc.DATA_TYPE = 'bigint'
                                 GROUP BY cc.TABLE_NAME
                                 HAVING COUNT(*) > 1
                         )
@@ -314,17 +313,23 @@ impl MysqlSourceConfig {
                     .await
                     .expect("query failed");
 
-                let pk_column: Vec<String> = col_list
+                let primary_key_columns: Vec<&ColumnInfoFromMysql> = col_list
                     .iter()
-                    .filter(|c| c.column_key == "PRI")
-                    .filter(|c| c.data_type.eq_ignore_ascii_case("bigint"))
+                    .filter(|c| c.column_key.eq_ignore_ascii_case("PRI"))
+                    .collect();
+                let pk_column: Vec<String> = primary_key_columns
+                    .iter()
+                    .filter(|c| is_supported_mysql_pk_data_type(c.data_type.as_str()))
                     .map(|c| c.column_name.clone())
                     .collect();
                 let schema_only_no_pk =
                     no_pk_schema_only_tables.contains(table_name.to_ascii_lowercase().as_str());
-                if pk_column.len() > 1 || (pk_column.is_empty() && !schema_only_no_pk) {
+                if primary_key_columns.len() > 1
+                    || pk_column.len() > 1
+                    || (pk_column.is_empty() && !schema_only_no_pk)
+                {
                     error!(
-                        "pk_column is empty or more than one for table {}",
+                        "pk_column is empty, unsupported, or more than one for table {}",
                         table_name
                     );
                     // panic!("pk_column is empty or more than one");
@@ -424,6 +429,13 @@ pub struct ColumnInfoFromMysql {
     pub column_key: String,
     #[sqlx(try_from = "Vec<u8>")]
     pub data_type: String,
+}
+
+fn is_supported_mysql_pk_data_type(data_type: &str) -> bool {
+    matches!(
+        data_type.to_ascii_lowercase().as_str(),
+        "tinyint" | "smallint" | "mediumint" | "int" | "bigint"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3078,6 +3090,24 @@ mod tests {
 
         assert_eq!(cursor, InitPkCursor::Unsigned(42));
         assert_eq!(cursor.sql_literal().as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn init_pk_cursor_supports_signed_int() {
+        let cursor = InitPkCursor::from_value(&Value::Int32(7)).unwrap();
+
+        assert_eq!(cursor, InitPkCursor::Signed(7));
+        assert_eq!(cursor.sql_literal().as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn supported_pk_data_types_include_mysql_integer_types() {
+        for data_type in ["tinyint", "smallint", "mediumint", "int", "bigint"] {
+            assert!(is_supported_mysql_pk_data_type(data_type));
+        }
+        assert!(is_supported_mysql_pk_data_type("INT"));
+        assert!(!is_supported_mysql_pk_data_type("varchar"));
+        assert!(!is_supported_mysql_pk_data_type("decimal"));
     }
 
     #[test]
