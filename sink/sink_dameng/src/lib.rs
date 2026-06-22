@@ -60,6 +60,7 @@ struct DamengColumnInfo {
     data_type: String,
     data_length: u32,
     char_length: u32,
+    default_value: Option<String>,
 }
 
 pub struct DamengSink {
@@ -274,10 +275,14 @@ impl DamengSink {
             let auto_increment = src_col.eq_ignore_ascii_case(table_info.pk_column.as_str())
                 && mysql_column_is_auto_increment_from_definition(def.as_str());
             cols_sql.push(format!(
-                "{} {} {}",
+                "{} {}",
                 Self::quote_column_ident(src_col),
-                Self::map_mysql_type_to_dameng_for_column(mysql_type.as_str(), auto_increment),
-                nullable_sql
+                Self::dameng_column_definition(
+                    mysql_type.as_str(),
+                    def.as_str(),
+                    nullable_sql,
+                    auto_increment
+                ),
             ));
         }
         if cols_sql.is_empty() {
@@ -331,38 +336,46 @@ impl DamengSink {
             let nullable = mysql_column_allows_null_from_definition(def.as_str());
             let nullable_sql = if nullable { "NULL" } else { "NOT NULL" };
             let dameng_type = Self::map_mysql_type_to_dameng(mysql_type.as_str());
+            let column_definition = Self::dameng_column_definition(
+                mysql_type.as_str(),
+                def.as_str(),
+                nullable_sql,
+                false,
+            );
             if let Some(existing_col) = existing_cols.get(target_key.as_str()) {
-                let should_modify = Self::should_modify_existing_column(&mysql_type, existing_col);
+                let should_modify =
+                    Self::should_modify_existing_column(&mysql_type, def.as_str(), existing_col);
                 if dameng_type.eq_ignore_ascii_case("CLOB") || should_modify {
                     info!(
-                        "Dameng column check: {}.{} existing={} data_length={} char_length={} expected={} auto_modify={}",
+                        "Dameng column check: {}.{} existing={} data_length={} char_length={} default={:?} expected={} auto_modify={}",
                         Self::target_table_key(schema, table_info.table_name.as_str()),
                         src_col,
                         existing_col.data_type,
                         existing_col.data_length,
                         existing_col.char_length,
+                        existing_col.default_value,
                         dameng_type,
                         self.auto_modify_column
                     );
                 }
                 if should_modify && !self.auto_modify_column {
                     return Err(format!(
-                        "Dameng column type mismatch and auto_modify_column is false: {}.{} existing={} data_length={} char_length={} expected={}",
+                        "Dameng column type/default mismatch and auto_modify_column is false: {}.{} existing={} data_length={} char_length={} default={:?} expected={}",
                         Self::target_table_key(schema, table_info.table_name.as_str()),
                         src_col,
                         existing_col.data_type,
                         existing_col.data_length,
                         existing_col.char_length,
+                        existing_col.default_value,
                         dameng_type
                     ));
                 }
                 if should_modify {
                     let sql = format!(
-                        "ALTER TABLE {} MODIFY {} {} {}",
+                        "ALTER TABLE {} MODIFY {} {}",
                         Self::qualified_table(schema, table_info.table_name.as_str()),
                         Self::quote_ident(target_col.as_str()),
-                        dameng_type,
-                        nullable_sql
+                        column_definition
                     );
                     match self.execute(sql.as_str()).await {
                         Ok(_) => info!(
@@ -388,11 +401,10 @@ impl DamengSink {
                 continue;
             }
             let sql = format!(
-                "ALTER TABLE {} ADD {} {} {}",
+                "ALTER TABLE {} ADD {} {}",
                 Self::qualified_table(schema, table_info.table_name.as_str()),
                 Self::quote_ident(target_col.as_str()),
-                dameng_type,
-                nullable_sql
+                column_definition
             );
             match self.execute(sql.as_str()).await {
                 Ok(_) => info!(
@@ -454,12 +466,12 @@ impl DamengSink {
     ) -> Result<HashMap<String, DamengColumnInfo>, String> {
         let sql = if schema.is_empty() {
             format!(
-                "SELECT LISTAGG(COLUMN_NAME || ':' || DATA_TYPE || ':' || DATA_LENGTH || ':' || CHAR_LENGTH, '|') WITHIN GROUP (ORDER BY COLUMN_ID) FROM USER_TAB_COLUMNS WHERE {}",
+                "SELECT LISTAGG(COLUMN_NAME || ':' || DATA_TYPE || ':' || DATA_LENGTH || ':' || CHAR_LENGTH || ':' || NVL(REPLACE(REPLACE(TRIM(DATA_DEFAULT), '|', ' '), ':', ' '), ''), '|') WITHIN GROUP (ORDER BY COLUMN_ID) FROM USER_TAB_COLUMNS WHERE {}",
                 Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
             )
         } else {
             format!(
-                "SELECT LISTAGG(COLUMN_NAME || ':' || DATA_TYPE || ':' || DATA_LENGTH || ':' || CHAR_LENGTH, '|') WITHIN GROUP (ORDER BY COLUMN_ID) FROM ALL_TAB_COLUMNS WHERE {} AND {}",
+                "SELECT LISTAGG(COLUMN_NAME || ':' || DATA_TYPE || ':' || DATA_LENGTH || ':' || CHAR_LENGTH || ':' || NVL(REPLACE(REPLACE(TRIM(DATA_DEFAULT), '|', ' '), ':', ' '), ''), '|') WITHIN GROUP (ORDER BY COLUMN_ID) FROM ALL_TAB_COLUMNS WHERE {} AND {}",
                 Self::eq_original_or_upper_sql("OWNER", schema),
                 Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
             )
@@ -475,7 +487,7 @@ impl DamengSink {
     fn parse_columns_metadata(metadata: &str) -> HashMap<String, DamengColumnInfo> {
         let mut cols = HashMap::new();
         for column in metadata.split('|').filter(|s| !s.is_empty()) {
-            let mut parts = column.splitn(4, ':');
+            let mut parts = column.splitn(5, ':');
             let name = match parts.next() {
                 Some(v) if !v.is_empty() => v,
                 _ => continue,
@@ -492,12 +504,18 @@ impl DamengSink {
                 .next()
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(0);
+            let default_value = parts
+                .next()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToString::to_string);
             cols.insert(
                 name.to_ascii_lowercase(),
                 DamengColumnInfo {
                     data_type: data_type.to_string(),
                     data_length,
                     char_length,
+                    default_value,
                 },
             );
         }
@@ -916,6 +934,136 @@ impl DamengSink {
         }
     }
 
+    fn dameng_column_definition(
+        mysql_type_token: &str,
+        mysql_column_definition: &str,
+        nullable_sql: &str,
+        auto_increment: bool,
+    ) -> String {
+        let mut parts = vec![Self::map_mysql_type_to_dameng_for_column(
+            mysql_type_token,
+            auto_increment,
+        )];
+        if !nullable_sql.trim().is_empty() {
+            parts.push(nullable_sql.to_string());
+        }
+        if let Some(default_sql) =
+            Self::mysql_current_timestamp_default_sql(mysql_type_token, mysql_column_definition)
+        {
+            parts.push(default_sql.to_string());
+        }
+        parts.join(" ")
+    }
+
+    fn mysql_current_timestamp_default_sql(
+        mysql_type_token: &str,
+        mysql_column_definition: &str,
+    ) -> Option<&'static str> {
+        let t = mysql_type_token.to_ascii_lowercase();
+        if !t.starts_with("timestamp") && !t.starts_with("datetime") {
+            return None;
+        }
+        if Self::definition_has_current_timestamp_default(mysql_column_definition) {
+            Some("DEFAULT CURRENT_TIMESTAMP")
+        } else {
+            None
+        }
+    }
+
+    fn definition_has_current_timestamp_default(definition: &str) -> bool {
+        let Some(default_pos) = Self::find_keyword_outside_quotes(definition, 0, "default") else {
+            return false;
+        };
+        let rest = definition[default_pos + "default".len()..].trim_start();
+        let rest_lower = rest.to_ascii_lowercase();
+        let Some(tail) = rest_lower.strip_prefix("current_timestamp") else {
+            return false;
+        };
+        Self::current_timestamp_default_tail_ok(tail)
+    }
+
+    fn current_timestamp_default_tail_ok(tail: &str) -> bool {
+        if tail.is_empty() {
+            return true;
+        }
+        if tail.chars().next().is_some_and(char::is_whitespace) {
+            return true;
+        }
+        if let Some(rest) = tail.strip_prefix('(') {
+            let Some(end) = rest.find(')') else {
+                return false;
+            };
+            return rest[..end].chars().all(|c| c.is_ascii_digit());
+        }
+        !tail
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| Self::is_ascii_identifier_byte(*byte))
+    }
+
+    fn dameng_default_is_current_timestamp(default_value: Option<&str>) -> bool {
+        let Some(default_value) = default_value else {
+            return false;
+        };
+        let normalized = default_value
+            .trim()
+            .trim_matches(|c| c == '(' || c == ')')
+            .to_ascii_uppercase();
+        normalized == "CURRENT_TIMESTAMP" || normalized.starts_with("CURRENT_TIMESTAMP(")
+    }
+
+    fn starts_with_keyword(value: &str, pos: usize, keyword: &str) -> bool {
+        let bytes = value.as_bytes();
+        let keyword_bytes = keyword.as_bytes();
+        if pos + keyword_bytes.len() > bytes.len() {
+            return false;
+        }
+        if !bytes[pos..pos + keyword_bytes.len()].eq_ignore_ascii_case(keyword_bytes) {
+            return false;
+        }
+        let before_ok = pos == 0 || !Self::is_ascii_identifier_byte(bytes[pos - 1]);
+        let after_pos = pos + keyword_bytes.len();
+        let after_ok =
+            after_pos >= bytes.len() || !Self::is_ascii_identifier_byte(bytes[after_pos]);
+        before_ok && after_ok
+    }
+
+    fn find_keyword_outside_quotes(value: &str, start: usize, keyword: &str) -> Option<usize> {
+        let bytes = value.as_bytes();
+        let mut quote = None;
+        let mut pos = start;
+        while pos < bytes.len() {
+            let byte = bytes[pos];
+            if let Some(quote_byte) = quote {
+                if byte == quote_byte {
+                    if bytes.get(pos + 1) == Some(&quote_byte) {
+                        pos += 2;
+                    } else {
+                        quote = None;
+                        pos += 1;
+                    }
+                } else {
+                    pos += 1;
+                }
+                continue;
+            }
+            if matches!(byte, b'`' | b'\'' | b'"') {
+                quote = Some(byte);
+                pos += 1;
+                continue;
+            }
+            if Self::starts_with_keyword(value, pos, keyword) {
+                return Some(pos);
+            }
+            pos += 1;
+        }
+        None
+    }
+
+    fn is_ascii_identifier_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
     fn map_mysql_type_to_dameng(mysql_type_token: &str) -> String {
         Self::map_mysql_type_to_dameng_for_column(mysql_type_token, false)
     }
@@ -1145,8 +1293,11 @@ impl DamengSink {
                         let auto_increment = column
                             .eq_ignore_ascii_case(table_info.pk_column.as_str())
                             && mysql_column_is_auto_increment_from_definition(def.as_str());
-                        Some(Self::map_mysql_type_to_dameng_for_column(
+                        let nullable_sql = "";
+                        Some(Self::dameng_column_definition(
                             mysql_type.as_str(),
+                            def.as_str(),
+                            nullable_sql,
                             auto_increment,
                         ))
                     })
@@ -1211,8 +1362,16 @@ impl DamengSink {
 
     fn should_modify_existing_column(
         mysql_type_token: &str,
+        mysql_column_definition: &str,
         existing_col: &DamengColumnInfo,
     ) -> bool {
+        if Self::mysql_current_timestamp_default_sql(mysql_type_token, mysql_column_definition)
+            .is_some()
+            && !Self::dameng_default_is_current_timestamp(existing_col.default_value.as_deref())
+        {
+            return true;
+        }
+
         let t = mysql_type_token.to_ascii_lowercase();
         if !t.starts_with("varchar") && !t.starts_with("char") {
             return false;
@@ -1852,6 +2011,36 @@ mod tests {
     }
 
     #[test]
+    fn create_table_sql_preserves_current_timestamp_default_for_time_columns() {
+        let table_info = TableInfoVo {
+            source_database: "source_db".to_string(),
+            target_database: "target_schema".to_string(),
+            table_name: "orders".to_string(),
+            pk_column: "id".to_string(),
+            create_table_sql: r#"CREATE TABLE `orders` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `sys_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  `update_time` datetime DEFAULT CURRENT_TIMESTAMP,
+  `name` varchar(32) DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#
+                .to_string(),
+            columns: vec![
+                "id".to_string(),
+                "sys_time".to_string(),
+                "update_time".to_string(),
+                "name".to_string(),
+            ],
+        };
+
+        let sql = DamengSink::create_table_sql("target_schema", &table_info).unwrap();
+
+        assert!(sql.contains("\"sys_time\" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"));
+        assert!(sql.contains("\"update_time\" TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP"));
+        assert!(sql.contains("\"name\" VARCHAR(32 CHAR) NULL"));
+    }
+
+    #[test]
     fn disallowed_dameng_column_names_are_remapped() {
         assert_eq!(DamengSink::target_column_name("id"), "id");
         assert_eq!(DamengSink::target_column_name("rOWID"), "rOWID_");
@@ -1925,18 +2114,18 @@ mod tests {
     #[test]
     fn parses_dameng_columns_metadata() {
         let cols = DamengSink::parse_columns_metadata(
-            "id:BIGINT:8:0|param:VARCHAR:16000:4000|opration:VARCHAR:4000:1000",
+            "id:BIGINT:8:0:|param:VARCHAR:16000:4000:|sys_time:TIMESTAMP:8:0:CURRENT_TIMESTAMP",
         );
 
         let param = cols.get("param").unwrap();
         assert_eq!(param.data_type, "VARCHAR");
         assert_eq!(param.data_length, 16000);
         assert_eq!(param.char_length, 4000);
+        assert_eq!(param.default_value, None);
 
-        let opration = cols.get("opration").unwrap();
-        assert_eq!(opration.data_type, "VARCHAR");
-        assert_eq!(opration.data_length, 4000);
-        assert_eq!(opration.char_length, 1000);
+        let sys_time = cols.get("sys_time").unwrap();
+        assert_eq!(sys_time.data_type, "TIMESTAMP");
+        assert_eq!(sys_time.default_value.as_deref(), Some("CURRENT_TIMESTAMP"));
     }
 
     #[test]
@@ -2170,19 +2359,84 @@ mod tests {
             data_type: "VARCHAR".to_string(),
             data_length: 50,
             char_length: 50,
+            default_value: None,
         };
         let char_semantics = super::DamengColumnInfo {
             data_type: "VARCHAR".to_string(),
             data_length: 200,
             char_length: 50,
+            default_value: None,
         };
         assert!(DamengSink::should_modify_existing_column(
             "varchar(50)",
+            "`name` varchar(50) DEFAULT NULL",
             &byte_semantics
         ));
         assert!(!DamengSink::should_modify_existing_column(
             "varchar(50)",
+            "`name` varchar(50) DEFAULT NULL",
             &char_semantics
+        ));
+    }
+
+    #[test]
+    fn current_timestamp_default_detection_handles_supported_time_columns() {
+        assert_eq!(
+            DamengSink::mysql_current_timestamp_default_sql(
+                "timestamp",
+                "`sys_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+            ),
+            Some("DEFAULT CURRENT_TIMESTAMP")
+        );
+        assert_eq!(
+            DamengSink::mysql_current_timestamp_default_sql(
+                "datetime",
+                "`update_time` datetime DEFAULT CURRENT_TIMESTAMP(3)",
+            ),
+            Some("DEFAULT CURRENT_TIMESTAMP")
+        );
+        assert_eq!(
+            DamengSink::mysql_current_timestamp_default_sql(
+                "varchar(64)",
+                "`name` varchar(64) DEFAULT CURRENT_TIMESTAMP",
+            ),
+            None
+        );
+        assert_eq!(
+            DamengSink::mysql_current_timestamp_default_sql(
+                "timestamp",
+                "`sys_time` timestamp NOT NULL COMMENT 'DEFAULT CURRENT_TIMESTAMP'",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn current_timestamp_default_mismatch_requires_column_modify() {
+        let missing_default = super::DamengColumnInfo {
+            data_type: "TIMESTAMP".to_string(),
+            data_length: 8,
+            char_length: 0,
+            default_value: None,
+        };
+        let matching_default = super::DamengColumnInfo {
+            data_type: "TIMESTAMP".to_string(),
+            data_length: 8,
+            char_length: 0,
+            default_value: Some("CURRENT_TIMESTAMP".to_string()),
+        };
+        let def =
+            "`sys_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP";
+
+        assert!(DamengSink::should_modify_existing_column(
+            "timestamp",
+            def,
+            &missing_default
+        ));
+        assert!(!DamengSink::should_modify_existing_column(
+            "timestamp",
+            def,
+            &matching_default
         ));
     }
 
