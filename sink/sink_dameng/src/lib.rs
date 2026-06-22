@@ -911,6 +911,8 @@ impl DamengSink {
     ) -> Option<DamengParam> {
         if Self::is_source_blob_column(table_info, column_name) && matches!(value, Value::Blob(_)) {
             None
+        } else if let Value::Blob(v) = value {
+            Some(DamengParam::Text(String::from_utf8_lossy(v).to_string()))
         } else {
             Some(Self::value_to_param(value))
         }
@@ -2075,6 +2077,36 @@ mod tests {
                 3
             ),
             "DECLARE\n  v_lob BLOB;\nBEGIN\n  SELECT \"operatorLogo\" INTO v_lob FROM \"target_schema\".\"ns_soss_operator\" WHERE \"id\" = ? FOR UPDATE;\n  DBMS_LOB.WRITEAPPEND(v_lob, 3, HEXTORAW(?));\nEND;"
+        );
+    }
+
+    #[test]
+    fn text_columns_with_blob_runtime_values_bind_as_text() {
+        let table_info = TableInfoVo {
+            source_database: "source_db".to_string(),
+            target_database: "target_schema".to_string(),
+            table_name: "o2o_bbs_activity".to_string(),
+            pk_column: "id".to_string(),
+            create_table_sql: r#"CREATE TABLE `o2o_bbs_activity` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `content` longtext DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3"#
+                .to_string(),
+            columns: vec!["id".to_string(), "content".to_string()],
+        };
+
+        let value = Value::Blob("正文内容".as_bytes().to_vec());
+
+        assert_eq!(
+            DamengSink::dml_value_sql(&table_info, "content", &value),
+            "?"
+        );
+        assert_eq!(
+            DamengSink::dml_value_param(&table_info, "content", &value)
+                .unwrap()
+                .to_dm_value(),
+            DmValue::Text("正文内容".to_string())
         );
     }
 }
