@@ -882,8 +882,45 @@ impl DamengSink {
             || t.starts_with("NUMERIC")
     }
 
-    fn value_placeholder(_table_info: &TableInfoVo, _column_name: &str) -> &'static str {
-        "?"
+    fn source_column_dameng_type(table_info: &TableInfoVo, column_name: &str) -> Option<String> {
+        let defs =
+            extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
+        let def = defs.get(column_name.to_ascii_lowercase().as_str())?;
+        let mysql_type = mysql_type_token_from_column_definition(def.as_str())?;
+        Some(Self::map_mysql_type_to_dameng(mysql_type.as_str()))
+    }
+
+    fn is_source_blob_column(table_info: &TableInfoVo, column_name: &str) -> bool {
+        Self::source_column_dameng_type(table_info, column_name)
+            .is_some_and(|dameng_type| dameng_type.eq_ignore_ascii_case("BLOB"))
+    }
+
+    fn value_placeholder(table_info: &TableInfoVo, column_name: &str) -> &'static str {
+        if Self::is_source_blob_column(table_info, column_name) {
+            "HEXTORAW(?)"
+        } else {
+            "?"
+        }
+    }
+
+    fn value_to_param_for_column(
+        table_info: &TableInfoVo,
+        column_name: &str,
+        value: &Value,
+    ) -> DamengParam {
+        if Self::is_source_blob_column(table_info, column_name) {
+            match value {
+                Value::None => DamengParam::Null,
+                Value::Blob(v) => DamengParam::Text(Self::bytes_to_hex(v)),
+                _ => Self::value_to_param(value),
+            }
+        } else {
+            Self::value_to_param(value)
+        }
+    }
+
+    fn bytes_to_hex(value: &[u8]) -> String {
+        value.iter().map(|b| format!("{:02X}", b)).collect()
     }
 
     fn validate_merged_target_schema(
@@ -1343,16 +1380,21 @@ impl DamengSink {
             .collect::<Vec<_>>()
             .join(", ");
         let update_sql = format!(
-            "UPDATE {} SET {} WHERE {} = ?",
+            "UPDATE {} SET {} WHERE {} = {}",
             Self::qualified_table(schema, table_name),
             set_sql,
-            Self::quote_column_ident(pk_name)
+            Self::quote_column_ident(pk_name),
+            Self::value_placeholder(&table_info, pk_name)
         );
         let mut update_params = Vec::with_capacity(update_columns.len() + 1);
         for col in update_columns {
-            update_params.push(Self::value_to_param(record.after.get(col)));
+            update_params.push(Self::value_to_param_for_column(
+                &table_info,
+                col,
+                record.after.get(col),
+            ));
         }
-        update_params.push(Self::value_to_param(pk));
+        update_params.push(Self::value_to_param_for_column(&table_info, pk_name, pk));
         debug!("Dameng UPDATE: {}", update_sql);
         self.execute_with_params(update_sql.as_str(), &update_params)
             .await
@@ -1385,7 +1427,7 @@ impl DamengSink {
         );
         let insert_params = columns
             .iter()
-            .map(|col| Self::value_to_param(record.after.get(col)))
+            .map(|col| Self::value_to_param_for_column(&table_info, col, record.after.get(col)))
             .collect::<Vec<_>>();
         debug!("Dameng INSERT: {}", insert_sql);
 
@@ -1462,7 +1504,7 @@ impl DamengSink {
         &self,
         schema: &str,
         table_name: &str,
-        _table_key: &str,
+        table_key: &str,
         pk_name: &str,
         record: &DataBuffer,
     ) -> Result<(), String> {
@@ -1470,12 +1512,14 @@ impl DamengSink {
         if pk.is_none() {
             return Ok(());
         }
+        let table_info = self.table_info_cache.lock().await.get(table_key);
         let sql = format!(
-            "DELETE FROM {} WHERE {} = ?",
+            "DELETE FROM {} WHERE {} = {}",
             Self::qualified_table(schema, table_name),
-            Self::quote_column_ident(pk_name)
+            Self::quote_column_ident(pk_name),
+            Self::value_placeholder(&table_info, pk_name)
         );
-        let params = vec![Self::value_to_param(pk)];
+        let params = vec![Self::value_to_param_for_column(&table_info, pk_name, pk)];
         debug!("Dameng DELETE: {}", sql);
         self.execute_with_params(sql.as_str(), &params).await?;
         Ok(())
@@ -1840,6 +1884,7 @@ mod tests {
   `param` varchar(4000) DEFAULT NULL,
   `modul` varchar(100) DEFAULT NULL,
   `opration` varchar(1000) DEFAULT NULL,
+  `operatorLogo` blob DEFAULT NULL,
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3"#
                 .to_string(),
@@ -1848,11 +1893,45 @@ mod tests {
                 "param".to_string(),
                 "modul".to_string(),
                 "opration".to_string(),
+                "operatorLogo".to_string(),
             ],
         };
 
         assert_eq!(DamengSink::value_placeholder(&table_info, "param"), "?");
         assert_eq!(DamengSink::value_placeholder(&table_info, "opration"), "?");
         assert_eq!(DamengSink::value_placeholder(&table_info, "modul"), "?");
+        assert_eq!(
+            DamengSink::value_placeholder(&table_info, "operatorLogo"),
+            "HEXTORAW(?)"
+        );
+    }
+
+    #[test]
+    fn blob_columns_use_hex_text_for_hextoraw() {
+        let table_info = TableInfoVo {
+            source_database: "source_db".to_string(),
+            target_database: "target_schema".to_string(),
+            table_name: "ns_soss_operator".to_string(),
+            pk_column: "id".to_string(),
+            create_table_sql: r#"CREATE TABLE `ns_soss_operator` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `operatorLogo` blob DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3"#
+                .to_string(),
+            columns: vec!["id".to_string(), "operatorLogo".to_string()],
+        };
+
+        let value = Value::Blob(vec![0x1f, 0x8b, 0x08]);
+        assert_eq!(
+            DamengSink::value_to_param_for_column(&table_info, "operatorLogo", &value)
+                .to_dm_value(),
+            DmValue::Text("1F8B08".to_string())
+        );
+        assert_eq!(
+            DamengSink::value_to_param_for_column(&table_info, "operatorLogo", &Value::None)
+                .to_dm_value(),
+            DmValue::Null
+        );
     }
 }
