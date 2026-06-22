@@ -882,25 +882,8 @@ impl DamengSink {
             || t.starts_with("NUMERIC")
     }
 
-    fn source_column_dameng_type(table_info: &TableInfoVo, column_name: &str) -> Option<String> {
-        let defs =
-            extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
-        let def = defs.get(column_name.to_ascii_lowercase().as_str())?;
-        let mysql_type = mysql_type_token_from_column_definition(def.as_str())?;
-        Some(Self::map_mysql_type_to_dameng(mysql_type.as_str()))
-    }
-
-    fn is_source_clob_column(table_info: &TableInfoVo, column_name: &str) -> bool {
-        Self::source_column_dameng_type(table_info, column_name)
-            .is_some_and(|dameng_type| dameng_type.eq_ignore_ascii_case("CLOB"))
-    }
-
-    fn value_placeholder(table_info: &TableInfoVo, column_name: &str) -> &'static str {
-        if Self::is_source_clob_column(table_info, column_name) {
-            "CAST(? AS CLOB)"
-        } else {
-            "?"
-        }
+    fn value_placeholder(_table_info: &TableInfoVo, _column_name: &str) -> &'static str {
+        "?"
     }
 
     fn validate_merged_target_schema(
@@ -1846,7 +1829,7 @@ mod tests {
     }
 
     #[test]
-    fn large_varchar_columns_use_clob_placeholder() {
+    fn clob_columns_use_plain_placeholder() {
         let table_info = TableInfoVo {
             source_database: "source_db".to_string(),
             target_database: "target_schema".to_string(),
@@ -1868,14 +1851,8 @@ mod tests {
             ],
         };
 
-        assert_eq!(
-            DamengSink::value_placeholder(&table_info, "param"),
-            "CAST(? AS CLOB)"
-        );
-        assert_eq!(
-            DamengSink::value_placeholder(&table_info, "opration"),
-            "CAST(? AS CLOB)"
-        );
+        assert_eq!(DamengSink::value_placeholder(&table_info, "param"), "?");
+        assert_eq!(DamengSink::value_placeholder(&table_info, "opration"), "?");
         assert_eq!(DamengSink::value_placeholder(&table_info, "modul"), "?");
     }
 }
