@@ -104,6 +104,9 @@ impl DamengSink {
         if let Err(e) = Self::validate_merged_target_schema(&table_info_list, schema.as_str()) {
             panic!("{}", e);
         }
+        if let Err(e) = Self::validate_target_column_names(&table_info_list, schema.as_str()) {
+            panic!("{}", e);
+        }
 
         let client = Self::connect_client(&host, port, &username, &password)
             .unwrap_or_else(|e| panic!("Failed to connect to Dameng: {}", e));
@@ -260,7 +263,7 @@ impl DamengSink {
                 && mysql_column_is_auto_increment_from_definition(def.as_str());
             cols_sql.push(format!(
                 "{} {} {}",
-                Self::quote_ident(src_col),
+                Self::quote_column_ident(src_col),
                 Self::map_mysql_type_to_dameng_for_column(mysql_type.as_str(), auto_increment),
                 nullable_sql
             ));
@@ -270,7 +273,7 @@ impl DamengSink {
         }
         cols_sql.push(format!(
             "PRIMARY KEY ({})",
-            Self::quote_ident(table_info.pk_column.as_str())
+            Self::quote_column_ident(table_info.pk_column.as_str())
         ));
         let sql = format!(
             "CREATE TABLE {} ({})",
@@ -306,6 +309,8 @@ impl DamengSink {
             extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
         for src_col in &table_info.columns {
             let key = src_col.to_ascii_lowercase();
+            let target_col = Self::target_column_name(src_col);
+            let target_key = target_col.to_ascii_lowercase();
             let def = match defs.get(&key) {
                 None => continue,
                 Some(v) => v,
@@ -317,7 +322,7 @@ impl DamengSink {
             let nullable = mysql_column_allows_null_from_definition(def.as_str());
             let nullable_sql = if nullable { "NULL" } else { "NOT NULL" };
             let dameng_type = Self::map_mysql_type_to_dameng(mysql_type.as_str());
-            if let Some(existing_col) = existing_cols.get(key.as_str()) {
+            if let Some(existing_col) = existing_cols.get(target_key.as_str()) {
                 let should_modify = Self::should_modify_existing_column(&mysql_type, existing_col);
                 if dameng_type.eq_ignore_ascii_case("CLOB") || should_modify {
                     info!(
@@ -346,7 +351,7 @@ impl DamengSink {
                     let sql = format!(
                         "ALTER TABLE {} MODIFY {} {} {}",
                         Self::qualified_table(schema, table_info.table_name.as_str()),
-                        Self::quote_ident(src_col),
+                        Self::quote_ident(target_col.as_str()),
                         dameng_type,
                         nullable_sql
                     );
@@ -376,7 +381,7 @@ impl DamengSink {
             let sql = format!(
                 "ALTER TABLE {} ADD {} {} {}",
                 Self::qualified_table(schema, table_info.table_name.as_str()),
-                Self::quote_ident(src_col),
+                Self::quote_ident(target_col.as_str()),
                 dameng_type,
                 nullable_sql
             );
@@ -719,6 +724,22 @@ impl DamengSink {
         format!("\"{}\"", identifier.replace('"', "\"\""))
     }
 
+    fn quote_column_ident(column_name: &str) -> String {
+        Self::quote_ident(Self::target_column_name(column_name).as_str())
+    }
+
+    fn target_column_name(column_name: &str) -> String {
+        if Self::is_disallowed_dameng_column_name(column_name) {
+            format!("{}_", column_name)
+        } else {
+            column_name.to_string()
+        }
+    }
+
+    fn is_disallowed_dameng_column_name(column_name: &str) -> bool {
+        column_name.eq_ignore_ascii_case("ROWID")
+    }
+
     fn qualified_table(schema: &str, table_name: &str) -> String {
         if schema.is_empty() {
             Self::quote_ident(table_name)
@@ -886,18 +907,47 @@ impl DamengSink {
                 None => {
                     signatures.insert(
                         target_key,
-                        (table_info.pk_column.to_ascii_lowercase(), signature),
+                        (
+                            Self::target_column_name(table_info.pk_column.as_str())
+                                .to_ascii_lowercase(),
+                            signature,
+                        ),
                     );
                 }
                 Some((pk, existing_signature)) => {
-                    if !pk.eq_ignore_ascii_case(table_info.pk_column.as_str())
-                        || existing_signature != &signature
+                    if !pk.eq_ignore_ascii_case(
+                        Self::target_column_name(table_info.pk_column.as_str()).as_str(),
+                    ) || existing_signature != &signature
                     {
                         return Err(format!(
                             "Dameng multi_mode target table schema mismatch: {}",
                             Self::target_table_key(schema.as_str(), table_info.table_name.as_str())
                         ));
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_target_column_names(
+        table_info_list: &[TableInfoVo],
+        fallback_schema: &str,
+    ) -> Result<(), String> {
+        for table_info in table_info_list {
+            let schema = Self::table_info_target_schema(table_info, fallback_schema);
+            let table_key = Self::target_table_key(schema.as_str(), table_info.table_name.as_str());
+            let mut seen: HashMap<String, (String, String)> = HashMap::new();
+            for source_column in &table_info.columns {
+                let target_column = Self::target_column_name(source_column);
+                let target_key = target_column.to_ascii_lowercase();
+                if let Some((existing_source, existing_target)) =
+                    seen.insert(target_key, (source_column.clone(), target_column.clone()))
+                {
+                    return Err(format!(
+                        "Dameng target column name conflict: {} source columns {} and {} both map to target column {}",
+                        table_key, existing_source, source_column, existing_target
+                    ));
                 }
             }
         }
@@ -926,7 +976,10 @@ impl DamengSink {
                     })
                     .unwrap_or_else(|| "__missing_definition__".to_string())
                     .to_ascii_lowercase();
-                (key, type_token)
+                (
+                    Self::target_column_name(column).to_ascii_lowercase(),
+                    type_token,
+                )
             })
             .collect()
     }
@@ -1263,7 +1316,7 @@ impl DamengSink {
             .map(|c| {
                 format!(
                     "{} = {}",
-                    Self::quote_ident(c),
+                    Self::quote_column_ident(c),
                     Self::value_placeholder(&table_info, c)
                 )
             })
@@ -1273,7 +1326,7 @@ impl DamengSink {
             "UPDATE {} SET {} WHERE {} = ?",
             Self::qualified_table(schema, table_name),
             set_sql,
-            Self::quote_ident(pk_name)
+            Self::quote_column_ident(pk_name)
         );
         let mut update_params = Vec::with_capacity(update_columns.len() + 1);
         for col in update_columns {
@@ -1296,7 +1349,7 @@ impl DamengSink {
         let table_info = self.table_info_cache.lock().await.get(table_key);
         let cols_sql = columns
             .iter()
-            .map(|c| Self::quote_ident(c))
+            .map(|c| Self::quote_column_ident(c))
             .collect::<Vec<_>>()
             .join(", ");
         let placeholders = columns
@@ -1400,7 +1453,7 @@ impl DamengSink {
         let sql = format!(
             "DELETE FROM {} WHERE {} = ?",
             Self::qualified_table(schema, table_name),
-            Self::quote_ident(pk_name)
+            Self::quote_column_ident(pk_name)
         );
         let params = vec![Self::value_to_param(pk)];
         debug!("Dameng DELETE: {}", sql);
@@ -1462,6 +1515,42 @@ mod tests {
             DamengSink::target_table_key("TARGET_SCHEMA", "orders"),
             "TARGET_SCHEMA.orders"
         );
+    }
+
+    #[test]
+    fn disallowed_rowid_column_is_remapped() {
+        assert_eq!(DamengSink::target_column_name("id"), "id");
+        assert_eq!(DamengSink::target_column_name("rOWID"), "rOWID_");
+        assert_eq!(DamengSink::target_column_name("ROWID"), "ROWID_");
+        assert_eq!(DamengSink::quote_column_ident("rOWID"), "\"rOWID_\"");
+    }
+
+    #[test]
+    fn table_schema_signature_uses_target_column_name() {
+        let table_info = TableInfoVo {
+            source_database: "source_db".to_string(),
+            target_database: "target_schema".to_string(),
+            table_name: "line_item".to_string(),
+            pk_column: "id".to_string(),
+            create_table_sql: "CREATE TABLE `line_item` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `rOWID` varchar(50) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB".to_string(),
+            columns: vec!["id".to_string(), "rOWID".to_string()],
+        };
+
+        let signature = DamengSink::table_schema_signature(&table_info);
+
+        assert!(signature.contains(&("rowid_".to_string(), "varchar(50 char)".to_string())));
+    }
+
+    #[test]
+    fn target_column_name_validation_rejects_remap_collision() {
+        let mut table_info = table_info("target_schema", "varchar(64)");
+        table_info.columns = vec!["id".to_string(), "rOWID".to_string(), "rOWID_".to_string()];
+
+        let err = DamengSink::validate_target_column_names(&[table_info], "").unwrap_err();
+
+        assert!(err.contains("target column name conflict"));
+        assert!(err.contains("rOWID"));
+        assert!(err.contains("rOWID_"));
     }
 
     #[test]
