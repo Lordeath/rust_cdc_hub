@@ -21,6 +21,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, trace, warn};
 
 const DAMENG_INLINE_STRING_CHAR_LIMIT: u32 = 512;
+const DAMENG_DECIMAL_MAX_PRECISION: u32 = 38;
 
 #[derive(Debug, Clone)]
 enum DamengParam {
@@ -833,7 +834,7 @@ impl DamengSink {
         } else if t.starts_with("double") || t.starts_with("real") {
             "DOUBLE".to_string()
         } else if t.starts_with("decimal") || t.starts_with("numeric") {
-            mysql_type_token.to_ascii_uppercase()
+            Self::map_mysql_decimal_type_to_dameng(mysql_type_token)
         } else if t.starts_with("datetime") || t.starts_with("timestamp") {
             "TIMESTAMP".to_string()
         } else if t.starts_with("date") {
@@ -1004,6 +1005,32 @@ impl DamengSink {
             Some(len) => format!("{}({} CHAR)", dameng_type, len),
             None => format!("{}(255 CHAR)", dameng_type),
         }
+    }
+
+    fn map_mysql_decimal_type_to_dameng(mysql_type_token: &str) -> String {
+        let Some((precision, scale)) = Self::mysql_decimal_precision_scale(mysql_type_token) else {
+            return "DECIMAL".to_string();
+        };
+        let precision = precision.max(1);
+        let scale = scale.min(precision);
+        if precision <= DAMENG_DECIMAL_MAX_PRECISION {
+            return format!("DECIMAL({},{})", precision, scale);
+        }
+
+        let scale = scale.min(DAMENG_DECIMAL_MAX_PRECISION);
+        format!("DECIMAL({},{})", DAMENG_DECIMAL_MAX_PRECISION, scale)
+    }
+
+    fn mysql_decimal_precision_scale(mysql_type_token: &str) -> Option<(u32, u32)> {
+        let start = mysql_type_token.find('(')? + 1;
+        let end = mysql_type_token[start..].find(')')? + start;
+        let mut parts = mysql_type_token[start..end].split(',');
+        let precision = parts.next()?.trim().parse::<u32>().ok()?;
+        let scale = parts
+            .next()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        Some((precision, scale))
     }
 
     fn mysql_type_length(mysql_type_token: &str) -> Option<u32> {
@@ -1745,6 +1772,31 @@ mod tests {
             DamengSink::map_mysql_type_to_dameng("varchar(9000)"),
             "CLOB"
         );
+    }
+
+    #[test]
+    fn mysql_decimal_precision_is_limited_for_dameng() {
+        assert_eq!(
+            DamengSink::map_mysql_type_to_dameng("decimal(20,2)"),
+            "DECIMAL(20,2)"
+        );
+        assert_eq!(
+            DamengSink::map_mysql_type_to_dameng("numeric(10)"),
+            "DECIMAL(10,0)"
+        );
+        assert_eq!(
+            DamengSink::map_mysql_type_to_dameng("decimal(50,2)"),
+            "DECIMAL(38,2)"
+        );
+        assert_eq!(
+            DamengSink::map_mysql_type_to_dameng("decimal(65,30)"),
+            "DECIMAL(38,30)"
+        );
+        assert_eq!(
+            DamengSink::map_mysql_type_to_dameng("decimal(65,30) unsigned"),
+            "DECIMAL(38,30)"
+        );
+        assert_eq!(DamengSink::map_mysql_type_to_dameng("decimal"), "DECIMAL");
     }
 
     #[test]
