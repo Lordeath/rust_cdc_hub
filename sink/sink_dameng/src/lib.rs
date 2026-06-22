@@ -22,6 +22,7 @@ use tracing::{debug, error, info, trace, warn};
 
 const DAMENG_INLINE_STRING_CHAR_LIMIT: u32 = 512;
 const DAMENG_DECIMAL_MAX_PRECISION: u32 = 38;
+const DAMENG_BLOB_WRITE_CHUNK_SIZE: usize = 1000;
 
 #[derive(Debug, Clone)]
 enum DamengParam {
@@ -895,32 +896,53 @@ impl DamengSink {
             .is_some_and(|dameng_type| dameng_type.eq_ignore_ascii_case("BLOB"))
     }
 
-    fn value_placeholder(table_info: &TableInfoVo, column_name: &str) -> &'static str {
-        if Self::is_source_blob_column(table_info, column_name) {
-            "HEXTORAW(?)"
+    fn dml_value_sql(table_info: &TableInfoVo, column_name: &str, value: &Value) -> &'static str {
+        if Self::is_source_blob_column(table_info, column_name) && matches!(value, Value::Blob(_)) {
+            "EMPTY_BLOB()"
         } else {
             "?"
         }
     }
 
-    fn value_to_param_for_column(
+    fn dml_value_param(
         table_info: &TableInfoVo,
         column_name: &str,
         value: &Value,
-    ) -> DamengParam {
-        if Self::is_source_blob_column(table_info, column_name) {
-            match value {
-                Value::None => DamengParam::Null,
-                Value::Blob(v) => DamengParam::Text(Self::bytes_to_hex(v)),
-                _ => Self::value_to_param(value),
-            }
+    ) -> Option<DamengParam> {
+        if Self::is_source_blob_column(table_info, column_name) && matches!(value, Value::Blob(_)) {
+            None
         } else {
-            Self::value_to_param(value)
+            Some(Self::value_to_param(value))
         }
     }
 
     fn bytes_to_hex(value: &[u8]) -> String {
         value.iter().map(|b| format!("{:02X}", b)).collect()
+    }
+
+    fn reset_blob_sql(schema: &str, table_name: &str, pk_name: &str, column_name: &str) -> String {
+        format!(
+            "UPDATE {} SET {} = EMPTY_BLOB() WHERE {} = ?",
+            Self::qualified_table(schema, table_name),
+            Self::quote_column_ident(column_name),
+            Self::quote_column_ident(pk_name)
+        )
+    }
+
+    fn append_blob_chunk_sql(
+        schema: &str,
+        table_name: &str,
+        pk_name: &str,
+        column_name: &str,
+        chunk_len: usize,
+    ) -> String {
+        format!(
+            "DECLARE\n  v_lob BLOB;\nBEGIN\n  SELECT {} INTO v_lob FROM {} WHERE {} = ? FOR UPDATE;\n  DBMS_LOB.WRITEAPPEND(v_lob, {}, HEXTORAW(?));\nEND;",
+            Self::quote_column_ident(column_name),
+            Self::qualified_table(schema, table_name),
+            Self::quote_column_ident(pk_name),
+            chunk_len
+        )
     }
 
     fn validate_merged_target_schema(
@@ -1307,7 +1329,7 @@ impl DamengSink {
             return Ok(());
         }
 
-        self.insert_record(schema, table_name, table_key, columns, record)
+        self.insert_record(schema, table_name, table_key, pk_name, columns, record)
             .await
     }
 
@@ -1324,7 +1346,7 @@ impl DamengSink {
             return Err(format!("columns is empty: {}", table_key));
         }
         match self
-            .insert_record(schema, table_name, table_key, columns, record)
+            .insert_record(schema, table_name, table_key, pk_name, columns, record)
             .await
         {
             Ok(_) => Ok(()),
@@ -1374,30 +1396,41 @@ impl DamengSink {
                 format!(
                     "{} = {}",
                     Self::quote_column_ident(c),
-                    Self::value_placeholder(&table_info, c)
+                    Self::dml_value_sql(&table_info, c, record.after.get(c))
                 )
             })
             .collect::<Vec<_>>()
             .join(", ");
         let update_sql = format!(
-            "UPDATE {} SET {} WHERE {} = {}",
+            "UPDATE {} SET {} WHERE {} = ?",
             Self::qualified_table(schema, table_name),
             set_sql,
-            Self::quote_column_ident(pk_name),
-            Self::value_placeholder(&table_info, pk_name)
+            Self::quote_column_ident(pk_name)
         );
         let mut update_params = Vec::with_capacity(update_columns.len() + 1);
         for col in update_columns {
-            update_params.push(Self::value_to_param_for_column(
-                &table_info,
-                col,
-                record.after.get(col),
-            ));
+            if let Some(param) = Self::dml_value_param(&table_info, col, record.after.get(col)) {
+                update_params.push(param);
+            }
         }
-        update_params.push(Self::value_to_param_for_column(&table_info, pk_name, pk));
+        update_params.push(Self::value_to_param(pk));
         debug!("Dameng UPDATE: {}", update_sql);
-        self.execute_with_params(update_sql.as_str(), &update_params)
-            .await
+        let affected = self
+            .execute_with_params(update_sql.as_str(), &update_params)
+            .await?;
+        if affected > 0 {
+            self.write_blob_columns(
+                schema,
+                table_name,
+                table_key,
+                pk_name,
+                columns,
+                &table_info,
+                record,
+            )
+            .await?;
+        }
+        Ok(affected)
     }
 
     async fn insert_record(
@@ -1405,6 +1438,7 @@ impl DamengSink {
         schema: &str,
         table_name: &str,
         table_key: &str,
+        pk_name: &str,
         columns: &[String],
         record: &DataBuffer,
     ) -> Result<(), String> {
@@ -1416,7 +1450,7 @@ impl DamengSink {
             .join(", ");
         let placeholders = columns
             .iter()
-            .map(|c| Self::value_placeholder(&table_info, c))
+            .map(|c| Self::dml_value_sql(&table_info, c, record.after.get(c)))
             .collect::<Vec<_>>()
             .join(", ");
         let insert_sql = format!(
@@ -1427,7 +1461,7 @@ impl DamengSink {
         );
         let insert_params = columns
             .iter()
-            .map(|col| Self::value_to_param_for_column(&table_info, col, record.after.get(col)))
+            .filter_map(|col| Self::dml_value_param(&table_info, col, record.after.get(col)))
             .collect::<Vec<_>>();
         debug!("Dameng INSERT: {}", insert_sql);
 
@@ -1444,6 +1478,16 @@ impl DamengSink {
                 table_key,
                 insert_sql.as_str(),
                 &insert_params,
+            )
+            .await?;
+            self.write_blob_columns(
+                schema,
+                table_name,
+                table_key,
+                pk_name,
+                columns,
+                &table_info,
+                record,
             )
             .await?;
             return Ok(());
@@ -1470,6 +1514,16 @@ impl DamengSink {
             }
             Err(e) => return Err(e),
         }
+        self.write_blob_columns(
+            schema,
+            table_name,
+            table_key,
+            pk_name,
+            columns,
+            &table_info,
+            record,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1504,7 +1558,7 @@ impl DamengSink {
         &self,
         schema: &str,
         table_name: &str,
-        table_key: &str,
+        _table_key: &str,
         pk_name: &str,
         record: &DataBuffer,
     ) -> Result<(), String> {
@@ -1512,16 +1566,80 @@ impl DamengSink {
         if pk.is_none() {
             return Ok(());
         }
-        let table_info = self.table_info_cache.lock().await.get(table_key);
         let sql = format!(
-            "DELETE FROM {} WHERE {} = {}",
+            "DELETE FROM {} WHERE {} = ?",
             Self::qualified_table(schema, table_name),
-            Self::quote_column_ident(pk_name),
-            Self::value_placeholder(&table_info, pk_name)
+            Self::quote_column_ident(pk_name)
         );
-        let params = vec![Self::value_to_param_for_column(&table_info, pk_name, pk)];
+        let params = vec![Self::value_to_param(pk)];
         debug!("Dameng DELETE: {}", sql);
         self.execute_with_params(sql.as_str(), &params).await?;
+        Ok(())
+    }
+
+    async fn write_blob_columns(
+        &self,
+        schema: &str,
+        table_name: &str,
+        table_key: &str,
+        pk_name: &str,
+        columns: &[String],
+        table_info: &TableInfoVo,
+        record: &DataBuffer,
+    ) -> Result<(), String> {
+        let pk = record.get_pk(pk_name);
+        if pk.is_none()
+            && columns.iter().any(|col| {
+                Self::is_source_blob_column(table_info, col)
+                    && matches!(record.after.get(col), Value::Blob(_))
+            })
+        {
+            return Err(format!(
+                "pk is empty when writing Dameng BLOB columns: {}.{}",
+                table_key, pk_name
+            ));
+        }
+
+        for col in columns {
+            if !Self::is_source_blob_column(table_info, col) {
+                continue;
+            }
+            let Value::Blob(value) = record.after.get(col) else {
+                continue;
+            };
+            self.write_blob_column(schema, table_name, pk_name, pk, col, value)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn write_blob_column(
+        &self,
+        schema: &str,
+        table_name: &str,
+        pk_name: &str,
+        pk: &Value,
+        column_name: &str,
+        value: &[u8],
+    ) -> Result<(), String> {
+        let reset_sql = Self::reset_blob_sql(schema, table_name, pk_name, column_name);
+        let reset_params = vec![Self::value_to_param(pk)];
+        self.execute_with_params(reset_sql.as_str(), &reset_params)
+            .await?;
+
+        for chunk in value.chunks(DAMENG_BLOB_WRITE_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let append_sql =
+                Self::append_blob_chunk_sql(schema, table_name, pk_name, column_name, chunk.len());
+            let append_params = vec![
+                Self::value_to_param(pk),
+                DamengParam::Text(Self::bytes_to_hex(chunk)),
+            ];
+            self.execute_with_params(append_sql.as_str(), &append_params)
+                .await?;
+        }
         Ok(())
     }
 }
@@ -1873,7 +1991,7 @@ mod tests {
     }
 
     #[test]
-    fn clob_columns_use_plain_placeholder() {
+    fn lob_columns_use_dameng_dml_expressions() {
         let table_info = TableInfoVo {
             source_database: "source_db".to_string(),
             target_database: "target_schema".to_string(),
@@ -1897,17 +2015,30 @@ mod tests {
             ],
         };
 
-        assert_eq!(DamengSink::value_placeholder(&table_info, "param"), "?");
-        assert_eq!(DamengSink::value_placeholder(&table_info, "opration"), "?");
-        assert_eq!(DamengSink::value_placeholder(&table_info, "modul"), "?");
         assert_eq!(
-            DamengSink::value_placeholder(&table_info, "operatorLogo"),
-            "HEXTORAW(?)"
+            DamengSink::dml_value_sql(&table_info, "param", &Value::String("x".to_string())),
+            "?"
+        );
+        assert_eq!(
+            DamengSink::dml_value_sql(&table_info, "opration", &Value::String("x".to_string())),
+            "?"
+        );
+        assert_eq!(
+            DamengSink::dml_value_sql(&table_info, "modul", &Value::String("x".to_string())),
+            "?"
+        );
+        assert_eq!(
+            DamengSink::dml_value_sql(&table_info, "operatorLogo", &Value::Blob(vec![1, 2, 3])),
+            "EMPTY_BLOB()"
+        );
+        assert_eq!(
+            DamengSink::dml_value_sql(&table_info, "operatorLogo", &Value::None),
+            "?"
         );
     }
 
     #[test]
-    fn blob_columns_use_hex_text_for_hextoraw() {
+    fn blob_columns_are_written_as_hex_chunks() {
         let table_info = TableInfoVo {
             source_database: "source_db".to_string(),
             target_database: "target_schema".to_string(),
@@ -1923,15 +2054,27 @@ mod tests {
         };
 
         let value = Value::Blob(vec![0x1f, 0x8b, 0x08]);
+        assert!(DamengSink::dml_value_param(&table_info, "operatorLogo", &value).is_none());
         assert_eq!(
-            DamengSink::value_to_param_for_column(&table_info, "operatorLogo", &value)
-                .to_dm_value(),
-            DmValue::Text("1F8B08".to_string())
-        );
-        assert_eq!(
-            DamengSink::value_to_param_for_column(&table_info, "operatorLogo", &Value::None)
+            DamengSink::dml_value_param(&table_info, "operatorLogo", &Value::None)
+                .unwrap()
                 .to_dm_value(),
             DmValue::Null
+        );
+        assert_eq!(DamengSink::bytes_to_hex(&[0x1f, 0x8b, 0x08]), "1F8B08");
+        assert_eq!(
+            DamengSink::reset_blob_sql("target_schema", "ns_soss_operator", "id", "operatorLogo"),
+            "UPDATE \"target_schema\".\"ns_soss_operator\" SET \"operatorLogo\" = EMPTY_BLOB() WHERE \"id\" = ?"
+        );
+        assert_eq!(
+            DamengSink::append_blob_chunk_sql(
+                "target_schema",
+                "ns_soss_operator",
+                "id",
+                "operatorLogo",
+                3
+            ),
+            "DECLARE\n  v_lob BLOB;\nBEGIN\n  SELECT \"operatorLogo\" INTO v_lob FROM \"target_schema\".\"ns_soss_operator\" WHERE \"id\" = ? FOR UPDATE;\n  DBMS_LOB.WRITEAPPEND(v_lob, 3, HEXTORAW(?));\nEND;"
         );
     }
 }
