@@ -29,7 +29,7 @@ use sqlx::FromRow;
 use sqlx::Row;
 use sqlx::mysql::MySqlRow;
 use sqlx::{MySql, Pool, Transaction};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
@@ -185,12 +185,13 @@ impl MysqlSourceConfig {
             .unwrap_or_else(|e| panic!("MySQL source 初始化获取数据结构连接失败: {}", e));
 
             let mut current_source_tables = configured_table_names.clone();
+            let mut no_pk_schema_only_tables: HashSet<String> = HashSet::new();
 
-            if current_source_tables.is_empty()
+            let full_table_discovery = current_source_tables.is_empty()
                 || (current_source_tables.len() == 1
                     && (current_source_tables[0].eq_ignore_ascii_case("all")
-                        || current_source_tables[0].eq_ignore_ascii_case("*")))
-            {
+                        || current_source_tables[0].eq_ignore_ascii_case("*")));
+            if full_table_discovery {
                 // get all tables
                 let show_tables_sql = r#"
                     SELECT distinct c.TABLE_NAME AS table_name
@@ -230,6 +231,44 @@ impl MysqlSourceConfig {
                     .collect();
                 info!("get all tables from {}: {:?}", database, tables);
                 current_source_tables = tables;
+
+                if config.sync_no_pk_table_schema_enabled() {
+                    let no_pk_tables_sql = r#"
+                        SELECT DISTINCT t.TABLE_NAME AS table_name
+                        FROM information_schema.TABLES t
+                        WHERE t.TABLE_SCHEMA = (SELECT DATABASE())
+                          AND t.TABLE_TYPE = 'BASE TABLE'
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM information_schema.TABLE_CONSTRAINTS tc
+                              WHERE tc.TABLE_SCHEMA = t.TABLE_SCHEMA
+                                AND tc.TABLE_NAME = t.TABLE_NAME
+                                AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+                          )
+                    "#;
+                    let no_pk_tables: Vec<String> = sqlx::query(no_pk_tables_sql)
+                        .fetch_all(&pool)
+                        .await
+                        .expect("query failed")
+                        .into_iter()
+                        .map(|row| mysql_row_text_value(&row, "table_name"))
+                        .collect();
+                    info!(
+                        "get no primary key schema-only tables from {}: {:?}",
+                        database, no_pk_tables
+                    );
+
+                    let mut seen_tables = current_source_tables
+                        .iter()
+                        .map(|table| table.to_ascii_lowercase())
+                        .collect::<HashSet<_>>();
+                    for table in no_pk_tables {
+                        no_pk_schema_only_tables.insert(table.to_ascii_lowercase());
+                        if seen_tables.insert(table.to_ascii_lowercase()) {
+                            current_source_tables.push(table);
+                        }
+                    }
+                }
             }
 
             // Apply filters
@@ -281,7 +320,9 @@ impl MysqlSourceConfig {
                     .filter(|c| c.data_type.eq_ignore_ascii_case("bigint"))
                     .map(|c| c.column_name.clone())
                     .collect();
-                if pk_column.is_empty() || pk_column.len() > 1 {
+                let schema_only_no_pk =
+                    no_pk_schema_only_tables.contains(table_name.to_ascii_lowercase().as_str());
+                if pk_column.len() > 1 || (pk_column.is_empty() && !schema_only_no_pk) {
                     error!(
                         "pk_column is empty or more than one for table {}",
                         table_name
@@ -289,7 +330,7 @@ impl MysqlSourceConfig {
                     // panic!("pk_column is empty or more than one");
                     continue;
                 }
-                let pk_column = pk_column[0].clone();
+                let pk_column = pk_column.first().cloned().unwrap_or_default();
                 let columns: Vec<String> = col_list.iter().map(|c| c.column_name.clone()).collect();
 
                 table_info_list.push(TableInfoVo {
@@ -445,6 +486,11 @@ impl InitPkCursor {
 
 impl MysqlSourceConfigDetail {
     #[inline]
+    fn is_cdc_table(table_info: &TableInfoVo) -> bool {
+        !table_info.pk_column.trim().is_empty()
+    }
+
+    #[inline]
     fn source_table_key(&self, table_name: &str) -> String {
         database_table_key(self.database.as_str(), table_name)
     }
@@ -455,6 +501,9 @@ impl MysqlSourceConfigDetail {
             return false;
         }
         for table_info in &self.table_info_list {
+            if !Self::is_cdc_table(table_info) {
+                continue;
+            }
             if table_name.eq_ignore_ascii_case(&table_info.table_name) {
                 return true;
             }
@@ -566,6 +615,7 @@ impl MySQLSource {
                 .table_info_list
                 .clone()
                 .iter()
+                .filter(|t| !t.pk_column.trim().is_empty())
                 .map(|t| database_table_key(t.source_database.as_str(), t.table_name.as_str()))
                 .collect::<Vec<String>>();
             let mut mysql_checkpoint_detail_entity_map = HashMap::new();
@@ -728,6 +778,9 @@ impl MySQLSource {
         checkpoint_manager: Arc<dyn CheckpointManager>,
     ) -> Result<(usize, HashMap<String, MysqlCheckPointDetailEntity>, bool), CustomError> {
         let any_new = config.table_info_list.iter().any(|table_info| {
+            if !MysqlSourceConfigDetail::is_cdc_table(table_info) {
+                return false;
+            }
             let table_key = config.source_table_key(table_info.table_name.as_str());
             checkpoints
                 .get(table_key.to_lowercase().as_str())
@@ -753,6 +806,9 @@ impl MySQLSource {
         );
 
         for table_info in &config.table_info_list {
+            if !MysqlSourceConfigDetail::is_cdc_table(table_info) {
+                continue;
+            }
             let table_key = config.source_table_key(table_info.table_name.as_str());
             if let Some(cp) = checkpoints.get_mut(table_key.to_lowercase().as_str())
                 && cp.is_new
@@ -768,6 +824,9 @@ impl MySQLSource {
         })?;
 
         for table_info_vo in config.table_info_list.clone() {
+            if !MysqlSourceConfigDetail::is_cdc_table(&table_info_vo) {
+                continue;
+            }
             let table_name = table_info_vo.table_name.clone();
             let table_key = config.source_table_key(table_name.as_str());
             let is_new_table = checkpoints
@@ -1552,6 +1611,9 @@ fn compute_resume_position(
     {
         return ResumePosition::BinlogPosition(f.to_string(), p);
     }
+    if checkpoints.is_empty() {
+        return ResumePosition::Latest;
+    }
     let max: MysqlCheckPointDetailEntity = checkpoints
         .values()
         .max_by(|a, b| {
@@ -1612,7 +1674,7 @@ fn table_pk_column(config: &MysqlSourceConfigDetail, table_name: &str) -> Option
         .table_info_list
         .iter()
         .find(|table| table.table_name.eq_ignore_ascii_case(table_name))
-        .map(|table| table.pk_column.clone())
+        .and_then(|table| (!table.pk_column.trim().is_empty()).then(|| table.pk_column.clone()))
 }
 
 async fn detail_with_plugin(
@@ -2953,6 +3015,15 @@ mod tests {
     }
 
     #[test]
+    fn compute_resume_position_latest_when_no_cdc_tables() {
+        let checkpoints = HashMap::new();
+
+        let rp = compute_resume_position(None, None, &checkpoints);
+
+        assert_eq!(rp, ResumePosition::Latest);
+    }
+
+    #[test]
     fn compute_resume_position_uses_max_checkpoint() {
         let mut checkpoints = HashMap::new();
         checkpoints.insert(
@@ -3018,5 +3089,34 @@ mod tests {
         cursor.advance(InitPkCursor::Unsigned(12));
 
         assert_eq!(cursor, InitPkCursor::Unsigned(12));
+    }
+
+    #[test]
+    fn schema_only_tables_are_not_cdc_tables() {
+        let table_info = TableInfoVo {
+            source_database: "source_db".to_string(),
+            target_database: "target_db".to_string(),
+            table_name: "no_pk_table".to_string(),
+            pk_column: "".to_string(),
+            create_table_sql: "CREATE TABLE `no_pk_table` (`name` varchar(64))".to_string(),
+            columns: vec!["name".to_string()],
+        };
+        let config = MysqlSourceConfigDetail {
+            username: "".to_string(),
+            password: "".to_string(),
+            host: "".to_string(),
+            port: "".to_string(),
+            database: "source_db".to_string(),
+            target_database: "target_db".to_string(),
+            server_id: 1,
+            connection_url: "".to_string(),
+            table_info_list: vec![table_info],
+            batchsize: 100,
+            start_binlog_filename: None,
+            start_binlog_position: None,
+        };
+
+        assert!(!config.is_target_database_and_table("source_db", "no_pk_table"));
+        assert_eq!(table_pk_column(&config, "no_pk_table"), None);
     }
 }

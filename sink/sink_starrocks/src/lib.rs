@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::log::trace;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub const OP_UPSERT: u8 = 0;
 pub const OP_DELETE: u8 = 1;
@@ -163,6 +163,13 @@ impl StarrocksSink {
         if !self.auto_create_table {
             return Ok(());
         }
+        if Self::is_schema_only_table(table_info) {
+            warn!(
+                "Starrocks skip schema-only table without primary key: {}.{}",
+                self.database, table_info.table_name
+            );
+            return Ok(());
+        }
         let sql = format!(
             "select TABLE_NAME from information_schema.`tables` where TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' limit 1",
             self.database, table_info.table_name
@@ -270,6 +277,13 @@ impl StarrocksSink {
             return;
         }
         for table_info in &self.table_info_list {
+            if Self::is_schema_only_table(table_info) {
+                warn!(
+                    "Starrocks skip schema check for schema-only table without primary key: {}.{}",
+                    self.database, table_info.table_name
+                );
+                continue;
+            }
             let table_name = table_info.table_name.clone();
             let defs =
                 extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
@@ -384,6 +398,10 @@ impl StarrocksSink {
                 }
             }
         }
+    }
+
+    fn is_schema_only_table(table_info: &TableInfoVo) -> bool {
+        table_info.pk_column.trim().is_empty()
     }
 
     pub async fn cast_to_starrocks_map(&self, data_buffer: &DataBuffer) -> HashMap<String, Value> {
@@ -639,6 +657,20 @@ mod tests {
         let text = r#"{"Status":"FAILED","Message":"table not found"}"#;
         let err = StarrocksSink::parse_starrocks_json_lines(text).unwrap_err();
         assert_eq!(err, "table not found");
+    }
+
+    #[test]
+    fn schema_only_table_is_detected_by_empty_pk_column() {
+        let table_info = TableInfoVo {
+            source_database: "source_db".to_string(),
+            target_database: "target_db".to_string(),
+            table_name: "no_pk_table".to_string(),
+            pk_column: "".to_string(),
+            create_table_sql: "CREATE TABLE `no_pk_table` (`name` varchar(64))".to_string(),
+            columns: vec!["name".to_string()],
+        };
+
+        assert!(StarrocksSink::is_schema_only_table(&table_info));
     }
 
     #[tokio::test]

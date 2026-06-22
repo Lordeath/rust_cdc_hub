@@ -129,6 +129,7 @@ export CONFIG_PATH=/path/to/config.yaml
 | `auto_create_table` | 否 | 是否自动建表，默认 `true`。 |
 | `auto_add_column` | 否 | 是否自动加字段。 |
 | `auto_modify_column` | 否 | 是否自动修改字段。 |
+| `sync_no_pk_table_schema` | 否 | 全表发现时是否额外同步无主键表结构，默认 `false`；这些表只建结构，不做初始化数据和 CDC 同步；StarRocks 目标端会跳过并告警。 |
 | `sync_stored_procedure` | 否 | MySQL → MySQL 时是否同步源库存储过程，默认 `false`；也兼容 `sync_stored_procedures`。 |
 | `overwrite_stored_procedure` | 否 | 同步存储过程时，目标库已存在同名过程是否先删除再重建，默认 `false`；也兼容 `overwrite_stored_procedures`。 |
 | `plugins` | 否 | 插件配置列表。 |
@@ -147,13 +148,13 @@ export CONFIG_PATH=/path/to/config.yaml
 | `host` / `port` | MySQL 地址和端口。 |
 | `username` / `password` | MySQL 账号密码。 |
 | `database` | 源库名。 |
-| `table_name` | 表名；可填单表、逗号分隔多表或 `"*"` 表示按规则自动发现表。`"*"` 会筛选单一 `bigint`/`bigint unsigned` 主键且没有外键依赖的表。 |
+| `table_name` | 表名；可填单表、逗号分隔多表或 `"*"` 表示按规则自动发现表。`"*"` 默认筛选单一 `bigint`/`bigint unsigned` 主键且没有外键依赖的表；当顶层 `sync_no_pk_table_schema: true` 时，会额外纳入无主键 `BASE TABLE`，仅同步表结构。 |
 | `except_table_name_prefix` | 排除指定前缀的表，多个前缀用逗号分隔。 |
 | `server_id` | Binlog replication server id，必须与 MySQL 集群中其他 server id 不重复。 |
 | `ssl_mode` | MySQL SSL模式，透传为SQLx连接参数 `ssl-mode`。可选：`disabled`、`preferred`、`required`、`verify_ca`、`verify_identity`；默认 `disabled`。如果源库/目标库必须使用SSL，请显式设置为 `required` 或证书校验模式。 |
 | `statement_cache_capacity` | MySQL prepared statement 缓存容量，透传为 SQLx 连接参数 `statement-cache-capacity`；设为 `"0"` 可关闭缓存。MySQL 报 `Can't create more than max_prepared_stmt_count statements` 时，可先断开旧连接或临时调大 `max_prepared_stmt_count` 后重启同步进程。 |
 
-主键列会从 MySQL 表结构自动识别；参与同步的表需要单一 `bigint`/`bigint unsigned` 主键。MeiliSearch 目标端的 `meili_table_pk` 仍需单独配置为索引主键字段。
+主键列会从 MySQL 表结构自动识别；参与数据同步的表需要单一 `bigint`/`bigint unsigned` 主键。配置项 `pk_column` 已弃用，配置文件中出现该字段会在启动解析时报错。MeiliSearch 目标端的 `meili_table_pk` 仍需单独配置为索引主键字段。
 
 ### 多库同步模式（MySQL → MySQL/Dameng）
 

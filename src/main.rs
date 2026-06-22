@@ -110,6 +110,7 @@ impl UiState {
             "auto_create_table": config.auto_create_table.unwrap_or(true),
             "auto_add_column": config.auto_add_column.unwrap_or(true),
             "auto_modify_column": config.auto_modify_column.unwrap_or(true),
+            "sync_no_pk_table_schema": config.sync_no_pk_table_schema_enabled(),
             "sync_stored_procedure": config.sync_stored_procedure_enabled(),
             "overwrite_stored_procedure": config.overwrite_stored_procedure_enabled(),
             "ui_bind": config.ui_bind.clone(),
@@ -2106,6 +2107,13 @@ pub fn load_config(path: &str) -> Result<CdcConfig, Box<dyn Error>> {
     })?;
 
     if path.ends_with(".yaml") || path.ends_with(".yml") {
+        let raw_config: serde_json::Value = serde_yaml::from_str(&content).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("解析 YAML 配置失败: CONFIG_PATH={}, error={}", path, e),
+            )
+        })?;
+        reject_deprecated_pk_column_value(&raw_config, "", path)?;
         let cfg: CdcConfig = serde_yaml::from_str(&content).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2114,6 +2122,13 @@ pub fn load_config(path: &str) -> Result<CdcConfig, Box<dyn Error>> {
         })?;
         Ok(cfg)
     } else if path.ends_with(".json") {
+        let raw_config: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("解析 JSON 配置失败: CONFIG_PATH={}, error={}", path, e),
+            )
+        })?;
+        reject_deprecated_pk_column_value(&raw_config, "", path)?;
         let cfg: CdcConfig = serde_json::from_str(&content).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2131,6 +2146,47 @@ pub fn load_config(path: &str) -> Result<CdcConfig, Box<dyn Error>> {
         )
         .into())
     }
+}
+
+fn reject_deprecated_pk_column_value(
+    value: &serde_json::Value,
+    location: &str,
+    path: &str,
+) -> Result<(), Box<dyn Error>> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                let child_location = if location.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}.{}", location, key)
+                };
+                if key == "pk_column" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "配置项 pk_column 已弃用，请删除 {}: CONFIG_PATH={}",
+                            child_location, path
+                        ),
+                    )
+                    .into());
+                }
+                reject_deprecated_pk_column_value(child, child_location.as_str(), path)?;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                let child_location = if location.is_empty() {
+                    format!("[{}]", index)
+                } else {
+                    format!("{}[{}]", location, index)
+                };
+                reject_deprecated_pk_column_value(child, child_location.as_str(), path)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 struct CustomTime;
@@ -2676,5 +2732,59 @@ plugins:
         assert!(err.contains(path.as_str()));
         assert!(err.contains("CONFIG_PATH="));
         assert!(err.contains("cwd="));
+    }
+
+    #[test]
+    fn test_load_config_rejects_deprecated_pk_column() {
+        let path = format!(
+            "/tmp/rust_cdc_hub_deprecated_pk_column_{}.yaml",
+            std::process::id()
+        );
+        fs::write(
+            path.as_str(),
+            r#"
+source_type: MySQL
+sink_type: Dameng
+source_config:
+  - database: demo
+    pk_column: id
+sink_config:
+  - database: target
+"#,
+        )
+        .unwrap();
+
+        let err = load_config(path.as_str()).unwrap_err().to_string();
+        let _ = fs::remove_file(path.as_str());
+
+        assert!(err.contains("pk_column 已弃用"));
+        assert!(err.contains("source_config[0].pk_column"));
+    }
+
+    #[test]
+    fn test_load_config_rejects_deprecated_top_level_pk_column() {
+        let path = format!(
+            "/tmp/rust_cdc_hub_deprecated_top_level_pk_column_{}.yaml",
+            std::process::id()
+        );
+        fs::write(
+            path.as_str(),
+            r#"
+source_type: MySQL
+sink_type: Dameng
+pk_column: id
+source_config:
+  - database: demo
+sink_config:
+  - database: target
+"#,
+        )
+        .unwrap();
+
+        let err = load_config(path.as_str()).unwrap_err().to_string();
+        let _ = fs::remove_file(path.as_str());
+
+        assert!(err.contains("pk_column 已弃用"));
+        assert!(err.contains("请删除 pk_column"));
     }
 }

@@ -133,6 +133,7 @@ pub struct CdcConfig {
     pub auto_create_table: Option<bool>,
     pub auto_add_column: Option<bool>,
     pub auto_modify_column: Option<bool>,
+    pub sync_no_pk_table_schema: Option<bool>,
     #[serde(alias = "sync_stored_procedures")]
     pub sync_stored_procedure: Option<bool>,
     #[serde(alias = "overwrite_stored_procedures")]
@@ -214,6 +215,10 @@ impl CdcConfig {
 
     pub fn sync_stored_procedure_enabled(&self) -> bool {
         self.sync_stored_procedure.unwrap_or(false)
+    }
+
+    pub fn sync_no_pk_table_schema_enabled(&self) -> bool {
+        self.sync_no_pk_table_schema.unwrap_or(false)
     }
 
     pub fn overwrite_stored_procedure_enabled(&self) -> bool {
@@ -1379,6 +1384,7 @@ mod tests {
             auto_create_table: None,
             auto_add_column: None,
             auto_modify_column: None,
+            sync_no_pk_table_schema: None,
             sync_stored_procedure: None,
             overwrite_stored_procedure: None,
             plugins: None,
@@ -1451,6 +1457,25 @@ mod tests {
 
         assert!(config.sync_stored_procedure_enabled());
         assert!(config.overwrite_stored_procedure_enabled());
+    }
+
+    #[test]
+    fn test_sync_no_pk_table_schema_default_false_and_parse() {
+        let default_config = multi_mode_config();
+        assert!(!default_config.sync_no_pk_table_schema_enabled());
+
+        let config: CdcConfig = serde_json::from_str(
+            r#"{
+                "source_type": "MySQL",
+                "sink_type": "Dameng",
+                "source_config": [{}],
+                "sink_config": [{}],
+                "sync_no_pk_table_schema": true
+            }"#,
+        )
+        .unwrap();
+
+        assert!(config.sync_no_pk_table_schema_enabled());
     }
 
     #[test]

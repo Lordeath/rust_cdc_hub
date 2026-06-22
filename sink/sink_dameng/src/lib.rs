@@ -243,6 +243,16 @@ impl DamengSink {
             return Ok(());
         }
 
+        let sql = Self::create_table_sql(schema, table_info)?;
+        self.execute(sql.as_str()).await?;
+        info!(
+            "Dameng auto create table success: {}",
+            Self::target_table_key(schema, table_info.table_name.as_str())
+        );
+        Ok(())
+    }
+
+    fn create_table_sql(schema: &str, table_info: &TableInfoVo) -> Result<String, String> {
         let defs =
             extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
         let mut cols_sql: Vec<String> = Vec::with_capacity(table_info.columns.len());
@@ -273,21 +283,18 @@ impl DamengSink {
         if cols_sql.is_empty() {
             return Err("no columns parsed from source create table sql".to_string());
         }
-        cols_sql.push(format!(
-            "PRIMARY KEY ({})",
-            Self::quote_column_ident(table_info.pk_column.as_str())
-        ));
+        if !table_info.pk_column.trim().is_empty() {
+            cols_sql.push(format!(
+                "PRIMARY KEY ({})",
+                Self::quote_column_ident(table_info.pk_column.as_str())
+            ));
+        }
         let sql = format!(
             "CREATE TABLE {} ({})",
             Self::qualified_table(schema, table_info.table_name.as_str()),
             cols_sql.join(", ")
         );
-        self.execute(sql.as_str()).await?;
-        info!(
-            "Dameng auto create table success: {}",
-            Self::target_table_key(schema, table_info.table_name.as_str())
-        );
-        Ok(())
+        Ok(sql)
     }
 
     async fn ensure_columns(&self, schema: &str, table_info: &TableInfoVo) -> Result<(), String> {
@@ -1699,6 +1706,35 @@ mod tests {
             DamengSink::target_table_key("TARGET_SCHEMA", "orders"),
             "TARGET_SCHEMA.orders"
         );
+    }
+
+    #[test]
+    fn create_table_sql_omits_primary_key_for_schema_only_table() {
+        let table_info = TableInfoVo {
+            source_database: "source_db".to_string(),
+            target_database: "target_schema".to_string(),
+            table_name: "ns_system_organization_dimen_tree".to_string(),
+            pk_column: "".to_string(),
+            create_table_sql: r#"CREATE TABLE `ns_system_organization_dimen_tree` (
+  `organization_id` bigint NOT NULL,
+  `organization_parent_id` bigint NOT NULL,
+  `organization_path` varchar(400) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3"#
+                .to_string(),
+            columns: vec![
+                "organization_id".to_string(),
+                "organization_parent_id".to_string(),
+                "organization_path".to_string(),
+            ],
+        };
+
+        let sql = DamengSink::create_table_sql("target_schema", &table_info).unwrap();
+
+        assert!(
+            sql.starts_with("CREATE TABLE \"target_schema\".\"ns_system_organization_dimen_tree\"")
+        );
+        assert!(sql.contains("\"organization_id\" BIGINT NOT NULL"));
+        assert!(!sql.contains("PRIMARY KEY"));
     }
 
     #[test]
