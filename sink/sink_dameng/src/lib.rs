@@ -737,7 +737,17 @@ impl DamengSink {
     }
 
     fn is_disallowed_dameng_column_name(column_name: &str) -> bool {
-        column_name.eq_ignore_ascii_case("ROWID")
+        matches!(
+            column_name.to_ascii_uppercase().as_str(),
+            "ROWID"
+                | "ROWNUM"
+                | "TRXID"
+                | "VERSIONS_STARTTIME"
+                | "VERSIONS_ENDTIME"
+                | "VERSIONS_STARTTRXID"
+                | "VERSIONS_ENDTRXID"
+                | "VERSIONS_OPERATION"
+        )
     }
 
     fn qualified_table(schema: &str, table_name: &str) -> String {
@@ -1518,11 +1528,34 @@ mod tests {
     }
 
     #[test]
-    fn disallowed_rowid_column_is_remapped() {
+    fn disallowed_dameng_column_names_are_remapped() {
         assert_eq!(DamengSink::target_column_name("id"), "id");
         assert_eq!(DamengSink::target_column_name("rOWID"), "rOWID_");
         assert_eq!(DamengSink::target_column_name("ROWID"), "ROWID_");
+        assert_eq!(DamengSink::target_column_name("trxid"), "trxid_");
+        assert_eq!(DamengSink::target_column_name("rownum"), "rownum_");
+        assert_eq!(
+            DamengSink::target_column_name("VERSIONS_STARTTIME"),
+            "VERSIONS_STARTTIME_"
+        );
+        assert_eq!(
+            DamengSink::target_column_name("versions_endtime"),
+            "versions_endtime_"
+        );
+        assert_eq!(
+            DamengSink::target_column_name("VERSIONS_STARTTRXID"),
+            "VERSIONS_STARTTRXID_"
+        );
+        assert_eq!(
+            DamengSink::target_column_name("versions_endtrxid"),
+            "versions_endtrxid_"
+        );
+        assert_eq!(
+            DamengSink::target_column_name("VERSIONS_OPERATION"),
+            "VERSIONS_OPERATION_"
+        );
         assert_eq!(DamengSink::quote_column_ident("rOWID"), "\"rOWID_\"");
+        assert_eq!(DamengSink::quote_column_ident("trxid"), "\"trxid_\"");
     }
 
     #[test]
