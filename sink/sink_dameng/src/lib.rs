@@ -184,6 +184,15 @@ impl DamengSink {
                         e
                     )
                 })?;
+            self.ensure_column_comments(schema.as_str(), table_info)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Dameng ensure column comments failed: {} {}",
+                        Self::target_table_key(schema.as_str(), table_info.table_name.as_str()),
+                        e
+                    )
+                })?;
         }
         Ok(())
     }
@@ -191,6 +200,67 @@ impl DamengSink {
     async fn ensure_database(&self) -> Result<(), String> {
         for schema in self.target_schemas() {
             self.ensure_database_schema(schema.as_str()).await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_column_comments(
+        &self,
+        schema: &str,
+        table_info: &TableInfoVo,
+    ) -> Result<(), String> {
+        let expected_comments = Self::mysql_column_comments(table_info);
+        if expected_comments.is_empty() {
+            return Ok(());
+        }
+
+        let existing_comments = self
+            .existing_column_comments(schema, table_info.table_name.as_str())
+            .await?;
+        if existing_comments.is_empty() {
+            warn!(
+                "Dameng target table comment metadata is empty, skip comment check: {}",
+                Self::target_table_key(schema, table_info.table_name.as_str())
+            );
+            return Ok(());
+        }
+
+        for src_col in &table_info.columns {
+            let target_col = Self::target_column_name(src_col);
+            let target_key = target_col.to_ascii_lowercase();
+            let Some(expected_comment) = expected_comments.get(target_key.as_str()) else {
+                continue;
+            };
+            if existing_comments
+                .get(target_key.as_str())
+                .is_some_and(|existing| existing == expected_comment)
+            {
+                continue;
+            }
+
+            let sql = Self::comment_on_column_sql(
+                schema,
+                table_info.table_name.as_str(),
+                target_col.as_str(),
+                expected_comment.as_str(),
+            );
+            match self.execute(sql.as_str()).await {
+                Ok(_) => info!(
+                    "Dameng auto comment column success: {} {}",
+                    Self::target_table_key(schema, table_info.table_name.as_str()),
+                    src_col
+                ),
+                Err(e) => {
+                    let msg = format!(
+                        "Dameng auto comment column failed: {} {} {}",
+                        Self::target_table_key(schema, table_info.table_name.as_str()),
+                        src_col,
+                        e
+                    );
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
         }
         Ok(())
     }
@@ -484,6 +554,32 @@ impl DamengSink {
         Ok(Self::parse_columns_metadata(metadata.as_str()))
     }
 
+    async fn existing_column_comments(
+        &self,
+        schema: &str,
+        table_name: &str,
+    ) -> Result<HashMap<String, String>, String> {
+        let sql = if schema.is_empty() {
+            format!(
+                "SELECT c.COLUMN_NAME || CHR(31) || NVL(REPLACE(REPLACE(cc.COMMENTS, CHR(30), ' '), CHR(31), ' '), '') FROM USER_TAB_COLUMNS c LEFT JOIN USER_COL_COMMENTS cc ON cc.TABLE_NAME = c.TABLE_NAME AND cc.COLUMN_NAME = c.COLUMN_NAME WHERE {} ORDER BY c.COLUMN_ID",
+                Self::eq_original_or_upper_sql("c.TABLE_NAME", table_name)
+            )
+        } else {
+            format!(
+                "SELECT c.COLUMN_NAME || CHR(31) || NVL(REPLACE(REPLACE(cc.COMMENTS, CHR(30), ' '), CHR(31), ' '), '') FROM ALL_TAB_COLUMNS c LEFT JOIN ALL_COL_COMMENTS cc ON cc.OWNER = c.OWNER AND cc.TABLE_NAME = c.TABLE_NAME AND cc.COLUMN_NAME = c.COLUMN_NAME WHERE {} AND {} ORDER BY c.COLUMN_ID",
+                Self::eq_original_or_upper_sql("c.OWNER", schema),
+                Self::eq_original_or_upper_sql("c.TABLE_NAME", table_name)
+            )
+        };
+        let rows = self.query(sql.as_str(), &[]).await?;
+        let metadata = rows
+            .iter()
+            .filter_map(|row| row.get::<String>(0).ok())
+            .collect::<Vec<_>>()
+            .join("\x1e");
+        Ok(Self::parse_column_comments_metadata(metadata.as_str()))
+    }
+
     fn parse_columns_metadata(metadata: &str) -> HashMap<String, DamengColumnInfo> {
         let mut cols = HashMap::new();
         for column in metadata.split('|').filter(|s| !s.is_empty()) {
@@ -520,6 +616,20 @@ impl DamengSink {
             );
         }
         cols
+    }
+
+    fn parse_column_comments_metadata(metadata: &str) -> HashMap<String, String> {
+        let mut comments = HashMap::new();
+        for column in metadata.split('\x1e').filter(|s| !s.is_empty()) {
+            let Some((name, comment)) = column.split_once('\x1f') else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            comments.insert(name.to_ascii_lowercase(), comment.to_string());
+        }
+        comments
     }
 
     fn quote_literal(value: &str) -> String {
@@ -903,6 +1013,27 @@ impl DamengSink {
         }
     }
 
+    fn qualified_column(schema: &str, table_name: &str, column_name: &str) -> String {
+        format!(
+            "{}.{}",
+            Self::qualified_table(schema, table_name),
+            Self::quote_column_ident(column_name)
+        )
+    }
+
+    fn comment_on_column_sql(
+        schema: &str,
+        table_name: &str,
+        column_name: &str,
+        comment: &str,
+    ) -> String {
+        format!(
+            "COMMENT ON COLUMN {} IS {}",
+            Self::qualified_column(schema, table_name, column_name),
+            Self::quote_literal(comment)
+        )
+    }
+
     fn value_to_param(value: &Value) -> DamengParam {
         match value {
             Value::None => DamengParam::Null,
@@ -948,11 +1079,63 @@ impl DamengSink {
             parts.push(nullable_sql.to_string());
         }
         if let Some(default_sql) =
-            Self::mysql_current_timestamp_default_sql(mysql_type_token, mysql_column_definition)
+            Self::mysql_column_default_sql(mysql_type_token, mysql_column_definition)
         {
-            parts.push(default_sql.to_string());
+            parts.push(default_sql);
         }
         parts.join(" ")
+    }
+
+    fn mysql_column_default_sql(
+        mysql_type_token: &str,
+        mysql_column_definition: &str,
+    ) -> Option<String> {
+        let default_value = Self::mysql_default_value_expression(mysql_column_definition)?;
+        if Self::mysql_default_is_null(default_value.as_str()) {
+            return None;
+        }
+
+        let t = mysql_type_token.to_ascii_lowercase();
+        if (t.starts_with("timestamp") || t.starts_with("datetime"))
+            && Self::mysql_default_is_current_timestamp(default_value.as_str())
+        {
+            return Some("DEFAULT CURRENT_TIMESTAMP".to_string());
+        }
+
+        let dameng_type = Self::map_mysql_type_to_dameng(mysql_type_token);
+        if dameng_type.eq_ignore_ascii_case("CLOB") || dameng_type.eq_ignore_ascii_case("BLOB") {
+            return None;
+        }
+
+        let default_literal =
+            Self::mysql_default_literal_sql(mysql_type_token, default_value.as_str())?;
+        Some(format!("DEFAULT {}", default_literal))
+    }
+
+    fn mysql_column_comments(table_info: &TableInfoVo) -> HashMap<String, String> {
+        let defs =
+            extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
+        let mut comments = HashMap::new();
+        for src_col in &table_info.columns {
+            let key = src_col.to_ascii_lowercase();
+            let Some(def) = defs.get(key.as_str()) else {
+                continue;
+            };
+            let Some(comment) = Self::mysql_column_comment(def.as_str()) else {
+                continue;
+            };
+            comments.insert(
+                Self::target_column_name(src_col).to_ascii_lowercase(),
+                comment,
+            );
+        }
+        comments
+    }
+
+    fn mysql_column_comment(mysql_column_definition: &str) -> Option<String> {
+        let comment_pos = Self::find_keyword_outside_quotes(mysql_column_definition, 0, "comment")?;
+        let rest = mysql_column_definition[comment_pos + "comment".len()..].trim_start();
+        Self::mysql_string_literal_content(rest)
     }
 
     fn mysql_current_timestamp_default_sql(
@@ -963,20 +1146,125 @@ impl DamengSink {
         if !t.starts_with("timestamp") && !t.starts_with("datetime") {
             return None;
         }
-        if Self::definition_has_current_timestamp_default(mysql_column_definition) {
+        let Some(default_value) = Self::mysql_default_value_expression(mysql_column_definition)
+        else {
+            return None;
+        };
+        if Self::mysql_default_is_current_timestamp(default_value.as_str()) {
             Some("DEFAULT CURRENT_TIMESTAMP")
         } else {
             None
         }
     }
 
-    fn definition_has_current_timestamp_default(definition: &str) -> bool {
+    fn mysql_default_value_expression(definition: &str) -> Option<String> {
         let Some(default_pos) = Self::find_keyword_outside_quotes(definition, 0, "default") else {
-            return false;
+            return None;
         };
         let rest = definition[default_pos + "default".len()..].trim_start();
-        let rest_lower = rest.to_ascii_lowercase();
-        let Some(tail) = rest_lower.strip_prefix("current_timestamp") else {
+        Self::take_mysql_default_expression(rest).map(ToString::to_string)
+    }
+
+    fn take_mysql_default_expression(rest: &str) -> Option<&str> {
+        let rest = rest.trim_start();
+        if rest.is_empty() {
+            return None;
+        }
+
+        let bytes = rest.as_bytes();
+        let mut quote: Option<u8> = None;
+        let mut paren_depth = 0u32;
+        let mut pos = 0usize;
+        let mut end = bytes.len();
+
+        while pos < bytes.len() {
+            let byte = bytes[pos];
+            if let Some(quote_byte) = quote {
+                if byte == b'\\' {
+                    pos = (pos + 2).min(bytes.len());
+                    continue;
+                }
+                if byte == quote_byte {
+                    if bytes.get(pos + 1) == Some(&quote_byte) {
+                        pos += 2;
+                    } else {
+                        quote = None;
+                        pos += 1;
+                    }
+                } else {
+                    pos += 1;
+                }
+                continue;
+            }
+
+            match byte {
+                b'\'' | b'"' | b'`' => {
+                    quote = Some(byte);
+                    pos += 1;
+                }
+                b'(' => {
+                    paren_depth += 1;
+                    pos += 1;
+                }
+                b')' => {
+                    paren_depth = paren_depth.saturating_sub(1);
+                    pos += 1;
+                }
+                b if b.is_ascii_whitespace() && paren_depth == 0 => {
+                    let next = Self::skip_ascii_whitespace(rest, pos);
+                    if next < bytes.len() && Self::is_mysql_default_tail_keyword(rest, next) {
+                        end = pos;
+                        break;
+                    }
+                    pos += 1;
+                }
+                _ => pos += 1,
+            }
+        }
+
+        let value = rest[..end].trim_end();
+        if value.is_empty() { None } else { Some(value) }
+    }
+
+    fn skip_ascii_whitespace(value: &str, start: usize) -> usize {
+        let bytes = value.as_bytes();
+        let mut pos = start;
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        pos
+    }
+
+    fn is_mysql_default_tail_keyword(value: &str, pos: usize) -> bool {
+        const TAIL_KEYWORDS: &[&str] = &[
+            "comment",
+            "on",
+            "not",
+            "null",
+            "auto_increment",
+            "primary",
+            "unique",
+            "collate",
+            "character",
+            "charset",
+            "check",
+            "constraint",
+            "references",
+            "visible",
+            "invisible",
+        ];
+        TAIL_KEYWORDS
+            .iter()
+            .any(|keyword| Self::starts_with_keyword(value, pos, keyword))
+    }
+
+    fn mysql_default_is_null(default_value: &str) -> bool {
+        default_value.trim().eq_ignore_ascii_case("null")
+    }
+
+    fn mysql_default_is_current_timestamp(default_value: &str) -> bool {
+        let default_lower = default_value.trim().to_ascii_lowercase();
+        let Some(tail) = default_lower.strip_prefix("current_timestamp") else {
             return false;
         };
         Self::current_timestamp_default_tail_ok(tail)
@@ -1001,6 +1289,140 @@ impl DamengSink {
             .is_some_and(|byte| Self::is_ascii_identifier_byte(*byte))
     }
 
+    fn mysql_default_literal_sql(mysql_type_token: &str, default_value: &str) -> Option<String> {
+        let t = mysql_type_token.to_ascii_lowercase();
+        if Self::mysql_numeric_or_boolean_type(t.as_str()) {
+            return Self::mysql_numeric_default_literal_sql(default_value);
+        }
+        if t.starts_with("varchar") || t.starts_with("char") {
+            let value = Self::mysql_string_literal_content(default_value)?;
+            return Some(Self::quote_literal(value.as_str()));
+        }
+        None
+    }
+
+    fn mysql_numeric_or_boolean_type(mysql_type_token: &str) -> bool {
+        mysql_type_token.starts_with("tinyint")
+            || mysql_type_token.starts_with("smallint")
+            || mysql_type_token.starts_with("mediumint")
+            || mysql_type_token.starts_with("int")
+            || mysql_type_token.starts_with("integer")
+            || mysql_type_token.starts_with("bigint")
+            || mysql_type_token.starts_with("float")
+            || mysql_type_token.starts_with("double")
+            || mysql_type_token.starts_with("real")
+            || mysql_type_token.starts_with("decimal")
+            || mysql_type_token.starts_with("numeric")
+            || mysql_type_token.starts_with("bit")
+            || mysql_type_token.starts_with("bool")
+            || mysql_type_token.starts_with("boolean")
+    }
+
+    fn mysql_numeric_default_literal_sql(default_value: &str) -> Option<String> {
+        let value = default_value.trim();
+        if let Some(bit_value) = Self::mysql_bit_literal_to_decimal(value) {
+            return Some(bit_value);
+        }
+
+        let unquoted =
+            Self::mysql_string_literal_content(value).unwrap_or_else(|| value.to_string());
+        let normalized = unquoted.trim();
+        if normalized.eq_ignore_ascii_case("true") {
+            return Some("1".to_string());
+        }
+        if normalized.eq_ignore_ascii_case("false") {
+            return Some("0".to_string());
+        }
+        if Self::is_numeric_literal(normalized) {
+            return Some(normalized.to_string());
+        }
+        None
+    }
+
+    fn mysql_bit_literal_to_decimal(value: &str) -> Option<String> {
+        let value = value.trim();
+        if value.len() < 4 || !value[..2].eq_ignore_ascii_case("b'") || !value.ends_with('\'') {
+            return None;
+        }
+        let bits = &value[2..value.len() - 1];
+        if bits.is_empty() || !bits.bytes().all(|b| matches!(b, b'0' | b'1')) {
+            return None;
+        }
+        u128::from_str_radix(bits, 2).ok().map(|v| v.to_string())
+    }
+
+    fn is_numeric_literal(value: &str) -> bool {
+        let value = value.trim();
+        if value.is_empty() {
+            return false;
+        }
+        let mut has_digit = false;
+        for (idx, byte) in value.bytes().enumerate() {
+            if byte.is_ascii_digit() {
+                has_digit = true;
+                continue;
+            }
+            match byte {
+                b'+' | b'-' if idx == 0 => {}
+                b'+' | b'-'
+                    if matches!(value.as_bytes().get(idx.wrapping_sub(1)), Some(b'e' | b'E')) => {}
+                b'.' | b'e' | b'E' => {}
+                _ => return false,
+            }
+        }
+        has_digit && value.parse::<f64>().is_ok()
+    }
+
+    fn mysql_string_literal_content(default_value: &str) -> Option<String> {
+        let value = default_value.trim();
+        let bytes = value.as_bytes();
+        let quote_pos = if matches!(bytes.first(), Some(b'\'' | b'"')) {
+            0
+        } else if bytes.len() >= 2
+            && matches!(bytes[0], b'n' | b'N')
+            && matches!(bytes[1], b'\'' | b'"')
+        {
+            1
+        } else if bytes.first() == Some(&b'_') {
+            value.find(|c| matches!(c, '\'' | '"')).filter(|idx| {
+                value[..*idx]
+                    .bytes()
+                    .all(|b| b == b'_' || b.is_ascii_alphanumeric())
+            })?
+        } else {
+            return None;
+        };
+
+        let quote = bytes[quote_pos];
+        let mut result = Vec::new();
+        let mut pos = quote_pos + 1;
+        while pos < bytes.len() {
+            let byte = bytes[pos];
+            if byte == b'\\' {
+                let Some(next) = bytes.get(pos + 1) else {
+                    return None;
+                };
+                result.push(*next);
+                pos += 2;
+                continue;
+            }
+            if byte == quote {
+                if bytes.get(pos + 1) == Some(&quote) {
+                    result.push(quote);
+                    pos += 2;
+                    continue;
+                }
+                if value[pos + 1..].trim().is_empty() {
+                    return Some(String::from_utf8_lossy(result.as_slice()).into_owned());
+                }
+                return None;
+            }
+            result.push(byte);
+            pos += 1;
+        }
+        None
+    }
+
     fn dameng_default_is_current_timestamp(default_value: Option<&str>) -> bool {
         let Some(default_value) = default_value else {
             return false;
@@ -1010,6 +1432,61 @@ impl DamengSink {
             .trim_matches(|c| c == '(' || c == ')')
             .to_ascii_uppercase();
         normalized == "CURRENT_TIMESTAMP" || normalized.starts_with("CURRENT_TIMESTAMP(")
+    }
+
+    fn dameng_default_matches_mysql(
+        mysql_type_token: &str,
+        mysql_column_definition: &str,
+        default_value: Option<&str>,
+    ) -> bool {
+        let Some(expected_default) =
+            Self::mysql_column_default_value_sql(mysql_type_token, mysql_column_definition)
+        else {
+            return true;
+        };
+        let Some(default_value) = default_value else {
+            return false;
+        };
+        Self::normalize_default_for_compare(expected_default.as_str())
+            == Self::normalize_default_for_compare(default_value)
+    }
+
+    fn mysql_column_default_value_sql(
+        mysql_type_token: &str,
+        mysql_column_definition: &str,
+    ) -> Option<String> {
+        Self::mysql_column_default_sql(mysql_type_token, mysql_column_definition).and_then(|sql| {
+            sql.trim_start()
+                .strip_prefix("DEFAULT")
+                .map(|value| value.trim_start().to_string())
+        })
+    }
+
+    fn normalize_default_for_compare(default_value: &str) -> String {
+        let value = default_value.trim();
+        let value = if Self::starts_with_keyword(value, 0, "default") {
+            value["default".len()..].trim_start()
+        } else {
+            value
+        };
+        if Self::mysql_default_is_current_timestamp(value) {
+            return "CURRENT_TIMESTAMP".to_string();
+        }
+        let value = if value.starts_with('(') && value.ends_with(')') && value.len() > 2 {
+            value[1..value.len() - 1].trim()
+        } else {
+            value
+        };
+        if Self::mysql_default_is_current_timestamp(value) {
+            return "CURRENT_TIMESTAMP".to_string();
+        }
+        if let Some(string_value) = Self::mysql_string_literal_content(value) {
+            return Self::quote_literal(string_value.as_str());
+        }
+        if Self::is_numeric_literal(value) {
+            return value.to_string();
+        }
+        value.to_ascii_uppercase()
     }
 
     fn starts_with_keyword(value: &str, pos: usize, keyword: &str) -> bool {
@@ -1365,6 +1842,14 @@ impl DamengSink {
         mysql_column_definition: &str,
         existing_col: &DamengColumnInfo,
     ) -> bool {
+        if !Self::dameng_default_matches_mysql(
+            mysql_type_token,
+            mysql_column_definition,
+            existing_col.default_value.as_deref(),
+        ) {
+            return true;
+        }
+
         if Self::mysql_current_timestamp_default_sql(mysql_type_token, mysql_column_definition)
             .is_some()
             && !Self::dameng_default_is_current_timestamp(existing_col.default_value.as_deref())
@@ -2041,6 +2526,76 @@ mod tests {
     }
 
     #[test]
+    fn create_table_sql_preserves_supported_literal_defaults() {
+        let table_info = TableInfoVo {
+            source_database: "source_db".to_string(),
+            target_database: "target_schema".to_string(),
+            table_name: "biz_building_info".to_string(),
+            pk_column: "id".to_string(),
+            create_table_sql: r#"CREATE TABLE `biz_building_info` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `migrate_flag` tinyint NOT NULL DEFAULT '0' COMMENT '是否迁移业务表标志 0未迁移 1已迁移',
+  `building_name` varchar(50) DEFAULT '未命名',
+  `remark` varchar(50) DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#
+                .to_string(),
+            columns: vec![
+                "id".to_string(),
+                "migrate_flag".to_string(),
+                "building_name".to_string(),
+                "remark".to_string(),
+            ],
+        };
+
+        let sql = DamengSink::create_table_sql("target_schema", &table_info).unwrap();
+
+        assert!(sql.contains("\"migrate_flag\" TINYINT NOT NULL DEFAULT 0"));
+        assert!(sql.contains("\"building_name\" VARCHAR(50 CHAR) NULL DEFAULT '未命名'"));
+        assert!(sql.contains("\"remark\" VARCHAR(50 CHAR) NULL"));
+        assert!(!sql.contains("DEFAULT NULL"));
+    }
+
+    #[test]
+    fn column_comments_are_converted_to_dameng_comment_sql() {
+        let table_info = TableInfoVo {
+            source_database: "source_db".to_string(),
+            target_database: "newsee-owner".to_string(),
+            table_name: "biz_building_info".to_string(),
+            pk_column: "id".to_string(),
+            create_table_sql: r#"CREATE TABLE `biz_building_info` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `migrate_flag` tinyint NOT NULL DEFAULT '0' COMMENT '是否迁移业务表标志 0未迁移 1已迁移',
+  `name` varchar(50) DEFAULT NULL COMMENT '业主''名称',
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#
+                .to_string(),
+            columns: vec![
+                "id".to_string(),
+                "migrate_flag".to_string(),
+                "name".to_string(),
+            ],
+        };
+
+        let comments = DamengSink::mysql_column_comments(&table_info);
+
+        assert_eq!(
+            comments.get("migrate_flag").map(String::as_str),
+            Some("是否迁移业务表标志 0未迁移 1已迁移")
+        );
+        assert_eq!(comments.get("name").map(String::as_str), Some("业主'名称"));
+        assert_eq!(
+            DamengSink::comment_on_column_sql(
+                "newsee-owner",
+                "biz_building_info",
+                "migrate_flag",
+                comments.get("migrate_flag").unwrap()
+            ),
+            "COMMENT ON COLUMN \"newsee-owner\".\"biz_building_info\".\"migrate_flag\" IS '是否迁移业务表标志 0未迁移 1已迁移'"
+        );
+    }
+
+    #[test]
     fn disallowed_dameng_column_names_are_remapped() {
         assert_eq!(DamengSink::target_column_name("id"), "id");
         assert_eq!(DamengSink::target_column_name("rOWID"), "rOWID_");
@@ -2126,6 +2681,19 @@ mod tests {
         let sys_time = cols.get("sys_time").unwrap();
         assert_eq!(sys_time.data_type, "TIMESTAMP");
         assert_eq!(sys_time.default_value.as_deref(), Some("CURRENT_TIMESTAMP"));
+    }
+
+    #[test]
+    fn parses_dameng_column_comments_metadata() {
+        let comments = DamengSink::parse_column_comments_metadata(
+            "migrate_flag\x1f是否迁移业务表标志 0未迁移 1已迁移\x1ename\x1f业主名称",
+        );
+
+        assert_eq!(
+            comments.get("migrate_flag").map(String::as_str),
+            Some("是否迁移业务表标志 0未迁移 1已迁移")
+        );
+        assert_eq!(comments.get("name").map(String::as_str), Some("业主名称"));
     }
 
     #[test]
@@ -2435,6 +3003,34 @@ mod tests {
         ));
         assert!(!DamengSink::should_modify_existing_column(
             "timestamp",
+            def,
+            &matching_default
+        ));
+    }
+
+    #[test]
+    fn literal_default_mismatch_requires_column_modify() {
+        let missing_default = super::DamengColumnInfo {
+            data_type: "TINYINT".to_string(),
+            data_length: 1,
+            char_length: 0,
+            default_value: None,
+        };
+        let matching_default = super::DamengColumnInfo {
+            data_type: "TINYINT".to_string(),
+            data_length: 1,
+            char_length: 0,
+            default_value: Some("0".to_string()),
+        };
+        let def = "`migrate_flag` tinyint NOT NULL DEFAULT '0' COMMENT '是否迁移业务表标志 0未迁移 1已迁移'";
+
+        assert!(DamengSink::should_modify_existing_column(
+            "tinyint",
+            def,
+            &missing_default
+        ));
+        assert!(!DamengSink::should_modify_existing_column(
+            "tinyint",
             def,
             &matching_default
         ));
