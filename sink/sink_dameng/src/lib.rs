@@ -1049,6 +1049,7 @@ impl DamengSink {
             sql.push_str(" ON UPDATE ");
             sql.push_str(update_rule);
         }
+        sql.push_str(" WITH INDEX");
         Some(sql)
     }
 
@@ -1111,22 +1112,22 @@ impl DamengSink {
                     continue;
                 }
                 let Some(sql) = Self::foreign_key_sql(schema.as_str(), foreign_key) else {
-                    return Err(format!(
-                        "invalid foreign key metadata: {}.{}",
+                    warn!(
+                        "Dameng skip invalid foreign key metadata: {}.{}",
                         table_info.table_name, foreign_key.constraint_name
-                    ));
+                    );
+                    continue;
                 };
-                self.execute(sql.as_str()).await.map_err(|e| {
-                    format!(
-                        "Dameng auto add foreign key failed: {} {}",
-                        Self::target_table_key(schema.as_str(), foreign_key.table_name.as_str()),
-                        e
-                    )
-                })?;
-                info!(
-                    "Dameng auto add foreign key success: {}.{}",
-                    schema, foreign_key.constraint_name
-                );
+                match self.execute(sql.as_str()).await {
+                    Ok(_) => info!(
+                        "Dameng auto add foreign key success: {}.{}",
+                        schema, foreign_key.constraint_name
+                    ),
+                    Err(e) => warn!(
+                        "Dameng skip foreign key after add failed: {}.{} {}",
+                        schema, foreign_key.constraint_name, e
+                    ),
+                }
             }
         }
         Ok(())
@@ -2605,8 +2606,23 @@ mod tests {
 
         assert_eq!(
             DamengSink::foreign_key_sql("target_schema", &foreign_key).unwrap(),
-            "ALTER TABLE \"target_schema\".\"child\" ADD CONSTRAINT \"fk_child_parent\" FOREIGN KEY (\"parent_id\") REFERENCES \"target_schema\".\"parent\" (\"rOWID_\") ON DELETE CASCADE ON UPDATE NO ACTION"
+            "ALTER TABLE \"target_schema\".\"child\" ADD CONSTRAINT \"fk_child_parent\" FOREIGN KEY (\"parent_id\") REFERENCES \"target_schema\".\"parent\" (\"rOWID_\") ON DELETE CASCADE ON UPDATE NO ACTION WITH INDEX"
         );
+    }
+
+    #[test]
+    fn foreign_key_sql_rejects_mismatched_columns() {
+        let foreign_key = ForeignKeyInfo {
+            constraint_name: "fk_bad".to_string(),
+            table_name: "child".to_string(),
+            columns: vec!["parent_id".to_string()],
+            referenced_table_name: "parent".to_string(),
+            referenced_columns: vec![],
+            update_rule: None,
+            delete_rule: None,
+        };
+
+        assert!(DamengSink::foreign_key_sql("target_schema", &foreign_key).is_none());
     }
 
     #[test]

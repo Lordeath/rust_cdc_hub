@@ -156,7 +156,7 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 
 The primary-key column is detected from the MySQL table schema automatically. Tables that participate in data synchronization need exactly one integer primary key (`tinyint`, `smallint`, `mediumint`, `int`, `bigint`, and their unsigned variants). The `pk_column` config key is deprecated; configuration loading fails if it appears. `meili_table_pk` is still required for the MeiliSearch sink because it defines the target index primary key.
 
-Foreign-key tables are included by default. MySQL/Dameng targets create base tables first, load initial data, and then add foreign-key constraints. When only part of a schema is explicitly selected, constraints whose parent or child table is not selected are skipped with a warning; the table list is not expanded automatically.
+Foreign-key tables are included by default. MySQL/Dameng targets create base tables first, load initial data, and then add foreign-key constraints. When only part of a schema is explicitly selected, constraints whose parent or child table is not selected are skipped with a warning; the table list is not expanded automatically. Dameng foreign-key creation is best-effort: if one constraint cannot be created because of index, data, or compatibility limitations, it is logged and sync continues.
 
 ### Multi-database sync mode (MySQL → MySQL/Dameng)
 
