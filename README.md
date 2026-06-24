@@ -129,7 +129,7 @@ export CONFIG_PATH=/path/to/config.yaml
 | `auto_create_table` | 否 | 是否自动建表，默认 `true`。 |
 | `auto_add_column` | 否 | 是否自动加字段。 |
 | `auto_modify_column` | 否 | 是否自动修改字段。 |
-| `sync_foreign_key_tables` | 否 | 是否在 `table_name: "*"` 自动发现时纳入外键相关表，并在 MySQL/Dameng 目标端初始化后补外键约束，默认 `true`。设为 `false` 时保留旧行为：排除有外键依赖或被外键引用的表。 |
+| `sync_foreign_key_tables` | 否 | 是否在 `table_name: "*"` 自动发现时纳入外键相关表，并在 MySQL/Dameng 目标端初始化后补外键约束，默认 `true`。MySQL 目标端初始化写入期间会临时关闭当前 session 的外键检查，避免目标库已有外键时子表先写入失败。设为 `false` 时保留旧行为：排除有外键依赖或被外键引用的表。 |
 | `sync_no_pk_table_schema` | 否 | 全表发现时是否额外同步无主键表结构，默认 `false`；这些表只建结构，不做初始化数据和 CDC 同步；StarRocks 目标端会跳过并告警。 |
 | `sync_stored_procedure` | 否 | MySQL → MySQL 时是否同步源库存储过程，默认 `false`；也兼容 `sync_stored_procedures`。 |
 | `overwrite_stored_procedure` | 否 | 同步存储过程时，目标库已存在同名过程是否先删除再重建，默认 `false`；也兼容 `overwrite_stored_procedures`。 |

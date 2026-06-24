@@ -39,6 +39,7 @@ pub struct MySqlSink {
     table_info_list: Vec<TableInfoVo>,
     buffer: Mutex<Vec<DataBuffer>>,
     initialized: RwLock<bool>,
+    source_initializing: RwLock<bool>,
     sink_batch_size: usize,
     sync_foreign_key_tables: bool,
 
@@ -268,6 +269,7 @@ impl MySqlSink {
             table_info_list,
             buffer: Mutex::new(Vec::with_capacity(sink_batch_size)),
             initialized: RwLock::new(false),
+            source_initializing: RwLock::new(true),
             sink_batch_size,
             sync_foreign_key_tables: config.sync_foreign_key_tables_enabled(),
             table_info_cache: Mutex::new(CaseInsensitiveHashMapTableInfoVo::new_with_no_arg()),
@@ -984,6 +986,7 @@ impl MySqlSink {
         table_name: &str,
         columns: &[String],
         inserts: &[common::case_insensitive_hash_map::CaseInsensitiveHashMap],
+        disable_foreign_key_checks: bool,
     ) -> Result<MySqlQueryResult, String> {
         let cols_str = columns
             .iter()
@@ -1016,7 +1019,7 @@ impl MySqlSink {
         );
 
         let query = Self::bind_upsert_query(sql.as_str(), columns, inserts);
-        match query.execute(pool).await {
+        match Self::execute_query(pool, query, disable_foreign_key_checks).await {
             Ok(ok) => Ok(ok),
             Err(err) => {
                 error!("Failed to execute query: {} 进行重试, sql: {}", err, sql);
@@ -1031,11 +1034,52 @@ impl MySqlSink {
                         .await
                         .map_err(|e| e.to_string())?;
                 let retry_query = Self::bind_upsert_query(sql.as_str(), columns, inserts);
-                retry_query
-                    .execute(&new_pool)
+                Self::execute_query(&new_pool, retry_query, disable_foreign_key_checks)
                     .await
                     .map_err(|e| e.to_string())
             }
+        }
+    }
+
+    async fn execute_query(
+        pool: &Pool<MySql>,
+        query: Query<'_, MySql, MySqlArguments>,
+        disable_foreign_key_checks: bool,
+    ) -> Result<MySqlQueryResult, sqlx::Error> {
+        if !disable_foreign_key_checks {
+            return query.execute(pool).await;
+        }
+
+        let mut conn = pool.acquire().await?;
+        sqlx::query(Self::foreign_key_checks_sql(false))
+            .persistent(false)
+            .execute(&mut *conn)
+            .await?;
+        let query_result = query.execute(&mut *conn).await;
+        let restore_result = sqlx::query(Self::foreign_key_checks_sql(true))
+            .persistent(false)
+            .execute(&mut *conn)
+            .await;
+
+        match (query_result, restore_result) {
+            (Ok(ok), Ok(_)) => Ok(ok),
+            (Err(e), Ok(_)) => Err(e),
+            (Ok(_), Err(e)) => Err(e),
+            (Err(e), Err(restore_error)) => {
+                error!(
+                    "Failed to restore MySQL FOREIGN_KEY_CHECKS after query error: {}",
+                    restore_error
+                );
+                Err(e)
+            }
+        }
+    }
+
+    fn foreign_key_checks_sql(enabled: bool) -> &'static str {
+        if enabled {
+            "SET FOREIGN_KEY_CHECKS=1"
+        } else {
+            "SET FOREIGN_KEY_CHECKS=0"
         }
     }
 
@@ -1221,6 +1265,7 @@ impl MySqlSink {
         table_name: &str,
         pk_name: &str,
         deletes: &[String],
+        disable_foreign_key_checks: bool,
     ) -> Result<MySqlQueryResult, String> {
         let ph = (0..deletes.len())
             .map(|_| "?")
@@ -1235,7 +1280,7 @@ impl MySqlSink {
         );
 
         let query = Self::bind_delete_query(sql.as_str(), deletes);
-        match query.execute(pool).await {
+        match Self::execute_query(pool, query, disable_foreign_key_checks).await {
             Ok(ok) => Ok(ok),
             Err(err) => {
                 error!("Failed to execute query: {} 进行重试, sql: {}", err, sql);
@@ -1244,8 +1289,7 @@ impl MySqlSink {
                         .await
                         .map_err(|e| e.to_string())?;
                 let retry_query = Self::bind_delete_query(sql.as_str(), deletes);
-                retry_query
-                    .execute(&new_pool)
+                Self::execute_query(&new_pool, retry_query, disable_foreign_key_checks)
                     .await
                     .map_err(|e| e.to_string())
             }
@@ -1270,6 +1314,7 @@ impl MySqlSink {
         batch: Vec<DataBuffer>,
         columns_by_table: HashMap<String, Vec<String>>,
         pk_by_table: HashMap<String, String>,
+        disable_foreign_key_checks: bool,
     ) -> Result<(), String> {
         let mut insert_map: HashMap<
             String,
@@ -1328,6 +1373,7 @@ impl MySqlSink {
                 table_name.as_str(),
                 &columns,
                 &inserts,
+                disable_foreign_key_checks,
             )
             .await
             {
@@ -1356,6 +1402,7 @@ impl MySqlSink {
                 table_name.as_str(),
                 pk_name.as_str(),
                 &deletes,
+                disable_foreign_key_checks,
             )
             .await
             {
@@ -1375,6 +1422,7 @@ impl MySqlSink {
         batch: &[DataBuffer],
         columns_by_table: &HashMap<String, Vec<String>>,
         pk_by_table: &HashMap<String, String>,
+        disable_foreign_key_checks: bool,
     ) -> Result<(), String> {
         for record in batch {
             let database = self.record_target_database(record);
@@ -1410,6 +1458,7 @@ impl MySqlSink {
                         table_name.as_str(),
                         &columns,
                         std::slice::from_ref(&record.after),
+                        disable_foreign_key_checks,
                     )
                     .await
                     .map(|_| ())?;
@@ -1427,6 +1476,7 @@ impl MySqlSink {
                         table_name.as_str(),
                         pk_name.as_str(),
                         &deletes,
+                        disable_foreign_key_checks,
                     )
                     .await
                     .map(|_| ())?;
@@ -1581,6 +1631,7 @@ impl Sink for MySqlSink {
         for table_key in columns_cache.keys() {
             columns_by_table.insert(table_key.to_ascii_lowercase(), columns_cache.get(table_key));
         }
+        let disable_foreign_key_checks = *self.source_initializing.read().await;
 
         if self.has_foreign_key_metadata() {
             for record in &batch {
@@ -1598,7 +1649,12 @@ impl Sink for MySqlSink {
                     .inc();
             }
             if let Err(e) = self
-                .flush_records_in_order(&batch, &columns_by_table, &pk_by_table)
+                .flush_records_in_order(
+                    &batch,
+                    &columns_by_table,
+                    &pk_by_table,
+                    disable_foreign_key_checks,
+                )
                 .await
             {
                 error!("need to do it again: {}", cache_for_roll_back.len());
@@ -1651,6 +1707,7 @@ impl Sink for MySqlSink {
                     db_batch,
                     columns_by_table,
                     pk_by_table,
+                    disable_foreign_key_checks,
                 )
                 .await
             });
@@ -1708,6 +1765,7 @@ impl Sink for MySqlSink {
 
     async fn after_initialization(&mut self) -> Result<(), String> {
         self.flush_with_retry(&FlushByOperation::Init).await;
+        *self.source_initializing.write().await = false;
         self.ensure_foreign_keys().await
     }
 }
@@ -1772,6 +1830,18 @@ mod tests {
         assert_eq!(
             MySqlSink::foreign_key_sql("target-db", &foreign_key).unwrap(),
             "ALTER TABLE `target-db`.`child` ADD CONSTRAINT `fk_child_parent` FOREIGN KEY (`parent_id`) REFERENCES `target-db`.`parent` (`id`) ON DELETE RESTRICT ON UPDATE CASCADE"
+        );
+    }
+
+    #[test]
+    fn foreign_key_checks_sql_toggles_mysql_session_setting() {
+        assert_eq!(
+            MySqlSink::foreign_key_checks_sql(false),
+            "SET FOREIGN_KEY_CHECKS=0"
+        );
+        assert_eq!(
+            MySqlSink::foreign_key_checks_sql(true),
+            "SET FOREIGN_KEY_CHECKS=1"
         );
     }
 

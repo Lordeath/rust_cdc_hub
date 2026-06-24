@@ -129,7 +129,7 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 | `auto_create_table` | No | Create target tables automatically. Defaults to `true`. |
 | `auto_add_column` | No | Add missing target columns automatically. |
 | `auto_modify_column` | No | Modify target columns automatically. |
-| `sync_foreign_key_tables` | No | Include foreign-key-related tables during `table_name: "*"` discovery and add foreign-key constraints after MySQL/Dameng target initialization. Defaults to `true`. Set to `false` to keep the legacy behavior that excludes tables with foreign-key dependencies or references. |
+| `sync_foreign_key_tables` | No | Include foreign-key-related tables during `table_name: "*"` discovery and add foreign-key constraints after MySQL/Dameng target initialization. Defaults to `true`. For MySQL targets, initial data writes temporarily disable foreign-key checks on the current session so existing target constraints do not block child rows loaded before parent rows. Set to `false` to keep the legacy behavior that excludes tables with foreign-key dependencies or references. |
 | `sync_no_pk_table_schema` | No | Whether automatic discovery also syncs no-primary-key table schemas. Defaults to `false`; those tables are schema-only, with no initial data load or CDC writes. StarRocks skips them with a warning. |
 | `sync_stored_procedure` | No | Sync source stored procedures for MySQL → MySQL. Defaults to `false`; `sync_stored_procedures` is also accepted. |
 | `overwrite_stored_procedure` | No | When syncing stored procedures, drop and recreate an existing target procedure with the same name. Defaults to `false`; `overwrite_stored_procedures` is also accepted. |
