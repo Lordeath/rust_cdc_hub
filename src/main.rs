@@ -2285,6 +2285,7 @@ plugins:
                 pk_column: "id".to_string(),
                 create_table_sql: "".to_string(),
                 columns: vec!["id".to_string(), "project_id".to_string()],
+                foreign_keys: vec![],
             },
             TableInfoVo {
                 source_database: "source_shard_01".to_string(),
@@ -2297,6 +2298,7 @@ plugins:
                     "project_id".to_string(),
                     "tenant_id".to_string(),
                 ],
+                foreign_keys: vec![],
             },
         ]
     }

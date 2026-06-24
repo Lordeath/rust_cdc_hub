@@ -129,6 +129,7 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 | `auto_create_table` | No | Create target tables automatically. Defaults to `true`. |
 | `auto_add_column` | No | Add missing target columns automatically. |
 | `auto_modify_column` | No | Modify target columns automatically. |
+| `sync_foreign_key_tables` | No | Include foreign-key-related tables during `table_name: "*"` discovery and add foreign-key constraints after MySQL/Dameng target initialization. Defaults to `true`. Set to `false` to keep the legacy behavior that excludes tables with foreign-key dependencies or references. |
 | `sync_no_pk_table_schema` | No | Whether automatic discovery also syncs no-primary-key table schemas. Defaults to `false`; those tables are schema-only, with no initial data load or CDC writes. StarRocks skips them with a warning. |
 | `sync_stored_procedure` | No | Sync source stored procedures for MySQL → MySQL. Defaults to `false`; `sync_stored_procedures` is also accepted. |
 | `overwrite_stored_procedure` | No | When syncing stored procedures, drop and recreate an existing target procedure with the same name. Defaults to `false`; `overwrite_stored_procedures` is also accepted. |
@@ -148,12 +149,14 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 | `host` / `port` | MySQL host and port. |
 | `username` / `password` | MySQL credentials. |
 | `database` | Source database name. |
-| `table_name` | Table name; use a single table, comma-separated names, or `"*"` for automatic discovery. By default, `"*"` selects tables with one integer primary key and no foreign-key dependency. When top-level `sync_no_pk_table_schema: true` is enabled, no-primary-key `BASE TABLE`s are also included as schema-only tables. |
+| `table_name` | Table name; use a single table, comma-separated names, or `"*"` for automatic discovery. By default, `"*"` selects `BASE TABLE`s with one integer primary key, including foreign-key-related tables. When top-level `sync_no_pk_table_schema: true` is enabled, no-primary-key `BASE TABLE`s are also included as schema-only tables. |
 | `except_table_name_prefix` | Exclude tables by prefix; use comma-separated prefixes. |
 | `server_id` | Binlog replication server id. It must be unique in the MySQL topology. |
 | `statement_cache_capacity` | MySQL prepared statement cache capacity, passed through as SQLx `statement-cache-capacity`; set it to `"0"` to disable caching. If MySQL reports `Can't create more than max_prepared_stmt_count statements`, disconnect old clients or temporarily raise `max_prepared_stmt_count`, then restart the sync process. |
 
 The primary-key column is detected from the MySQL table schema automatically. Tables that participate in data synchronization need exactly one integer primary key (`tinyint`, `smallint`, `mediumint`, `int`, `bigint`, and their unsigned variants). The `pk_column` config key is deprecated; configuration loading fails if it appears. `meili_table_pk` is still required for the MeiliSearch sink because it defines the target index primary key.
+
+Foreign-key tables are included by default. MySQL/Dameng targets create base tables first, load initial data, and then add foreign-key constraints. When only part of a schema is explicitly selected, constraints whose parent or child table is not selected are skipped with a warning; the table list is not expanded automatically.
 
 ### Multi-database sync mode (MySQL → MySQL/Dameng)
 

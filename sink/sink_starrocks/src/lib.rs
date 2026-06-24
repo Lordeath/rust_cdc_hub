@@ -668,6 +668,7 @@ mod tests {
             pk_column: "".to_string(),
             create_table_sql: "CREATE TABLE `no_pk_table` (`name` varchar(64))".to_string(),
             columns: vec!["name".to_string()],
+            foreign_keys: vec![],
         };
 
         assert!(StarrocksSink::is_schema_only_table(&table_info));

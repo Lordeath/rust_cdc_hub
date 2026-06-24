@@ -9,7 +9,7 @@ use common::schema::{
     mysql_column_is_auto_increment_from_definition, mysql_type_token_from_column_definition,
 };
 use common::{
-    CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value,
+    CdcConfig, DataBuffer, FlushByOperation, ForeignKeyInfo, Operation, Sink, TableInfoVo, Value,
     database_table_key,
 };
 use dameng::Client;
@@ -78,6 +78,7 @@ pub struct DamengSink {
     auto_create_table: bool,
     auto_add_column: bool,
     auto_modify_column: bool,
+    sync_foreign_key_tables: bool,
     table_info_cache: Mutex<CaseInsensitiveHashMapTableInfoVo>,
     columns_cache: Mutex<CaseInsensitiveHashMapVecString>,
     checkpoint: Mutex<HashMap<String, MysqlCheckPointDetailEntity>>,
@@ -130,6 +131,7 @@ impl DamengSink {
             auto_create_table: config.auto_create_table.unwrap_or(true),
             auto_add_column: config.auto_add_column.unwrap_or(true),
             auto_modify_column: config.auto_modify_column.unwrap_or(true),
+            sync_foreign_key_tables: config.sync_foreign_key_tables_enabled(),
             table_info_cache: Mutex::new(CaseInsensitiveHashMapTableInfoVo::new_with_no_arg()),
             columns_cache: Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg()),
             checkpoint: Mutex::new(HashMap::new()),
@@ -1011,6 +1013,123 @@ impl DamengSink {
                 Self::quote_ident(table_name)
             )
         }
+    }
+
+    fn foreign_key_sql(schema: &str, foreign_key: &ForeignKeyInfo) -> Option<String> {
+        if foreign_key.columns.is_empty()
+            || foreign_key.columns.len() != foreign_key.referenced_columns.len()
+        {
+            return None;
+        }
+        let columns = foreign_key
+            .columns
+            .iter()
+            .map(|column| Self::quote_column_ident(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let referenced_columns = foreign_key
+            .referenced_columns
+            .iter()
+            .map(|column| Self::quote_column_ident(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut sql = format!(
+            "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
+            Self::qualified_table(schema, foreign_key.table_name.as_str()),
+            Self::quote_ident(foreign_key.constraint_name.as_str()),
+            columns,
+            Self::qualified_table(schema, foreign_key.referenced_table_name.as_str()),
+            referenced_columns
+        );
+        if let Some(delete_rule) = Self::dameng_fk_action(foreign_key.delete_rule.as_deref()) {
+            sql.push_str(" ON DELETE ");
+            sql.push_str(delete_rule);
+        }
+        if let Some(update_rule) = Self::dameng_fk_action(foreign_key.update_rule.as_deref()) {
+            sql.push_str(" ON UPDATE ");
+            sql.push_str(update_rule);
+        }
+        Some(sql)
+    }
+
+    fn dameng_fk_action(rule: Option<&str>) -> Option<&'static str> {
+        match rule.unwrap_or("").trim().to_ascii_uppercase().as_str() {
+            "CASCADE" => Some("CASCADE"),
+            "SET NULL" => Some("SET NULL"),
+            "SET DEFAULT" => Some("SET DEFAULT"),
+            "NO ACTION" | "RESTRICT" => Some("NO ACTION"),
+            _ => None,
+        }
+    }
+
+    async fn foreign_key_exists(
+        &self,
+        schema: &str,
+        table_name: &str,
+        constraint_name: &str,
+    ) -> Result<bool, String> {
+        let sql = if schema.is_empty() {
+            format!(
+                "SELECT COUNT(*) FROM USER_CONSTRAINTS WHERE {} AND {} AND CONSTRAINT_TYPE = 'R'",
+                Self::eq_original_or_upper_sql("TABLE_NAME", table_name),
+                Self::eq_original_or_upper_sql("CONSTRAINT_NAME", constraint_name)
+            )
+        } else {
+            format!(
+                "SELECT COUNT(*) FROM ALL_CONSTRAINTS WHERE {} AND {} AND {} AND CONSTRAINT_TYPE = 'R'",
+                Self::eq_original_or_upper_sql("OWNER", schema),
+                Self::eq_original_or_upper_sql("TABLE_NAME", table_name),
+                Self::eq_original_or_upper_sql("CONSTRAINT_NAME", constraint_name)
+            )
+        };
+        let rows = self.query(sql.as_str(), &[]).await?;
+        let count = rows
+            .first()
+            .and_then(|row| row.get::<i32>(0).ok())
+            .unwrap_or(0);
+        Ok(count > 0)
+    }
+
+    async fn ensure_foreign_keys(&self) -> Result<(), String> {
+        if !self.sync_foreign_key_tables {
+            return Ok(());
+        }
+        for table_info in &self.table_info_list {
+            if table_info.foreign_keys.is_empty() {
+                continue;
+            }
+            let schema = Self::table_info_target_schema(table_info, self.schema.as_str());
+            for foreign_key in &table_info.foreign_keys {
+                if self
+                    .foreign_key_exists(
+                        schema.as_str(),
+                        table_info.table_name.as_str(),
+                        foreign_key.constraint_name.as_str(),
+                    )
+                    .await?
+                {
+                    continue;
+                }
+                let Some(sql) = Self::foreign_key_sql(schema.as_str(), foreign_key) else {
+                    return Err(format!(
+                        "invalid foreign key metadata: {}.{}",
+                        table_info.table_name, foreign_key.constraint_name
+                    ));
+                };
+                self.execute(sql.as_str()).await.map_err(|e| {
+                    format!(
+                        "Dameng auto add foreign key failed: {} {}",
+                        Self::target_table_key(schema.as_str(), foreign_key.table_name.as_str()),
+                        e
+                    )
+                })?;
+                info!(
+                    "Dameng auto add foreign key success: {}.{}",
+                    schema, foreign_key.constraint_name
+                );
+            }
+        }
+        Ok(())
     }
 
     fn qualified_column(schema: &str, table_name: &str, column_name: &str) -> String {
@@ -2074,6 +2193,11 @@ impl Sink for DamengSink {
         trace!("Dameng alter flush done");
         Ok(())
     }
+
+    async fn after_initialization(&mut self) -> Result<(), String> {
+        self.flush_with_retry(&FlushByOperation::Init).await;
+        self.ensure_foreign_keys().await
+    }
 }
 
 impl DamengSink {
@@ -2413,7 +2537,7 @@ impl DamengSink {
 
 #[cfg(test)]
 mod tests {
-    use common::{TableInfoVo, Value};
+    use common::{ForeignKeyInfo, TableInfoVo, Value};
     use dameng::ToDmValue;
     use dameng_types::DmValue;
 
@@ -2430,6 +2554,7 @@ mod tests {
                 column_type
             ),
             columns: vec!["id".to_string(), "name".to_string()],
+            foreign_keys: vec![],
         }
     }
 
@@ -2467,6 +2592,24 @@ mod tests {
     }
 
     #[test]
+    fn foreign_key_sql_maps_restrict_to_no_action() {
+        let foreign_key = ForeignKeyInfo {
+            constraint_name: "fk_child_parent".to_string(),
+            table_name: "child".to_string(),
+            columns: vec!["parent_id".to_string()],
+            referenced_table_name: "parent".to_string(),
+            referenced_columns: vec!["rOWID".to_string()],
+            update_rule: Some("RESTRICT".to_string()),
+            delete_rule: Some("CASCADE".to_string()),
+        };
+
+        assert_eq!(
+            DamengSink::foreign_key_sql("target_schema", &foreign_key).unwrap(),
+            "ALTER TABLE \"target_schema\".\"child\" ADD CONSTRAINT \"fk_child_parent\" FOREIGN KEY (\"parent_id\") REFERENCES \"target_schema\".\"parent\" (\"rOWID_\") ON DELETE CASCADE ON UPDATE NO ACTION"
+        );
+    }
+
+    #[test]
     fn create_table_sql_omits_primary_key_for_schema_only_table() {
         let table_info = TableInfoVo {
             source_database: "source_db".to_string(),
@@ -2484,6 +2627,7 @@ mod tests {
                 "organization_parent_id".to_string(),
                 "organization_path".to_string(),
             ],
+            foreign_keys: vec![],
         };
 
         let sql = DamengSink::create_table_sql("target_schema", &table_info).unwrap();
@@ -2516,6 +2660,7 @@ mod tests {
                 "update_time".to_string(),
                 "name".to_string(),
             ],
+            foreign_keys: vec![],
         };
 
         let sql = DamengSink::create_table_sql("target_schema", &table_info).unwrap();
@@ -2546,6 +2691,7 @@ mod tests {
                 "building_name".to_string(),
                 "remark".to_string(),
             ],
+            foreign_keys: vec![],
         };
 
         let sql = DamengSink::create_table_sql("target_schema", &table_info).unwrap();
@@ -2575,6 +2721,7 @@ mod tests {
                 "migrate_flag".to_string(),
                 "name".to_string(),
             ],
+            foreign_keys: vec![],
         };
 
         let comments = DamengSink::mysql_column_comments(&table_info);
@@ -2635,6 +2782,7 @@ mod tests {
             pk_column: "id".to_string(),
             create_table_sql: "CREATE TABLE `line_item` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `rOWID` varchar(50) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB".to_string(),
             columns: vec!["id".to_string(), "rOWID".to_string()],
+            foreign_keys: vec![],
         };
 
         let signature = DamengSink::table_schema_signature(&table_info);
@@ -3059,6 +3207,7 @@ mod tests {
                 "opration".to_string(),
                 "operatorLogo".to_string(),
             ],
+            foreign_keys: vec![],
         };
 
         assert_eq!(
@@ -3097,6 +3246,7 @@ mod tests {
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3"#
                 .to_string(),
             columns: vec!["id".to_string(), "operatorLogo".to_string()],
+            foreign_keys: vec![],
         };
 
         let value = Value::Blob(vec![0x1f, 0x8b, 0x08]);
@@ -3138,6 +3288,7 @@ mod tests {
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3"#
                 .to_string(),
             columns: vec!["id".to_string(), "content".to_string()],
+            foreign_keys: vec![],
         };
 
         let value = Value::Blob("正文内容".as_bytes().to_vec());

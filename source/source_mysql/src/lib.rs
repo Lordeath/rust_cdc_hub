@@ -8,8 +8,8 @@ use common::metrics::{SOURCE_EVENTS_TOTAL, SOURCE_LAG_POSITION};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::runtime_progress;
 use common::{
-    CdcConfig, DataBuffer, FlushByOperation, Operation, Plugin, Sink, Source, TableInfoVo, Value,
-    database_table_key, get_mysql_pool_by_url_with_max_connections,
+    CdcConfig, DataBuffer, FlushByOperation, ForeignKeyInfo, Operation, Plugin, Sink, Source,
+    TableInfoVo, Value, database_table_key, get_mysql_pool_by_url_with_max_connections,
     mysql_connection_url_from_config, mysql_row_text_value, mysql_row_to_hashmap,
     redact_connection_url_password,
 };
@@ -186,6 +186,7 @@ impl MysqlSourceConfig {
 
             let mut current_source_tables = configured_table_names.clone();
             let mut no_pk_schema_only_tables: HashSet<String> = HashSet::new();
+            let sync_foreign_key_tables = config.sync_foreign_key_tables_enabled();
 
             let full_table_discovery = current_source_tables.is_empty()
                 || (current_source_tables.len() == 1
@@ -193,34 +194,8 @@ impl MysqlSourceConfig {
                         || current_source_tables[0].eq_ignore_ascii_case("*")));
             if full_table_discovery {
                 // get all tables
-                let show_tables_sql = r#"
-                    SELECT distinct c.TABLE_NAME AS table_name
-                    FROM information_schema.COLUMNS c
-                    WHERE c.TABLE_SCHEMA = (SELECT DATABASE())
-                      AND c.COLUMN_KEY = 'PRI'
-                      AND c.DATA_TYPE IN ('tinyint', 'smallint', 'mediumint', 'int', 'bigint')
-                      AND c.TABLE_NAME NOT IN (
-                            SELECT TABLE_NAME
-                            FROM information_schema.KEY_COLUMN_USAGE
-                            WHERE TABLE_SCHEMA = (SELECT DATABASE())
-                              AND REFERENCED_TABLE_NAME IS NOT NULL
-                       )
-                       AND c.TABLE_NAME NOT IN (
-                            SELECT REFERENCED_TABLE_NAME
-                            FROM information_schema.KEY_COLUMN_USAGE
-                            WHERE TABLE_SCHEMA = (SELECT DATABASE())
-                              AND REFERENCED_TABLE_NAME IS NOT NULL
-                       )
-                        AND c.TABLE_NAME NOT IN (
-                                SELECT cc.TABLE_NAME AS table_name
-                                FROM information_schema.COLUMNS cc
-                                WHERE cc.TABLE_SCHEMA = (SELECT DATABASE())
-                                    AND cc.COLUMN_KEY = 'PRI'
-                                GROUP BY cc.TABLE_NAME
-                                HAVING COUNT(*) > 1
-                        )
-                "#;
-                let tables: Vec<String> = sqlx::query(show_tables_sql)
+                let show_tables_sql = Self::full_table_discovery_sql(sync_foreign_key_tables);
+                let tables: Vec<String> = sqlx::query(show_tables_sql.as_str())
                     .fetch_all(&pool)
                     .await
                     .expect("query failed")
@@ -345,7 +320,23 @@ impl MysqlSourceConfig {
                     pk_column,
                     create_table_sql,
                     columns,
+                    foreign_keys: Vec::new(),
                 });
+            }
+            if sync_foreign_key_tables {
+                let cdc_tables = table_info_list
+                    .iter()
+                    .filter(|table_info| !table_info.pk_column.trim().is_empty())
+                    .map(|table_info| table_info.table_name.to_ascii_lowercase())
+                    .collect::<HashSet<_>>();
+                let foreign_keys =
+                    Self::fetch_foreign_keys(&pool, database.as_str(), &cdc_tables).await;
+                for table_info in &mut table_info_list {
+                    table_info.foreign_keys = foreign_keys
+                        .get(table_info.table_name.to_ascii_lowercase().as_str())
+                        .cloned()
+                        .unwrap_or_default();
+                }
             }
             mysql_source.push(MysqlSourceConfigDetail {
                 username,
@@ -403,6 +394,135 @@ impl MysqlSourceConfig {
             pools,
             stream_groups,
         }
+    }
+
+    fn full_table_discovery_sql(sync_foreign_key_tables: bool) -> String {
+        let mut sql = r#"
+            SELECT DISTINCT c.TABLE_NAME AS table_name
+            FROM information_schema.COLUMNS c
+            JOIN information_schema.TABLES t
+              ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
+             AND t.TABLE_NAME = c.TABLE_NAME
+            WHERE c.TABLE_SCHEMA = (SELECT DATABASE())
+              AND t.TABLE_TYPE = 'BASE TABLE'
+              AND c.COLUMN_KEY = 'PRI'
+              AND c.DATA_TYPE IN ('tinyint', 'smallint', 'mediumint', 'int', 'bigint')
+        "#
+        .to_string();
+        if !sync_foreign_key_tables {
+            sql.push_str(
+                r#"
+              AND c.TABLE_NAME NOT IN (
+                    SELECT TABLE_NAME
+                    FROM information_schema.KEY_COLUMN_USAGE
+                    WHERE TABLE_SCHEMA = (SELECT DATABASE())
+                      AND REFERENCED_TABLE_NAME IS NOT NULL
+               )
+              AND c.TABLE_NAME NOT IN (
+                    SELECT REFERENCED_TABLE_NAME
+                    FROM information_schema.KEY_COLUMN_USAGE
+                    WHERE TABLE_SCHEMA = (SELECT DATABASE())
+                      AND REFERENCED_TABLE_NAME IS NOT NULL
+               )
+            "#,
+            );
+        }
+        sql.push_str(
+            r#"
+              AND c.TABLE_NAME NOT IN (
+                    SELECT cc.TABLE_NAME AS table_name
+                    FROM information_schema.COLUMNS cc
+                    WHERE cc.TABLE_SCHEMA = (SELECT DATABASE())
+                      AND cc.COLUMN_KEY = 'PRI'
+                    GROUP BY cc.TABLE_NAME
+                    HAVING COUNT(*) > 1
+              )
+            ORDER BY c.TABLE_NAME
+        "#,
+        );
+        sql
+    }
+
+    async fn fetch_foreign_keys(
+        pool: &Pool<MySql>,
+        database: &str,
+        selected_cdc_tables: &HashSet<String>,
+    ) -> HashMap<String, Vec<ForeignKeyInfo>> {
+        if selected_cdc_tables.is_empty() {
+            return HashMap::new();
+        }
+        let sql = r#"
+            SELECT
+              kcu.CONSTRAINT_NAME AS constraint_name,
+              kcu.TABLE_NAME AS table_name,
+              kcu.COLUMN_NAME AS column_name,
+              kcu.REFERENCED_TABLE_NAME AS referenced_table_name,
+              kcu.REFERENCED_COLUMN_NAME AS referenced_column_name,
+              rc.UPDATE_RULE AS update_rule,
+              rc.DELETE_RULE AS delete_rule
+            FROM information_schema.KEY_COLUMN_USAGE kcu
+            LEFT JOIN information_schema.REFERENTIAL_CONSTRAINTS rc
+              ON rc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA
+             AND rc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+             AND rc.TABLE_NAME = kcu.TABLE_NAME
+            WHERE kcu.TABLE_SCHEMA = ?
+              AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
+            ORDER BY kcu.TABLE_NAME, kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION
+        "#;
+        let rows = sqlx::query(sql)
+            .bind(database)
+            .fetch_all(pool)
+            .await
+            .expect("query failed");
+        let mut grouped: HashMap<(String, String), ForeignKeyInfo> = HashMap::new();
+        let mut skipped = HashSet::new();
+        for row in rows {
+            let table_name = mysql_row_text_value(&row, "table_name");
+            let referenced_table_name = mysql_row_text_value(&row, "referenced_table_name");
+            let table_key = table_name.to_ascii_lowercase();
+            let referenced_key = referenced_table_name.to_ascii_lowercase();
+            if !selected_cdc_tables.contains(table_key.as_str())
+                || !selected_cdc_tables.contains(referenced_key.as_str())
+            {
+                let constraint_name = mysql_row_text_value(&row, "constraint_name");
+                if skipped.insert(format!("{}.{}", table_name, constraint_name)) {
+                    warn!(
+                        "Skip foreign key because child or referenced table is not selected for CDC: {}.{} -> {}",
+                        table_name, constraint_name, referenced_table_name
+                    );
+                }
+                continue;
+            }
+            let constraint_name = mysql_row_text_value(&row, "constraint_name");
+            let key = (table_key, constraint_name.to_ascii_lowercase());
+            let entry = grouped.entry(key).or_insert_with(|| ForeignKeyInfo {
+                constraint_name: constraint_name.clone(),
+                table_name: table_name.clone(),
+                columns: Vec::new(),
+                referenced_table_name: referenced_table_name.clone(),
+                referenced_columns: Vec::new(),
+                update_rule: Some(mysql_row_text_value(&row, "update_rule")),
+                delete_rule: Some(mysql_row_text_value(&row, "delete_rule")),
+            });
+            entry
+                .columns
+                .push(mysql_row_text_value(&row, "column_name"));
+            entry
+                .referenced_columns
+                .push(mysql_row_text_value(&row, "referenced_column_name"));
+        }
+
+        let mut by_table: HashMap<String, Vec<ForeignKeyInfo>> = HashMap::new();
+        for (_, foreign_key) in grouped {
+            by_table
+                .entry(foreign_key.table_name.to_ascii_lowercase())
+                .or_default()
+                .push(foreign_key);
+        }
+        for foreign_keys in by_table.values_mut() {
+            foreign_keys.sort_by(|a, b| a.constraint_name.cmp(&b.constraint_name));
+        }
+        by_table
     }
 
     fn judge_is_skip(except_table_name_prefix: &Vec<String>, table_name: &String) -> bool {
@@ -1780,6 +1900,14 @@ impl Source for MySQLSource {
             if any_initialized {
                 runtime_progress::finish_initialization().await;
             }
+            sink.lock()
+                .await
+                .after_initialization()
+                .await
+                .map_err(|e| CustomError {
+                    message: format!("sink after initialization failed: {}", e),
+                    error_type: CustomErrorType::Restart,
+                })?;
 
             for (stream_index, group) in self.stream_groups.iter().enumerate() {
                 let mut group_checkpoints: HashMap<String, MysqlCheckPointDetailEntity> =
@@ -3111,6 +3239,23 @@ mod tests {
     }
 
     #[test]
+    fn full_table_discovery_includes_foreign_key_tables_by_default() {
+        let sql = MysqlSourceConfig::full_table_discovery_sql(true);
+
+        assert!(!sql.contains("REFERENCED_TABLE_NAME IS NOT NULL"));
+        assert!(sql.contains("t.TABLE_TYPE = 'BASE TABLE'"));
+        assert!(sql.contains("HAVING COUNT(*) > 1"));
+    }
+
+    #[test]
+    fn full_table_discovery_can_keep_legacy_foreign_key_exclusion() {
+        let sql = MysqlSourceConfig::full_table_discovery_sql(false);
+
+        assert!(sql.contains("REFERENCED_TABLE_NAME IS NOT NULL"));
+        assert!(sql.contains("SELECT REFERENCED_TABLE_NAME"));
+    }
+
+    #[test]
     fn init_pk_cursor_advances_forward_only() {
         let mut cursor = InitPkCursor::Start;
 
@@ -3130,6 +3275,7 @@ mod tests {
             pk_column: "".to_string(),
             create_table_sql: "CREATE TABLE `no_pk_table` (`name` varchar(64))".to_string(),
             columns: vec!["name".to_string()],
+            foreign_keys: vec![],
         };
         let config = MysqlSourceConfigDetail {
             username: "".to_string(),

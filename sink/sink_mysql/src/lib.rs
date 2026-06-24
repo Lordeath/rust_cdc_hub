@@ -9,7 +9,7 @@ use common::schema::{
     mysql_type_token_from_column_definition, normalize_mysql_column_type_token,
 };
 use common::{
-    CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo, Value,
+    CdcConfig, DataBuffer, FlushByOperation, ForeignKeyInfo, Operation, Sink, TableInfoVo, Value,
     database_table_key, get_mysql_pool_by_url, mysql_connection_url_from_config,
     mysql_row_text_value,
 };
@@ -40,6 +40,7 @@ pub struct MySqlSink {
     buffer: Mutex<Vec<DataBuffer>>,
     initialized: RwLock<bool>,
     sink_batch_size: usize,
+    sync_foreign_key_tables: bool,
 
     // 缓存所有字段名（第一批数据会取一次）
     table_info_cache: Mutex<CaseInsensitiveHashMapTableInfoVo>,
@@ -110,7 +111,13 @@ impl MySqlSink {
                     .unwrap()
                     .is_empty();
                 if is_empty {
-                    let create_table_sql = table_info.create_table_sql.clone();
+                    let create_table_sql = if config.sync_foreign_key_tables_enabled() {
+                        Self::create_table_sql_without_foreign_keys(
+                            table_info.create_table_sql.as_str(),
+                        )
+                    } else {
+                        table_info.create_table_sql.clone()
+                    };
                     pool.execute(create_table_sql.as_str())
                         .await
                         .expect("Failed to create table");
@@ -262,6 +269,7 @@ impl MySqlSink {
             buffer: Mutex::new(Vec::with_capacity(sink_batch_size)),
             initialized: RwLock::new(false),
             sink_batch_size,
+            sync_foreign_key_tables: config.sync_foreign_key_tables_enabled(),
             table_info_cache: Mutex::new(CaseInsensitiveHashMapTableInfoVo::new_with_no_arg()),
             columns_cache: Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg()),
             // pk_cache: Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg()),
@@ -337,6 +345,166 @@ impl MySqlSink {
             Self::quote_mysql_identifier(database),
             Self::quote_mysql_identifier(table_name)
         )
+    }
+
+    fn create_table_sql_without_foreign_keys(create_table_sql: &str) -> String {
+        let mut lines = Vec::new();
+        for line in create_table_sql.lines() {
+            let trimmed = line.trim_start();
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.starts_with("constraint ") && lower.contains(" foreign key") {
+                continue;
+            }
+            if lower.starts_with("foreign key") {
+                continue;
+            }
+            lines.push(line.to_string());
+        }
+
+        let close_index = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(')'));
+        if let Some(close_index) = close_index {
+            for index in (0..close_index).rev() {
+                let trimmed_len = lines[index].trim_end().len();
+                if trimmed_len == 0 {
+                    continue;
+                }
+                if lines[index].as_bytes().get(trimmed_len - 1) == Some(&b',') {
+                    lines[index].replace_range(trimmed_len - 1..trimmed_len, "");
+                }
+                break;
+            }
+        }
+        lines.join("\n")
+    }
+
+    fn foreign_key_sql(database: &str, foreign_key: &ForeignKeyInfo) -> Option<String> {
+        if foreign_key.columns.is_empty()
+            || foreign_key.columns.len() != foreign_key.referenced_columns.len()
+        {
+            return None;
+        }
+        let columns = foreign_key
+            .columns
+            .iter()
+            .map(|column| Self::quote_mysql_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let referenced_columns = foreign_key
+            .referenced_columns
+            .iter()
+            .map(|column| Self::quote_mysql_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut sql = format!(
+            "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
+            Self::qualified_table_name(database, foreign_key.table_name.as_str()),
+            Self::quote_mysql_identifier(foreign_key.constraint_name.as_str()),
+            columns,
+            Self::qualified_table_name(database, foreign_key.referenced_table_name.as_str()),
+            referenced_columns
+        );
+        if let Some(delete_rule) = Self::mysql_fk_action(foreign_key.delete_rule.as_deref()) {
+            sql.push_str(" ON DELETE ");
+            sql.push_str(delete_rule);
+        }
+        if let Some(update_rule) = Self::mysql_fk_action(foreign_key.update_rule.as_deref()) {
+            sql.push_str(" ON UPDATE ");
+            sql.push_str(update_rule);
+        }
+        Some(sql)
+    }
+
+    fn mysql_fk_action(rule: Option<&str>) -> Option<&'static str> {
+        match rule.unwrap_or("").trim().to_ascii_uppercase().as_str() {
+            "CASCADE" => Some("CASCADE"),
+            "SET NULL" => Some("SET NULL"),
+            "SET DEFAULT" => Some("SET DEFAULT"),
+            "NO ACTION" => Some("NO ACTION"),
+            "RESTRICT" => Some("RESTRICT"),
+            _ => None,
+        }
+    }
+
+    async fn foreign_key_exists(
+        pool: &Pool<MySql>,
+        database: &str,
+        table_name: &str,
+        constraint_name: &str,
+    ) -> Result<bool, String> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) AS cnt
+            FROM information_schema.TABLE_CONSTRAINTS
+            WHERE CONSTRAINT_SCHEMA = ?
+              AND TABLE_SCHEMA = ?
+              AND TABLE_NAME = ?
+              AND CONSTRAINT_NAME = ?
+              AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+            "#,
+        )
+        .persistent(false)
+        .bind(database)
+        .bind(database)
+        .bind(table_name)
+        .bind(constraint_name)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let count = row
+            .try_get::<i64, _>("cnt")
+            .or_else(|_| row.try_get::<u64, _>("cnt").map(|v| v as i64))
+            .or_else(|_| row.try_get::<i64, _>(0))
+            .or_else(|_| row.try_get::<u64, _>(0).map(|v| v as i64))
+            .unwrap_or(0);
+        Ok(count > 0)
+    }
+
+    async fn ensure_foreign_keys(&self) -> Result<(), String> {
+        if !self.sync_foreign_key_tables {
+            return Ok(());
+        }
+        for table_info in &self.table_info_list {
+            if table_info.foreign_keys.is_empty() {
+                continue;
+            }
+            let database =
+                Self::table_info_target_database(table_info, self.primary_database.as_str());
+            let pool = self
+                .target_pools
+                .get(database.to_ascii_lowercase().as_str())
+                .ok_or_else(|| format!("target database pool not found: {}", database))?;
+            for foreign_key in &table_info.foreign_keys {
+                if Self::foreign_key_exists(
+                    pool,
+                    database.as_str(),
+                    table_info.table_name.as_str(),
+                    foreign_key.constraint_name.as_str(),
+                )
+                .await?
+                {
+                    continue;
+                }
+                let Some(sql) = Self::foreign_key_sql(database.as_str(), foreign_key) else {
+                    return Err(format!(
+                        "invalid foreign key metadata: {}.{}",
+                        table_info.table_name, foreign_key.constraint_name
+                    ));
+                };
+                pool.execute(sql.as_str()).await.map_err(|e| {
+                    format!(
+                        "MySQL auto add foreign key failed: {}.{} {}",
+                        database, foreign_key.constraint_name, e
+                    )
+                })?;
+                info!(
+                    "MySQL auto add foreign key success: {}.{}",
+                    database, foreign_key.constraint_name
+                );
+            }
+        }
+        Ok(())
     }
 
     fn qualified_routine_name(database: &str, routine_name: &str) -> String {
@@ -1201,6 +1369,83 @@ impl MySqlSink {
 
         Ok(())
     }
+
+    async fn flush_records_in_order(
+        &self,
+        batch: &[DataBuffer],
+        columns_by_table: &HashMap<String, Vec<String>>,
+        pk_by_table: &HashMap<String, String>,
+    ) -> Result<(), String> {
+        for record in batch {
+            let database = self.record_target_database(record);
+            let table_name = record.table_name.clone();
+            let table_key =
+                Self::target_table_key(database.as_str(), table_name.as_str()).to_ascii_lowercase();
+            let pool = self
+                .target_pools
+                .get(database.to_ascii_lowercase().as_str())
+                .unwrap_or_else(|| panic!("target database pool not found: {}", database));
+            let connection_url = self
+                .connection_urls
+                .get(database.to_ascii_lowercase().as_str())
+                .unwrap_or_else(|| panic!("target database url not found: {}", database));
+            let pk_name = pk_by_table
+                .get(table_key.as_str())
+                .cloned()
+                .unwrap_or_else(|| panic!("pk not found: {}", table_key));
+            match record.op {
+                Operation::CREATE(_) | Operation::UPDATE => {
+                    let columns = columns_by_table
+                        .get(table_key.as_str())
+                        .cloned()
+                        .unwrap_or_default();
+                    if columns.is_empty() {
+                        error!("columns is empty: {}.{}", database, table_name);
+                        continue;
+                    }
+                    Self::execute_upsert_batch(
+                        pool,
+                        connection_url.as_str(),
+                        database.as_str(),
+                        table_name.as_str(),
+                        &columns,
+                        std::slice::from_ref(&record.after),
+                    )
+                    .await
+                    .map(|_| ())?;
+                }
+                Operation::DELETE => {
+                    let pk = record.get_pk(pk_name.as_str());
+                    if pk.is_none() {
+                        continue;
+                    }
+                    let deletes = vec![pk.resolve_string()];
+                    Self::execute_delete_batch(
+                        pool,
+                        connection_url.as_str(),
+                        database.as_str(),
+                        table_name.as_str(),
+                        pk_name.as_str(),
+                        &deletes,
+                    )
+                    .await
+                    .map(|_| ())?;
+                }
+                _ => {
+                    return Err(format!("unexpected operation {:?}", record.op));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn has_foreign_key_metadata(&self) -> bool {
+        self.sync_foreign_key_tables
+            && self
+                .table_info_list
+                .iter()
+                .any(|table_info| !table_info.foreign_keys.is_empty())
+    }
 }
 
 #[async_trait]
@@ -1337,6 +1582,35 @@ impl Sink for MySqlSink {
             columns_by_table.insert(table_key.to_ascii_lowercase(), columns_cache.get(table_key));
         }
 
+        if self.has_foreign_key_metadata() {
+            for record in &batch {
+                let database = self.record_target_database(record);
+                let table_label =
+                    Self::target_table_key(database.as_str(), record.table_name.as_str());
+                let op_str = match record.op {
+                    Operation::CREATE(_) => "create",
+                    Operation::UPDATE => "update",
+                    Operation::DELETE => "delete",
+                    _ => "other",
+                };
+                SINK_EVENTS_TOTAL
+                    .with_label_values(&["mysql", table_label.as_str(), op_str])
+                    .inc();
+            }
+            if let Err(e) = self
+                .flush_records_in_order(&batch, &columns_by_table, &pk_by_table)
+                .await
+            {
+                error!("need to do it again: {}", cache_for_roll_back.len());
+                let mut buf = self.buffer.lock().await;
+                for cached_data_buffer in cache_for_roll_back {
+                    buf.push(cached_data_buffer);
+                }
+                return Err(e);
+            }
+            return Ok(());
+        }
+
         let mut db_batches: HashMap<String, Vec<DataBuffer>> = HashMap::new();
         for r in batch {
             let database = self.record_target_database(&r);
@@ -1431,6 +1705,11 @@ impl Sink for MySqlSink {
         trace!("alter flush done");
         Ok(())
     }
+
+    async fn after_initialization(&mut self) -> Result<(), String> {
+        self.flush_with_retry(&FlushByOperation::Init).await;
+        self.ensure_foreign_keys().await
+    }
 }
 
 fn mysql_error_column_name(message: &str) -> Option<String> {
@@ -1456,7 +1735,44 @@ mod tests {
                 column_type
             ),
             columns: vec!["id".to_string(), "name".to_string()],
+            foreign_keys: vec![],
         }
+    }
+
+    #[test]
+    fn create_table_sql_without_foreign_keys_removes_constraints() {
+        let sql = r#"CREATE TABLE `child` (
+  `id` bigint NOT NULL,
+  `parent_id` bigint NOT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_parent_id` (`parent_id`),
+  CONSTRAINT `fk_child_parent` FOREIGN KEY (`parent_id`) REFERENCES `parent` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB"#;
+
+        let stripped = MySqlSink::create_table_sql_without_foreign_keys(sql);
+
+        assert!(!stripped.contains("FOREIGN KEY"));
+        assert!(stripped.contains("KEY `idx_parent_id` (`parent_id`)"));
+        assert!(stripped.contains("PRIMARY KEY (`id`)"));
+        assert!(stripped.contains("KEY `idx_parent_id` (`parent_id`)\n) ENGINE=InnoDB"));
+    }
+
+    #[test]
+    fn foreign_key_sql_quotes_identifiers_and_actions() {
+        let foreign_key = ForeignKeyInfo {
+            constraint_name: "fk_child_parent".to_string(),
+            table_name: "child".to_string(),
+            columns: vec!["parent_id".to_string()],
+            referenced_table_name: "parent".to_string(),
+            referenced_columns: vec!["id".to_string()],
+            update_rule: Some("CASCADE".to_string()),
+            delete_rule: Some("RESTRICT".to_string()),
+        };
+
+        assert_eq!(
+            MySqlSink::foreign_key_sql("target-db", &foreign_key).unwrap(),
+            "ALTER TABLE `target-db`.`child` ADD CONSTRAINT `fk_child_parent` FOREIGN KEY (`parent_id`) REFERENCES `target-db`.`parent` (`id`) ON DELETE RESTRICT ON UPDATE CASCADE"
+        );
     }
 
     #[test]

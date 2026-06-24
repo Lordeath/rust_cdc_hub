@@ -87,6 +87,10 @@ pub trait Sink: Send + Sync {
 
     async fn alter_flush(&mut self) -> Result<(), String>;
 
+    async fn after_initialization(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// 关闭sink并释放资源（如连接池）
     async fn close(&mut self) {}
 }
@@ -133,6 +137,7 @@ pub struct CdcConfig {
     pub auto_create_table: Option<bool>,
     pub auto_add_column: Option<bool>,
     pub auto_modify_column: Option<bool>,
+    pub sync_foreign_key_tables: Option<bool>,
     pub sync_no_pk_table_schema: Option<bool>,
     #[serde(alias = "sync_stored_procedures")]
     pub sync_stored_procedure: Option<bool>,
@@ -219,6 +224,10 @@ impl CdcConfig {
 
     pub fn sync_no_pk_table_schema_enabled(&self) -> bool {
         self.sync_no_pk_table_schema.unwrap_or(false)
+    }
+
+    pub fn sync_foreign_key_tables_enabled(&self) -> bool {
+        self.sync_foreign_key_tables.unwrap_or(true)
     }
 
     pub fn overwrite_stored_procedure_enabled(&self) -> bool {
@@ -748,6 +757,19 @@ pub struct TableInfoVo {
     pub pk_column: String,
     pub create_table_sql: String,
     pub columns: Vec<String>,
+    #[serde(default)]
+    pub foreign_keys: Vec<ForeignKeyInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForeignKeyInfo {
+    pub constraint_name: String,
+    pub table_name: String,
+    pub columns: Vec<String>,
+    pub referenced_table_name: String,
+    pub referenced_columns: Vec<String>,
+    pub update_rule: Option<String>,
+    pub delete_rule: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnInfoVo {
@@ -1384,6 +1406,7 @@ mod tests {
             auto_create_table: None,
             auto_add_column: None,
             auto_modify_column: None,
+            sync_foreign_key_tables: None,
             sync_no_pk_table_schema: None,
             sync_stored_procedure: None,
             overwrite_stored_procedure: None,
@@ -1476,6 +1499,25 @@ mod tests {
         .unwrap();
 
         assert!(config.sync_no_pk_table_schema_enabled());
+    }
+
+    #[test]
+    fn test_sync_foreign_key_tables_default_true_and_parse_false() {
+        let default_config = multi_mode_config();
+        assert!(default_config.sync_foreign_key_tables_enabled());
+
+        let config: CdcConfig = serde_json::from_str(
+            r#"{
+                "source_type": "MySQL",
+                "sink_type": "MySQL",
+                "source_config": [{}],
+                "sink_config": [{}],
+                "sync_foreign_key_tables": false
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!config.sync_foreign_key_tables_enabled());
     }
 
     #[test]
