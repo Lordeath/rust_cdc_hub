@@ -1118,7 +1118,7 @@ impl DamengSink {
                     );
                     continue;
                 };
-                match self.execute(sql.as_str()).await {
+                match self.try_execute_optional(sql.as_str()).await {
                     Ok(_) => info!(
                         "Dameng auto add foreign key success: {}.{}",
                         schema, foreign_key.constraint_name
@@ -1131,6 +1131,14 @@ impl DamengSink {
             }
         }
         Ok(())
+    }
+
+    async fn try_execute_optional(&self, sql: &str) -> Result<u64, String> {
+        self.client
+            .lock()
+            .await
+            .execute(sql)
+            .map_err(|e| e.to_string())
     }
 
     fn qualified_column(schema: &str, table_name: &str, column_name: &str) -> String {
