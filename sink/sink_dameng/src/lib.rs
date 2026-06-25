@@ -234,11 +234,21 @@ impl DamengSink {
             let Some(expected_comment) = expected_comments.get(target_key.as_str()) else {
                 continue;
             };
-            if existing_comments
-                .get(target_key.as_str())
-                .is_some_and(|existing| existing == expected_comment)
-            {
-                continue;
+            match Self::column_comment_needs_update(
+                &existing_comments,
+                target_key.as_str(),
+                expected_comment.as_str(),
+            ) {
+                None => {
+                    warn!(
+                        "Dameng skip comment for missing target column: {} {}",
+                        Self::target_table_key(schema, table_info.table_name.as_str()),
+                        src_col
+                    );
+                    continue;
+                }
+                Some(false) => continue,
+                Some(true) => {}
             }
 
             let sql = Self::comment_on_column_sql(
@@ -266,6 +276,16 @@ impl DamengSink {
             }
         }
         Ok(())
+    }
+
+    fn column_comment_needs_update(
+        existing_comments: &HashMap<String, String>,
+        target_key: &str,
+        expected_comment: &str,
+    ) -> Option<bool> {
+        existing_comments
+            .get(target_key)
+            .map(|existing_comment| existing_comment != expected_comment)
     }
 
     async fn ensure_database_schema(&self, schema: &str) -> Result<(), String> {
@@ -2564,6 +2584,7 @@ mod tests {
     use common::{ForeignKeyInfo, TableInfoVo, Value};
     use dameng::ToDmValue;
     use dameng_types::DmValue;
+    use std::collections::HashMap;
 
     use super::{DamengParam, DamengSink};
 
@@ -2841,6 +2862,30 @@ mod tests {
                 comments.get("migrate_flag").unwrap()
             ),
             "COMMENT ON COLUMN \"newsee-owner\".\"biz_building_info\".\"migrate_flag\" IS '是否迁移业务表标志 0未迁移 1已迁移'"
+        );
+    }
+
+    #[test]
+    fn column_comment_update_skips_missing_target_columns() {
+        let mut existing_comments = HashMap::new();
+        existing_comments.insert("name".to_string(), "旧名称".to_string());
+        existing_comments.insert("remark".to_string(), "备注".to_string());
+
+        assert_eq!(
+            DamengSink::column_comment_needs_update(
+                &existing_comments,
+                "third_part_id",
+                "第三方ID"
+            ),
+            None
+        );
+        assert_eq!(
+            DamengSink::column_comment_needs_update(&existing_comments, "remark", "备注"),
+            Some(false)
+        );
+        assert_eq!(
+            DamengSink::column_comment_needs_update(&existing_comments, "name", "名称"),
+            Some(true)
         );
     }
 
