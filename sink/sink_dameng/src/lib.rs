@@ -1958,7 +1958,7 @@ impl DamengSink {
     ) -> String {
         match Self::mysql_type_length(mysql_type_token) {
             Some(len) if len > char_limit => "CLOB".to_string(),
-            Some(len) => format!("{}({} CHAR)", dameng_type, len),
+            Some(len) => format!("{}({} CHAR)", dameng_type, len.max(1)),
             None => format!("{}(255 CHAR)", dameng_type),
         }
     }
@@ -3161,8 +3161,16 @@ mod tests {
             "VARCHAR(50 CHAR)"
         );
         assert_eq!(
+            DamengSink::map_mysql_type_to_dameng("varchar(0)"),
+            "VARCHAR(1 CHAR)"
+        );
+        assert_eq!(
             DamengSink::map_mysql_type_to_dameng("char(20)"),
             "CHAR(20 CHAR)"
+        );
+        assert_eq!(
+            DamengSink::map_mysql_type_to_dameng("char(0)"),
+            "CHAR(1 CHAR)"
         );
         assert_eq!(
             DamengSink::map_mysql_type_to_dameng("varchar(1000)"),
