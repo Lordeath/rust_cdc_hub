@@ -2005,6 +2005,13 @@ impl DamengSink {
         mysql_column_definition: &str,
         existing_col: &DamengColumnInfo,
     ) -> bool {
+        let expected_type = Self::map_mysql_type_to_dameng(mysql_type_token);
+        if existing_col.data_type.eq_ignore_ascii_case("CLOB")
+            && Self::is_dameng_text_type(expected_type.as_str())
+        {
+            return false;
+        }
+
         if !Self::dameng_default_matches_mysql(
             mysql_type_token,
             mysql_column_definition,
@@ -2025,7 +2032,6 @@ impl DamengSink {
             return false;
         }
 
-        let expected_type = Self::map_mysql_type_to_dameng(mysql_type_token);
         if expected_type == "CLOB" {
             return !existing_col.data_type.eq_ignore_ascii_case("CLOB");
         }
@@ -2050,6 +2056,11 @@ impl DamengSink {
             }
             None => existing_col.data_length <= existing_col.char_length,
         }
+    }
+
+    fn is_dameng_text_type(dameng_type: &str) -> bool {
+        let normalized = dameng_type.to_ascii_uppercase();
+        normalized == "CLOB" || normalized.starts_with("VARCHAR") || normalized.starts_with("CHAR")
     }
 }
 
@@ -3239,6 +3250,22 @@ mod tests {
             "varchar(50)",
             "`name` varchar(50) DEFAULT NULL",
             &char_semantics
+        ));
+    }
+
+    #[test]
+    fn existing_clob_is_not_narrowed_to_varchar() {
+        let clob = super::DamengColumnInfo {
+            data_type: "CLOB".to_string(),
+            data_length: 2147483647,
+            char_length: 0,
+            default_value: None,
+        };
+
+        assert!(!DamengSink::should_modify_existing_column(
+            "varchar(50)",
+            "`errorMessage` varchar(50) DEFAULT NULL",
+            &clob
         ));
     }
 
