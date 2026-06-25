@@ -6,7 +6,8 @@ use common::metrics::{SINK_EVENTS_TOTAL, SINK_FLUSH_DURATION_SECONDS, SINK_FLUSH
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::schema::{
     extract_mysql_create_table_column_definitions, mysql_column_allows_null_from_definition,
-    mysql_column_is_auto_increment_from_definition, mysql_type_token_from_column_definition,
+    mysql_column_is_auto_increment_from_definition,
+    mysql_primary_key_columns_from_create_table_sql, mysql_type_token_from_column_definition,
 };
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, ForeignKeyInfo, Operation, Sink, TableInfoVo, Value,
@@ -328,6 +329,7 @@ impl DamengSink {
     fn create_table_sql(schema: &str, table_info: &TableInfoVo) -> Result<String, String> {
         let defs =
             extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
+        let primary_key_columns = Self::source_primary_key_columns(table_info);
         let mut cols_sql: Vec<String> = Vec::with_capacity(table_info.columns.len());
         for src_col in &table_info.columns {
             let key = src_col.to_ascii_lowercase();
@@ -340,12 +342,11 @@ impl DamengSink {
                 Some(v) => v,
             };
             let mut nullable = mysql_column_allows_null_from_definition(def.as_str());
-            if src_col.eq_ignore_ascii_case(table_info.pk_column.as_str()) {
+            if Self::contains_source_column(&primary_key_columns, src_col) {
                 nullable = false;
             }
             let nullable_sql = if nullable { "NULL" } else { "NOT NULL" };
-            let auto_increment = src_col.eq_ignore_ascii_case(table_info.pk_column.as_str())
-                && mysql_column_is_auto_increment_from_definition(def.as_str());
+            let auto_increment = mysql_column_is_auto_increment_from_definition(def.as_str());
             cols_sql.push(format!(
                 "{} {}",
                 Self::quote_column_ident(src_col),
@@ -360,11 +361,13 @@ impl DamengSink {
         if cols_sql.is_empty() {
             return Err("no columns parsed from source create table sql".to_string());
         }
-        if !table_info.pk_column.trim().is_empty() {
-            cols_sql.push(format!(
-                "PRIMARY KEY ({})",
-                Self::quote_column_ident(table_info.pk_column.as_str())
-            ));
+        if !primary_key_columns.is_empty() {
+            let primary_key_sql = primary_key_columns
+                .iter()
+                .map(|column| Self::quote_column_ident(column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            cols_sql.push(format!("PRIMARY KEY ({})", primary_key_sql));
         }
         let sql = format!(
             "CREATE TABLE {} ({})",
@@ -372,6 +375,16 @@ impl DamengSink {
             cols_sql.join(", ")
         );
         Ok(sql)
+    }
+
+    fn source_primary_key_columns(table_info: &TableInfoVo) -> Vec<String> {
+        mysql_primary_key_columns_from_create_table_sql(table_info.create_table_sql.as_str())
+    }
+
+    fn contains_source_column(columns: &[String], column_name: &str) -> bool {
+        columns
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(column_name))
     }
 
     async fn ensure_columns(&self, schema: &str, table_info: &TableInfoVo) -> Result<(), String> {
@@ -1836,17 +1849,12 @@ impl DamengSink {
                 None => {
                     signatures.insert(
                         target_key,
-                        (
-                            Self::target_column_name(table_info.pk_column.as_str())
-                                .to_ascii_lowercase(),
-                            signature,
-                        ),
+                        (Self::table_primary_key_signature(table_info), signature),
                     );
                 }
                 Some((pk, existing_signature)) => {
-                    if !pk.eq_ignore_ascii_case(
-                        Self::target_column_name(table_info.pk_column.as_str()).as_str(),
-                    ) || existing_signature != &signature
+                    if pk != &Self::table_primary_key_signature(table_info)
+                        || existing_signature != &signature
                     {
                         return Err(format!(
                             "Dameng multi_mode target table schema mismatch: {}",
@@ -1857,6 +1865,14 @@ impl DamengSink {
             }
         }
         Ok(())
+    }
+
+    fn table_primary_key_signature(table_info: &TableInfoVo) -> String {
+        Self::source_primary_key_columns(table_info)
+            .iter()
+            .map(|column| Self::target_column_name(column).to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     fn validate_target_column_names(
@@ -1895,9 +1911,8 @@ impl DamengSink {
                     .get(&key)
                     .and_then(|def| {
                         let mysql_type = mysql_type_token_from_column_definition(def.as_str())?;
-                        let auto_increment = column
-                            .eq_ignore_ascii_case(table_info.pk_column.as_str())
-                            && mysql_column_is_auto_increment_from_definition(def.as_str());
+                        let auto_increment =
+                            mysql_column_is_auto_increment_from_definition(def.as_str());
                         let nullable_sql = "";
                         Some(Self::dameng_column_definition(
                             mysql_type.as_str(),
@@ -2661,6 +2676,69 @@ mod tests {
         );
         assert!(sql.contains("\"organization_id\" BIGINT NOT NULL"));
         assert!(!sql.contains("PRIMARY KEY"));
+    }
+
+    #[test]
+    fn create_table_sql_preserves_string_primary_key_for_schema_only_table() {
+        let table_info = TableInfoVo {
+            source_database: "source_db".to_string(),
+            target_database: "target_schema".to_string(),
+            table_name: "act_ge_bytearray".to_string(),
+            pk_column: "".to_string(),
+            create_table_sql: r#"CREATE TABLE `act_ge_bytearray` (
+  `ID_` varchar(64) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci NOT NULL,
+  `REV_` int DEFAULT NULL,
+  `NAME_` varchar(255) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci DEFAULT NULL,
+  `DEPLOYMENT_ID_` varchar(64) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci DEFAULT NULL,
+  `BYTES_` longblob,
+  `GENERATED_` tinyint DEFAULT NULL,
+  PRIMARY KEY (`ID_`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 ROW_FORMAT=DYNAMIC"#
+                .to_string(),
+            columns: vec![
+                "ID_".to_string(),
+                "REV_".to_string(),
+                "NAME_".to_string(),
+                "DEPLOYMENT_ID_".to_string(),
+                "BYTES_".to_string(),
+                "GENERATED_".to_string(),
+            ],
+            foreign_keys: vec![],
+        };
+
+        let sql = DamengSink::create_table_sql("target_schema", &table_info).unwrap();
+
+        assert!(sql.contains("\"ID_\" VARCHAR(64 CHAR) NOT NULL"));
+        assert!(sql.contains("PRIMARY KEY (\"ID_\")"));
+    }
+
+    #[test]
+    fn create_table_sql_preserves_composite_primary_key_for_schema_only_table() {
+        let table_info = TableInfoVo {
+            source_database: "source_db".to_string(),
+            target_database: "target_schema".to_string(),
+            table_name: "tenant_code".to_string(),
+            pk_column: "".to_string(),
+            create_table_sql: r#"CREATE TABLE `tenant_code` (
+  `tenant_id` varchar(64) NOT NULL,
+  `code` varchar(64) NOT NULL,
+  `name` varchar(255) DEFAULT NULL,
+  CONSTRAINT `PRIMARY` PRIMARY KEY (`tenant_id`,`code`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#
+                .to_string(),
+            columns: vec![
+                "tenant_id".to_string(),
+                "code".to_string(),
+                "name".to_string(),
+            ],
+            foreign_keys: vec![],
+        };
+
+        let sql = DamengSink::create_table_sql("target_schema", &table_info).unwrap();
+
+        assert!(sql.contains("\"tenant_id\" VARCHAR(64 CHAR) NOT NULL"));
+        assert!(sql.contains("\"code\" VARCHAR(64 CHAR) NOT NULL"));
+        assert!(sql.contains("PRIMARY KEY (\"tenant_id\", \"code\")"));
     }
 
     #[test]

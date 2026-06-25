@@ -223,7 +223,7 @@ impl CdcConfig {
     }
 
     pub fn sync_no_pk_table_schema_enabled(&self) -> bool {
-        self.sync_no_pk_table_schema.unwrap_or(false)
+        self.sync_no_pk_table_schema.unwrap_or(true)
     }
 
     pub fn sync_foreign_key_tables_enabled(&self) -> bool {
@@ -1483,9 +1483,9 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_no_pk_table_schema_default_false_and_parse() {
+    fn test_sync_no_pk_table_schema_default_true_and_parse_false() {
         let default_config = multi_mode_config();
-        assert!(!default_config.sync_no_pk_table_schema_enabled());
+        assert!(default_config.sync_no_pk_table_schema_enabled());
 
         let config: CdcConfig = serde_json::from_str(
             r#"{
@@ -1493,12 +1493,12 @@ mod tests {
                 "sink_type": "Dameng",
                 "source_config": [{}],
                 "sink_config": [{}],
-                "sync_no_pk_table_schema": true
+                "sync_no_pk_table_schema": false
             }"#,
         )
         .unwrap();
 
-        assert!(config.sync_no_pk_table_schema_enabled());
+        assert!(!config.sync_no_pk_table_schema_enabled());
     }
 
     #[test]

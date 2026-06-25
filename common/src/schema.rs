@@ -104,6 +104,51 @@ pub fn mysql_column_is_auto_increment_from_definition(definition: &str) -> bool 
     definition.to_ascii_lowercase().contains("auto_increment")
 }
 
+pub fn mysql_primary_key_columns_from_create_table_sql(create_table_sql: &str) -> Vec<String> {
+    for raw_line in create_table_sql.lines() {
+        let line = raw_line.trim().trim_end_matches(',');
+        let line_lower = line.to_ascii_lowercase();
+        let is_primary_key_constraint = line_lower.starts_with("primary key")
+            || (line_lower.starts_with("constraint ") && line_lower.contains(" primary key"));
+        if !is_primary_key_constraint {
+            continue;
+        }
+
+        let Some(primary_key_index) = line_lower.find("primary key") else {
+            continue;
+        };
+        let identifiers = mysql_backtick_identifiers(&line[primary_key_index..]);
+        if !identifiers.is_empty() {
+            return identifiers;
+        }
+    }
+    Vec::new()
+}
+
+fn mysql_backtick_identifiers(input: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '`' {
+            continue;
+        }
+        let mut identifier = String::new();
+        while let Some(identifier_ch) = chars.next() {
+            if identifier_ch == '`' {
+                if chars.peek() == Some(&'`') {
+                    chars.next();
+                    identifier.push('`');
+                    continue;
+                }
+                break;
+            }
+            identifier.push(identifier_ch);
+        }
+        result.push(identifier);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +217,42 @@ mod tests {
         assert!(!mysql_column_is_auto_increment_from_definition(
             "`id` bigint NOT NULL"
         ));
+    }
+
+    #[test]
+    fn mysql_primary_key_columns_parse_common_table_constraints() {
+        let sql = r#"CREATE TABLE `act_ge_bytearray` (
+  `ID_` varchar(64) NOT NULL,
+  `DEPLOYMENT_ID_` varchar(64) DEFAULT NULL,
+  PRIMARY KEY (`ID_`) USING BTREE
+) ENGINE=InnoDB"#;
+
+        assert_eq!(
+            mysql_primary_key_columns_from_create_table_sql(sql),
+            vec!["ID_".to_string()]
+        );
+    }
+
+    #[test]
+    fn mysql_primary_key_columns_parse_composite_and_named_constraints() {
+        let sql = r#"CREATE TABLE `t` (
+  `tenant_id` varchar(64) NOT NULL,
+  `code` varchar(64) NOT NULL,
+  CONSTRAINT `PRIMARY` PRIMARY KEY (`tenant_id`,`code`)
+) ENGINE=InnoDB"#;
+
+        assert_eq!(
+            mysql_primary_key_columns_from_create_table_sql(sql),
+            vec!["tenant_id".to_string(), "code".to_string()]
+        );
+    }
+
+    #[test]
+    fn mysql_primary_key_columns_returns_empty_without_primary_key() {
+        let sql = r#"CREATE TABLE `t` (
+  `name` varchar(64) DEFAULT NULL COMMENT 'not a primary key'
+) ENGINE=InnoDB"#;
+
+        assert!(mysql_primary_key_columns_from_create_table_sql(sql).is_empty());
     }
 }

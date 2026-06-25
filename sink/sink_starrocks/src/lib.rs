@@ -165,7 +165,7 @@ impl StarrocksSink {
         }
         if Self::is_schema_only_table(table_info) {
             warn!(
-                "Starrocks skip schema-only table without primary key: {}.{}",
+                "Starrocks skip schema-only table not selected for CDC: {}.{}",
                 self.database, table_info.table_name
             );
             return Ok(());
@@ -279,7 +279,7 @@ impl StarrocksSink {
         for table_info in &self.table_info_list {
             if Self::is_schema_only_table(table_info) {
                 warn!(
-                    "Starrocks skip schema check for schema-only table without primary key: {}.{}",
+                    "Starrocks skip schema check for schema-only table not selected for CDC: {}.{}",
                     self.database, table_info.table_name
                 );
                 continue;

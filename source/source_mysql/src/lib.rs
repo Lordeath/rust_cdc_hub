@@ -185,8 +185,8 @@ impl MysqlSourceConfig {
             .unwrap_or_else(|e| panic!("MySQL source 初始化获取数据结构连接失败: {}", e));
 
             let mut current_source_tables = configured_table_names.clone();
-            let mut no_pk_schema_only_tables: HashSet<String> = HashSet::new();
             let sync_foreign_key_tables = config.sync_foreign_key_tables_enabled();
+            let sync_schema_only_tables = config.sync_no_pk_table_schema_enabled();
 
             let full_table_discovery = current_source_tables.is_empty()
                 || (current_source_tables.len() == 1
@@ -194,7 +194,10 @@ impl MysqlSourceConfig {
                         || current_source_tables[0].eq_ignore_ascii_case("*")));
             if full_table_discovery {
                 // get all tables
-                let show_tables_sql = Self::full_table_discovery_sql(sync_foreign_key_tables);
+                let show_tables_sql = Self::full_table_discovery_sql(
+                    sync_foreign_key_tables,
+                    sync_schema_only_tables,
+                );
                 let tables: Vec<String> = sqlx::query(show_tables_sql.as_str())
                     .fetch_all(&pool)
                     .await
@@ -205,44 +208,6 @@ impl MysqlSourceConfig {
                     .collect();
                 info!("get all tables from {}: {:?}", database, tables);
                 current_source_tables = tables;
-
-                if config.sync_no_pk_table_schema_enabled() {
-                    let no_pk_tables_sql = r#"
-                        SELECT DISTINCT t.TABLE_NAME AS table_name
-                        FROM information_schema.TABLES t
-                        WHERE t.TABLE_SCHEMA = (SELECT DATABASE())
-                          AND t.TABLE_TYPE = 'BASE TABLE'
-                          AND NOT EXISTS (
-                              SELECT 1
-                              FROM information_schema.TABLE_CONSTRAINTS tc
-                              WHERE tc.TABLE_SCHEMA = t.TABLE_SCHEMA
-                                AND tc.TABLE_NAME = t.TABLE_NAME
-                                AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
-                          )
-                    "#;
-                    let no_pk_tables: Vec<String> = sqlx::query(no_pk_tables_sql)
-                        .fetch_all(&pool)
-                        .await
-                        .expect("query failed")
-                        .into_iter()
-                        .map(|row| mysql_row_text_value(&row, "table_name"))
-                        .collect();
-                    info!(
-                        "get no primary key schema-only tables from {}: {:?}",
-                        database, no_pk_tables
-                    );
-
-                    let mut seen_tables = current_source_tables
-                        .iter()
-                        .map(|table| table.to_ascii_lowercase())
-                        .collect::<HashSet<_>>();
-                    for table in no_pk_tables {
-                        no_pk_schema_only_tables.insert(table.to_ascii_lowercase());
-                        if seen_tables.insert(table.to_ascii_lowercase()) {
-                            current_source_tables.push(table);
-                        }
-                    }
-                }
             }
 
             // Apply filters
@@ -288,29 +253,13 @@ impl MysqlSourceConfig {
                     .await
                     .expect("query failed");
 
-                let primary_key_columns: Vec<&ColumnInfoFromMysql> = col_list
-                    .iter()
-                    .filter(|c| c.column_key.eq_ignore_ascii_case("PRI"))
-                    .collect();
-                let pk_column: Vec<String> = primary_key_columns
-                    .iter()
-                    .filter(|c| is_supported_mysql_pk_data_type(c.data_type.as_str()))
-                    .map(|c| c.column_name.clone())
-                    .collect();
-                let schema_only_no_pk =
-                    no_pk_schema_only_tables.contains(table_name.to_ascii_lowercase().as_str());
-                if primary_key_columns.len() > 1
-                    || pk_column.len() > 1
-                    || (pk_column.is_empty() && !schema_only_no_pk)
-                {
-                    error!(
-                        "pk_column is empty, unsupported, or more than one for table {}",
-                        table_name
-                    );
-                    // panic!("pk_column is empty or more than one");
+                let Some(pk_column) = Self::table_cdc_pk_column(
+                    table_name.as_str(),
+                    &col_list,
+                    sync_schema_only_tables,
+                ) else {
                     continue;
-                }
-                let pk_column = pk_column.first().cloned().unwrap_or_default();
+                };
                 let columns: Vec<String> = col_list.iter().map(|c| c.column_name.clone()).collect();
 
                 table_info_list.push(TableInfoVo {
@@ -324,13 +273,12 @@ impl MysqlSourceConfig {
                 });
             }
             if sync_foreign_key_tables {
-                let cdc_tables = table_info_list
+                let selected_tables = table_info_list
                     .iter()
-                    .filter(|table_info| !table_info.pk_column.trim().is_empty())
                     .map(|table_info| table_info.table_name.to_ascii_lowercase())
                     .collect::<HashSet<_>>();
                 let foreign_keys =
-                    Self::fetch_foreign_keys(&pool, database.as_str(), &cdc_tables).await;
+                    Self::fetch_foreign_keys(&pool, database.as_str(), &selected_tables).await;
                 for table_info in &mut table_info_list {
                     table_info.foreign_keys = foreign_keys
                         .get(table_info.table_name.to_ascii_lowercase().as_str())
@@ -396,7 +344,29 @@ impl MysqlSourceConfig {
         }
     }
 
-    fn full_table_discovery_sql(sync_foreign_key_tables: bool) -> String {
+    fn full_table_discovery_sql(
+        sync_foreign_key_tables: bool,
+        sync_schema_only_tables: bool,
+    ) -> String {
+        if sync_schema_only_tables {
+            let mut sql = r#"
+            SELECT DISTINCT t.TABLE_NAME AS table_name
+            FROM information_schema.TABLES t
+            WHERE t.TABLE_SCHEMA = (SELECT DATABASE())
+              AND t.TABLE_TYPE = 'BASE TABLE'
+        "#
+            .to_string();
+            if !sync_foreign_key_tables {
+                Self::push_foreign_key_table_exclusion(&mut sql, "t.TABLE_NAME");
+            }
+            sql.push_str(
+                r#"
+            ORDER BY t.TABLE_NAME
+        "#,
+            );
+            return sql;
+        }
+
         let mut sql = r#"
             SELECT DISTINCT c.TABLE_NAME AS table_name
             FROM information_schema.COLUMNS c
@@ -410,22 +380,7 @@ impl MysqlSourceConfig {
         "#
         .to_string();
         if !sync_foreign_key_tables {
-            sql.push_str(
-                r#"
-              AND c.TABLE_NAME NOT IN (
-                    SELECT TABLE_NAME
-                    FROM information_schema.KEY_COLUMN_USAGE
-                    WHERE TABLE_SCHEMA = (SELECT DATABASE())
-                      AND REFERENCED_TABLE_NAME IS NOT NULL
-               )
-              AND c.TABLE_NAME NOT IN (
-                    SELECT REFERENCED_TABLE_NAME
-                    FROM information_schema.KEY_COLUMN_USAGE
-                    WHERE TABLE_SCHEMA = (SELECT DATABASE())
-                      AND REFERENCED_TABLE_NAME IS NOT NULL
-               )
-            "#,
-            );
+            Self::push_foreign_key_table_exclusion(&mut sql, "c.TABLE_NAME");
         }
         sql.push_str(
             r#"
@@ -443,12 +398,64 @@ impl MysqlSourceConfig {
         sql
     }
 
+    fn push_foreign_key_table_exclusion(sql: &mut String, table_expression: &str) {
+        sql.push_str(&format!(
+            r#"
+              AND {table_expression} NOT IN (
+                    SELECT TABLE_NAME
+                    FROM information_schema.KEY_COLUMN_USAGE
+                    WHERE TABLE_SCHEMA = (SELECT DATABASE())
+                      AND REFERENCED_TABLE_NAME IS NOT NULL
+               )
+              AND {table_expression} NOT IN (
+                    SELECT REFERENCED_TABLE_NAME
+                    FROM information_schema.KEY_COLUMN_USAGE
+                    WHERE TABLE_SCHEMA = (SELECT DATABASE())
+                      AND REFERENCED_TABLE_NAME IS NOT NULL
+               )
+            "#
+        ));
+    }
+
+    fn table_cdc_pk_column(
+        table_name: &str,
+        col_list: &[ColumnInfoFromMysql],
+        sync_schema_only_tables: bool,
+    ) -> Option<String> {
+        let primary_key_columns: Vec<&ColumnInfoFromMysql> = col_list
+            .iter()
+            .filter(|c| c.column_key.eq_ignore_ascii_case("PRI"))
+            .collect();
+        let supported_pk_columns: Vec<String> = primary_key_columns
+            .iter()
+            .filter(|c| is_supported_mysql_pk_data_type(c.data_type.as_str()))
+            .map(|c| c.column_name.clone())
+            .collect();
+        if primary_key_columns.len() == 1 && supported_pk_columns.len() == 1 {
+            return supported_pk_columns.first().cloned();
+        }
+
+        if sync_schema_only_tables {
+            info!(
+                "table {} is schema-only because primary key is missing, unsupported, or composite",
+                table_name
+            );
+            return Some(String::new());
+        }
+
+        error!(
+            "pk_column is empty, unsupported, or more than one for table {}",
+            table_name
+        );
+        None
+    }
+
     async fn fetch_foreign_keys(
         pool: &Pool<MySql>,
         database: &str,
-        selected_cdc_tables: &HashSet<String>,
+        selected_tables: &HashSet<String>,
     ) -> HashMap<String, Vec<ForeignKeyInfo>> {
-        if selected_cdc_tables.is_empty() {
+        if selected_tables.is_empty() {
             return HashMap::new();
         }
         let sql = r#"
@@ -481,13 +488,13 @@ impl MysqlSourceConfig {
             let referenced_table_name = mysql_row_text_value(&row, "referenced_table_name");
             let table_key = table_name.to_ascii_lowercase();
             let referenced_key = referenced_table_name.to_ascii_lowercase();
-            if !selected_cdc_tables.contains(table_key.as_str())
-                || !selected_cdc_tables.contains(referenced_key.as_str())
+            if !selected_tables.contains(table_key.as_str())
+                || !selected_tables.contains(referenced_key.as_str())
             {
                 let constraint_name = mysql_row_text_value(&row, "constraint_name");
                 if skipped.insert(format!("{}.{}", table_name, constraint_name)) {
                     warn!(
-                        "Skip foreign key because child or referenced table is not selected for CDC: {}.{} -> {}",
+                        "Skip foreign key because child or referenced table is not selected: {}.{} -> {}",
                         table_name, constraint_name, referenced_table_name
                     );
                 }
@@ -3239,20 +3246,79 @@ mod tests {
     }
 
     #[test]
-    fn full_table_discovery_includes_foreign_key_tables_by_default() {
-        let sql = MysqlSourceConfig::full_table_discovery_sql(true);
+    fn full_table_discovery_includes_all_base_tables_when_schema_only_enabled() {
+        let sql = MysqlSourceConfig::full_table_discovery_sql(true, true);
 
         assert!(!sql.contains("REFERENCED_TABLE_NAME IS NOT NULL"));
         assert!(sql.contains("t.TABLE_TYPE = 'BASE TABLE'"));
+        assert!(!sql.contains("c.COLUMN_KEY = 'PRI'"));
+        assert!(!sql.contains("HAVING COUNT(*) > 1"));
+    }
+
+    #[test]
+    fn full_table_discovery_filters_integer_pk_when_schema_only_disabled() {
+        let sql = MysqlSourceConfig::full_table_discovery_sql(true, false);
+
+        assert!(sql.contains("c.COLUMN_KEY = 'PRI'"));
+        assert!(sql.contains("c.DATA_TYPE IN"));
         assert!(sql.contains("HAVING COUNT(*) > 1"));
     }
 
     #[test]
     fn full_table_discovery_can_keep_legacy_foreign_key_exclusion() {
-        let sql = MysqlSourceConfig::full_table_discovery_sql(false);
+        let sql = MysqlSourceConfig::full_table_discovery_sql(false, true);
 
         assert!(sql.contains("REFERENCED_TABLE_NAME IS NOT NULL"));
         assert!(sql.contains("SELECT REFERENCED_TABLE_NAME"));
+        assert!(sql.contains("t.TABLE_NAME NOT IN"));
+    }
+
+    fn column_info(column_name: &str, column_key: &str, data_type: &str) -> ColumnInfoFromMysql {
+        ColumnInfoFromMysql {
+            column_name: column_name.to_string(),
+            column_key: column_key.to_string(),
+            data_type: data_type.to_string(),
+        }
+    }
+
+    #[test]
+    fn table_cdc_pk_column_keeps_only_single_integer_primary_key_for_cdc() {
+        let cols = vec![
+            column_info("id", "PRI", "bigint"),
+            column_info("name", "", "varchar"),
+        ];
+
+        assert_eq!(
+            MysqlSourceConfig::table_cdc_pk_column("orders", &cols, true),
+            Some("id".to_string())
+        );
+    }
+
+    #[test]
+    fn table_cdc_pk_column_marks_unsupported_tables_as_schema_only() {
+        let string_pk_cols = vec![column_info("ID_", "PRI", "varchar")];
+        let composite_pk_cols = vec![
+            column_info("tenant_id", "PRI", "bigint"),
+            column_info("code", "PRI", "varchar"),
+        ];
+        let no_pk_cols = vec![column_info("name", "", "varchar")];
+
+        assert_eq!(
+            MysqlSourceConfig::table_cdc_pk_column("string_pk", &string_pk_cols, true),
+            Some(String::new())
+        );
+        assert_eq!(
+            MysqlSourceConfig::table_cdc_pk_column("composite_pk", &composite_pk_cols, true),
+            Some(String::new())
+        );
+        assert_eq!(
+            MysqlSourceConfig::table_cdc_pk_column("no_pk", &no_pk_cols, true),
+            Some(String::new())
+        );
+        assert_eq!(
+            MysqlSourceConfig::table_cdc_pk_column("string_pk", &string_pk_cols, false),
+            None
+        );
     }
 
     #[test]

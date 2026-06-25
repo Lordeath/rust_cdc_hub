@@ -130,7 +130,7 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 | `auto_add_column` | No | Add missing target columns automatically. |
 | `auto_modify_column` | No | Modify target columns automatically. |
 | `sync_foreign_key_tables` | No | Include foreign-key-related tables during `table_name: "*"` discovery and add foreign-key constraints after MySQL/Dameng target initialization. Defaults to `true`. For MySQL targets, initial data writes temporarily disable foreign-key checks on the current session so existing target constraints do not block child rows loaded before parent rows. Set to `false` to keep the legacy behavior that excludes tables with foreign-key dependencies or references. |
-| `sync_no_pk_table_schema` | No | Whether automatic discovery also syncs no-primary-key table schemas. Defaults to `false`; those tables are schema-only, with no initial data load or CDC writes. StarRocks skips them with a warning. |
+| `sync_no_pk_table_schema` | No | Whether to sync table schemas that are not selected for CDC. Defaults to `true`; this includes no-primary-key tables, string primary keys, composite primary keys, and other unsupported primary-key shapes. These tables are schema-only, with primary keys and satisfiable foreign keys created when supported, but no initial data load or CDC writes. StarRocks skips them with a warning. |
 | `sync_stored_procedure` | No | Sync source stored procedures for MySQL → MySQL. Defaults to `false`; `sync_stored_procedures` is also accepted. |
 | `overwrite_stored_procedure` | No | When syncing stored procedures, drop and recreate an existing target procedure with the same name. Defaults to `false`; `overwrite_stored_procedures` is also accepted. |
 | `plugins` | No | Plugin configuration list. |
@@ -149,12 +149,12 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 | `host` / `port` | MySQL host and port. |
 | `username` / `password` | MySQL credentials. |
 | `database` | Source database name. |
-| `table_name` | Table name; use a single table, comma-separated names, or `"*"` for automatic discovery. By default, `"*"` selects `BASE TABLE`s with one integer primary key, including foreign-key-related tables. When top-level `sync_no_pk_table_schema: true` is enabled, no-primary-key `BASE TABLE`s are also included as schema-only tables. |
+| `table_name` | Table name; use a single table, comma-separated names, or `"*"` for automatic discovery. By default, `"*"` discovers all `BASE TABLE`s, including foreign-key-related tables. Tables with one integer primary key participate in data sync; other tables are schema-only. Set top-level `sync_no_pk_table_schema: false` to keep the legacy behavior of selecting only one-integer-primary-key tables. |
 | `except_table_name_prefix` | Exclude tables by prefix; use comma-separated prefixes. |
 | `server_id` | Binlog replication server id. It must be unique in the MySQL topology. |
 | `statement_cache_capacity` | MySQL prepared statement cache capacity, passed through as SQLx `statement-cache-capacity`; set it to `"0"` to disable caching. If MySQL reports `Can't create more than max_prepared_stmt_count statements`, disconnect old clients or temporarily raise `max_prepared_stmt_count`, then restart the sync process. |
 
-The primary-key column is detected from the MySQL table schema automatically. Tables that participate in data synchronization need exactly one integer primary key (`tinyint`, `smallint`, `mediumint`, `int`, `bigint`, and their unsigned variants). The `pk_column` config key is deprecated; configuration loading fails if it appears. `meili_table_pk` is still required for the MeiliSearch sink because it defines the target index primary key.
+The primary-key column is detected from the MySQL table schema automatically. Tables that participate in data synchronization need exactly one integer primary key (`tinyint`, `smallint`, `mediumint`, `int`, `bigint`, and their unsigned variants). Tables that do not meet this requirement are schema-only when `sync_no_pk_table_schema: true`. The `pk_column` config key is deprecated; configuration loading fails if it appears. `meili_table_pk` is still required for the MeiliSearch sink because it defines the target index primary key.
 
 Foreign-key tables are included by default. MySQL/Dameng targets create base tables first, load initial data, and then add foreign-key constraints. When only part of a schema is explicitly selected, constraints whose parent or child table is not selected are skipped with a warning; the table list is not expanded automatically. Dameng foreign-key creation is best-effort: if one constraint cannot be created because of index, data, or compatibility limitations, it is logged and sync continues.
 
