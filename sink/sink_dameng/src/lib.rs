@@ -451,7 +451,7 @@ impl DamengSink {
             let nullable = mysql_column_allows_null_from_definition(def.as_str());
             let nullable_sql = if nullable { "NULL" } else { "NOT NULL" };
             let dameng_type = Self::map_mysql_type_to_dameng(mysql_type.as_str());
-            let column_definition = Self::dameng_column_definition(
+            let add_column_definition = Self::dameng_column_definition(
                 mysql_type.as_str(),
                 def.as_str(),
                 nullable_sql,
@@ -460,7 +460,9 @@ impl DamengSink {
             if let Some(existing_col) = existing_cols.get(target_key.as_str()) {
                 let should_modify =
                     Self::should_modify_existing_column(&mysql_type, def.as_str(), existing_col);
-                if dameng_type.eq_ignore_ascii_case("CLOB") || should_modify {
+                let default_mismatch =
+                    Self::existing_column_default_mismatch(&mysql_type, def.as_str(), existing_col);
+                if dameng_type.eq_ignore_ascii_case("CLOB") || should_modify || default_mismatch {
                     info!(
                         "Dameng column check: {}.{} existing={} data_length={} char_length={} default={:?} expected={} auto_modify={}",
                         Self::target_table_key(schema, table_info.table_name.as_str()),
@@ -473,9 +475,18 @@ impl DamengSink {
                         self.auto_modify_column
                     );
                 }
+                if default_mismatch {
+                    warn!(
+                        "Dameng skip auto modify default mismatch: {}.{} existing_default={:?} expected_default={:?}",
+                        Self::target_table_key(schema, table_info.table_name.as_str()),
+                        src_col,
+                        existing_col.default_value,
+                        Self::mysql_column_default_value_sql(mysql_type.as_str(), def.as_str())
+                    );
+                }
                 if should_modify && !self.auto_modify_column {
                     return Err(format!(
-                        "Dameng column type/default mismatch and auto_modify_column is false: {}.{} existing={} data_length={} char_length={} default={:?} expected={}",
+                        "Dameng column type mismatch and auto_modify_column is false: {}.{} existing={} data_length={} char_length={} default={:?} expected={}",
                         Self::target_table_key(schema, table_info.table_name.as_str()),
                         src_col,
                         existing_col.data_type,
@@ -509,7 +520,7 @@ impl DamengSink {
                         "ALTER TABLE {} MODIFY {} {}",
                         Self::qualified_table(schema, table_info.table_name.as_str()),
                         Self::quote_ident(target_col.as_str()),
-                        column_definition
+                        Self::dameng_modify_column_definition(mysql_type.as_str())
                     );
                     match self.execute(sql.as_str()).await {
                         Ok(_) => info!(
@@ -538,7 +549,7 @@ impl DamengSink {
                 "ALTER TABLE {} ADD {} {}",
                 Self::qualified_table(schema, table_info.table_name.as_str()),
                 Self::quote_ident(target_col.as_str()),
-                column_definition
+                add_column_definition
             );
             match self.execute(sql.as_str()).await {
                 Ok(_) => info!(
@@ -1313,6 +1324,10 @@ impl DamengSink {
         parts.join(" ")
     }
 
+    fn dameng_modify_column_definition(mysql_type_token: &str) -> String {
+        Self::map_mysql_type_to_dameng_for_column(mysql_type_token, false)
+    }
+
     fn mysql_column_default_sql(
         mysql_type_token: &str,
         mysql_column_definition: &str,
@@ -1676,6 +1691,20 @@ impl DamengSink {
         };
         Self::normalize_default_for_compare(expected_default.as_str())
             == Self::normalize_default_for_compare(default_value)
+    }
+
+    fn existing_column_default_mismatch(
+        mysql_type_token: &str,
+        mysql_column_definition: &str,
+        existing_col: &DamengColumnInfo,
+    ) -> bool {
+        !Self::dameng_default_matches_mysql(
+            mysql_type_token,
+            mysql_column_definition,
+            existing_col.default_value.as_deref(),
+        ) || (Self::mysql_current_timestamp_default_sql(mysql_type_token, mysql_column_definition)
+            .is_some()
+            && !Self::dameng_default_is_current_timestamp(existing_col.default_value.as_deref()))
     }
 
     fn mysql_column_default_value_sql(
@@ -2068,7 +2097,7 @@ impl DamengSink {
 
     fn should_modify_existing_column(
         mysql_type_token: &str,
-        mysql_column_definition: &str,
+        _mysql_column_definition: &str,
         existing_col: &DamengColumnInfo,
     ) -> bool {
         let expected_type = Self::map_mysql_type_to_dameng(mysql_type_token);
@@ -2076,21 +2105,6 @@ impl DamengSink {
             && Self::is_dameng_text_type(expected_type.as_str())
         {
             return false;
-        }
-
-        if !Self::dameng_default_matches_mysql(
-            mysql_type_token,
-            mysql_column_definition,
-            existing_col.default_value.as_deref(),
-        ) {
-            return true;
-        }
-
-        if Self::mysql_current_timestamp_default_sql(mysql_type_token, mysql_column_definition)
-            .is_some()
-            && !Self::dameng_default_is_current_timestamp(existing_col.default_value.as_deref())
-        {
-            return true;
         }
 
         let t = mysql_type_token.to_ascii_lowercase();
@@ -3365,6 +3379,18 @@ mod tests {
     }
 
     #[test]
+    fn existing_column_modify_definition_uses_type_only() {
+        assert_eq!(
+            DamengSink::dameng_modify_column_definition("bigint"),
+            "BIGINT"
+        );
+        assert_eq!(
+            DamengSink::dameng_modify_column_definition("varchar(50)"),
+            "VARCHAR(50 CHAR)"
+        );
+    }
+
+    #[test]
     fn current_timestamp_default_detection_handles_supported_time_columns() {
         assert_eq!(
             DamengSink::mysql_current_timestamp_default_sql(
@@ -3397,7 +3423,7 @@ mod tests {
     }
 
     #[test]
-    fn current_timestamp_default_mismatch_requires_column_modify() {
+    fn current_timestamp_default_mismatch_is_skipped_for_existing_columns() {
         let missing_default = super::DamengColumnInfo {
             data_type: "TIMESTAMP".to_string(),
             data_length: 8,
@@ -3413,7 +3439,12 @@ mod tests {
         let def =
             "`sys_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP";
 
-        assert!(DamengSink::should_modify_existing_column(
+        assert!(DamengSink::existing_column_default_mismatch(
+            "timestamp",
+            def,
+            &missing_default
+        ));
+        assert!(!DamengSink::should_modify_existing_column(
             "timestamp",
             def,
             &missing_default
@@ -3426,7 +3457,7 @@ mod tests {
     }
 
     #[test]
-    fn literal_default_mismatch_requires_column_modify() {
+    fn literal_default_mismatch_is_skipped_for_existing_columns() {
         let missing_default = super::DamengColumnInfo {
             data_type: "TINYINT".to_string(),
             data_length: 1,
@@ -3441,7 +3472,12 @@ mod tests {
         };
         let def = "`migrate_flag` tinyint NOT NULL DEFAULT '0' COMMENT '是否迁移业务表标志 0未迁移 1已迁移'";
 
-        assert!(DamengSink::should_modify_existing_column(
+        assert!(DamengSink::existing_column_default_mismatch(
+            "tinyint",
+            def,
+            &missing_default
+        ));
+        assert!(!DamengSink::should_modify_existing_column(
             "tinyint",
             def,
             &missing_default
