@@ -407,6 +407,15 @@ impl DamengSink {
             .any(|column| column.eq_ignore_ascii_case(column_name))
     }
 
+    fn is_protected_source_column_for_auto_modify(
+        primary_key_columns: &[String],
+        column_name: &str,
+        column_definition: &str,
+    ) -> bool {
+        Self::contains_source_column(primary_key_columns, column_name)
+            || mysql_column_is_auto_increment_from_definition(column_definition)
+    }
+
     async fn ensure_columns(&self, schema: &str, table_info: &TableInfoVo) -> Result<(), String> {
         if !self.auto_add_column && !self.auto_modify_column {
             return Ok(());
@@ -426,6 +435,7 @@ impl DamengSink {
         }
         let defs =
             extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
+        let primary_key_columns = Self::source_primary_key_columns(table_info);
         for src_col in &table_info.columns {
             let key = src_col.to_ascii_lowercase();
             let target_col = Self::target_column_name(src_col);
@@ -474,6 +484,25 @@ impl DamengSink {
                         existing_col.default_value,
                         dameng_type
                     ));
+                }
+                if should_modify
+                    && Self::is_protected_source_column_for_auto_modify(
+                        &primary_key_columns,
+                        src_col,
+                        def.as_str(),
+                    )
+                {
+                    warn!(
+                        "Dameng skip auto modify protected column: {}.{} existing={} data_length={} char_length={} default={:?} expected={}",
+                        Self::target_table_key(schema, table_info.table_name.as_str()),
+                        src_col,
+                        existing_col.data_type,
+                        existing_col.data_length,
+                        existing_col.char_length,
+                        existing_col.default_value,
+                        dameng_type
+                    );
+                    continue;
                 }
                 if should_modify {
                     let sql = format!(
@@ -3421,6 +3450,27 @@ mod tests {
             "tinyint",
             def,
             &matching_default
+        ));
+    }
+
+    #[test]
+    fn primary_key_and_auto_increment_columns_are_protected_from_auto_modify() {
+        let primary_key_columns = vec!["id".to_string()];
+
+        assert!(DamengSink::is_protected_source_column_for_auto_modify(
+            &primary_key_columns,
+            "ID",
+            "`id` bigint NOT NULL DEFAULT 0"
+        ));
+        assert!(DamengSink::is_protected_source_column_for_auto_modify(
+            &[],
+            "id",
+            "`id` bigint NOT NULL AUTO_INCREMENT"
+        ));
+        assert!(!DamengSink::is_protected_source_column_for_auto_modify(
+            &primary_key_columns,
+            "migrate_flag",
+            "`migrate_flag` tinyint NOT NULL DEFAULT '0'"
         ));
     }
 
