@@ -505,11 +505,25 @@ impl DamengSink {
             if !self.auto_add_column {
                 continue;
             }
+            let add_nullable_sql = Self::auto_add_column_nullable_sql(def.as_str(), nullable);
+            let add_column_definition = Self::dameng_column_definition(
+                mysql_type.as_str(),
+                def.as_str(),
+                add_nullable_sql,
+                false,
+            );
+            if !nullable && add_nullable_sql == "NULL" {
+                warn!(
+                    "Dameng auto add column relax NOT NULL because target table may already contain rows: {} {}",
+                    Self::target_table_key(schema, table_info.table_name.as_str()),
+                    src_col
+                );
+            }
             let sql = format!(
                 "ALTER TABLE {} ADD {} {}",
                 Self::qualified_table(schema, table_info.table_name.as_str()),
                 Self::quote_ident(target_col.as_str()),
-                column_definition
+                add_column_definition
             );
             match self.execute(sql.as_str()).await {
                 Ok(_) => info!(
@@ -530,6 +544,14 @@ impl DamengSink {
             }
         }
         Ok(())
+    }
+
+    fn auto_add_column_nullable_sql(mysql_column_definition: &str, nullable: bool) -> &'static str {
+        if nullable || !Self::mysql_column_has_non_null_default(mysql_column_definition) {
+            "NULL"
+        } else {
+            "NOT NULL"
+        }
     }
 
     async fn table_exists(&self, schema: &str, table_name: &str) -> Result<bool, String> {
@@ -1271,6 +1293,11 @@ impl DamengSink {
         let default_literal =
             Self::mysql_default_literal_sql(mysql_type_token, default_value.as_str())?;
         Some(format!("DEFAULT {}", default_literal))
+    }
+
+    fn mysql_column_has_non_null_default(mysql_column_definition: &str) -> bool {
+        Self::mysql_default_value_expression(mysql_column_definition)
+            .is_some_and(|default_value| !Self::mysql_default_is_null(default_value.as_str()))
     }
 
     fn mysql_column_comments(table_info: &TableInfoVo) -> HashMap<String, String> {
@@ -2834,6 +2861,34 @@ mod tests {
         assert!(sql.contains("\"building_name\" VARCHAR(50 CHAR) NULL DEFAULT '未命名'"));
         assert!(sql.contains("\"remark\" VARCHAR(50 CHAR) NULL"));
         assert!(!sql.contains("DEFAULT NULL"));
+    }
+
+    #[test]
+    fn auto_add_not_null_column_without_default_is_relaxed_to_nullable() {
+        assert_eq!(
+            DamengSink::auto_add_column_nullable_sql("`foreignkeyId` bigint NOT NULL", false),
+            "NULL"
+        );
+        assert_eq!(
+            DamengSink::dameng_column_definition(
+                "bigint",
+                "`foreignkeyId` bigint NOT NULL",
+                DamengSink::auto_add_column_nullable_sql("`foreignkeyId` bigint NOT NULL", false),
+                false
+            ),
+            "BIGINT NULL"
+        );
+        assert_eq!(
+            DamengSink::auto_add_column_nullable_sql(
+                "`delete_flag` int NOT NULL DEFAULT '0'",
+                false
+            ),
+            "NOT NULL"
+        );
+        assert_eq!(
+            DamengSink::auto_add_column_nullable_sql("`name` varchar(64) DEFAULT NULL", true),
+            "NULL"
+        );
     }
 
     #[test]
