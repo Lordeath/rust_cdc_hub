@@ -594,7 +594,51 @@ impl DamengSink {
         schema: &str,
         table_name: &str,
     ) -> Result<HashMap<String, String>, String> {
-        let sql = if schema.is_empty() {
+        if !schema.is_empty() {
+            let dba_sql = Self::dba_column_comments_sql(schema, table_name);
+            match self.query(dba_sql.as_str(), &[]).await {
+                Ok(rows) => {
+                    let comments = Self::column_comments_from_rows(&rows);
+                    if !comments.is_empty() {
+                        return Ok(comments);
+                    }
+                    warn!(
+                        "Dameng DBA_COL_COMMENTS returned no column comments, fallback to ALL_COL_COMMENTS: {}",
+                        Self::target_table_key(schema, table_name)
+                    );
+                }
+                Err(e) => warn!(
+                    "Dameng DBA_COL_COMMENTS query failed, fallback to ALL_COL_COMMENTS: {} {}",
+                    Self::target_table_key(schema, table_name),
+                    e
+                ),
+            }
+        }
+
+        let sql = Self::all_column_comments_sql(schema, table_name);
+        let rows = self.query(sql.as_str(), &[]).await?;
+        Ok(Self::column_comments_from_rows(&rows))
+    }
+
+    fn column_comments_from_rows(rows: &dameng::ResultSet) -> HashMap<String, String> {
+        let metadata = rows
+            .iter()
+            .filter_map(|row| row.get::<String>(0).ok())
+            .collect::<Vec<_>>()
+            .join("\x1e");
+        Self::parse_column_comments_metadata(metadata.as_str())
+    }
+
+    fn dba_column_comments_sql(schema: &str, table_name: &str) -> String {
+        format!(
+            "SELECT c.COLUMN_NAME || CHR(31) || NVL(REPLACE(REPLACE(c.COMMENTS, CHR(30), ' '), CHR(31), ' '), '') FROM DBA_COL_COMMENTS c WHERE {} AND {} ORDER BY c.COLUMN_NAME",
+            Self::eq_original_or_upper_sql("c.OWNER", schema),
+            Self::eq_original_or_upper_sql("c.TABLE_NAME", table_name)
+        )
+    }
+
+    fn all_column_comments_sql(schema: &str, table_name: &str) -> String {
+        if schema.is_empty() {
             format!(
                 "SELECT c.COLUMN_NAME || CHR(31) || NVL(REPLACE(REPLACE(cc.COMMENTS, CHR(30), ' '), CHR(31), ' '), '') FROM USER_TAB_COLUMNS c LEFT JOIN USER_COL_COMMENTS cc ON cc.TABLE_NAME = c.TABLE_NAME AND cc.COLUMN_NAME = c.COLUMN_NAME WHERE {} ORDER BY c.COLUMN_ID",
                 Self::eq_original_or_upper_sql("c.TABLE_NAME", table_name)
@@ -605,14 +649,7 @@ impl DamengSink {
                 Self::eq_original_or_upper_sql("c.OWNER", schema),
                 Self::eq_original_or_upper_sql("c.TABLE_NAME", table_name)
             )
-        };
-        let rows = self.query(sql.as_str(), &[]).await?;
-        let metadata = rows
-            .iter()
-            .filter_map(|row| row.get::<String>(0).ok())
-            .collect::<Vec<_>>()
-            .join("\x1e");
-        Ok(Self::parse_column_comments_metadata(metadata.as_str()))
+        }
     }
 
     fn parse_columns_metadata(metadata: &str) -> HashMap<String, DamengColumnInfo> {
@@ -3000,6 +3037,27 @@ mod tests {
             Some("是否迁移业务表标志 0未迁移 1已迁移")
         );
         assert_eq!(comments.get("name").map(String::as_str), Some("业主名称"));
+    }
+
+    #[test]
+    fn column_comment_sql_prefers_dba_comments_for_schema() {
+        let sql = DamengSink::dba_column_comments_sql("newsee-center-pay", "ns_application");
+
+        assert!(sql.contains("FROM DBA_COL_COMMENTS c"));
+        assert!(sql.contains("c.OWNER = 'newsee-center-pay'"));
+        assert!(sql.contains("c.TABLE_NAME = 'ns_application'"));
+        assert!(sql.contains("c.COMMENTS"));
+    }
+
+    #[test]
+    fn all_column_comment_sql_keeps_user_and_all_fallbacks() {
+        let user_sql = DamengSink::all_column_comments_sql("", "ns_application");
+        let all_sql = DamengSink::all_column_comments_sql("newsee-center-pay", "ns_application");
+
+        assert!(user_sql.contains("FROM USER_TAB_COLUMNS c"));
+        assert!(user_sql.contains("LEFT JOIN USER_COL_COMMENTS cc"));
+        assert!(all_sql.contains("FROM ALL_TAB_COLUMNS c"));
+        assert!(all_sql.contains("LEFT JOIN ALL_COL_COMMENTS cc"));
     }
 
     #[test]
