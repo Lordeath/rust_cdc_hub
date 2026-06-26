@@ -20,6 +20,14 @@ pub fn convert_mysql_routine_to_dameng(
     target_schema: &str,
     routine: &MySqlRoutineDefinition,
 ) -> Result<String, String> {
+    convert_mysql_routine_to_dameng_with_name(target_schema, None, routine)
+}
+
+pub fn convert_mysql_routine_to_dameng_with_name(
+    target_schema: &str,
+    target_routine_name: Option<&str>,
+    routine: &MySqlRoutineDefinition,
+) -> Result<String, String> {
     let signature = parse_mysql_routine_signature(routine.create_sql.as_str(), routine.kind)?;
     let params = convert_mysql_routine_params(signature.params.as_str(), routine.kind)?;
     let params_sql = if params.is_empty() {
@@ -51,7 +59,8 @@ pub fn convert_mysql_routine_to_dameng(
     } else {
         format!("{}\n", body.declarations.join("\n"))
     };
-    let qualified_name = qualified_routine(target_schema, signature.name.as_str());
+    let target_routine_name = target_routine_name.unwrap_or(signature.name.as_str());
+    let qualified_name = qualified_routine(target_schema, target_routine_name);
     match routine.kind {
         MySqlRoutineKind::Procedure => Ok(format!(
             "CREATE OR REPLACE PROCEDURE {}{}\nAS\n{}{}",
@@ -4853,6 +4862,28 @@ mod tests {
         assert!(sql.contains("p_name := CONCAT('id:', p_id);"));
         assert!(sql.contains("SELECT \"name\" FROM \"orders\" WHERE \"id\" = p_id;"));
         assert!(sql.ends_with("END;"));
+    }
+
+    #[test]
+    fn converts_mysql_procedure_with_target_routine_name() {
+        let routine = MySqlRoutineDefinition {
+            kind: MySqlRoutineKind::Procedure,
+            name: "source_name".to_string(),
+            create_sql: "CREATE PROCEDURE `source_name`() BEGIN SELECT 1; END".to_string(),
+            sql_mode: String::new(),
+        };
+
+        let sql = convert_mysql_routine_to_dameng_with_name(
+            "target_schema",
+            Some("target_name"),
+            &routine,
+        )
+        .unwrap();
+
+        assert!(
+            sql.starts_with("CREATE OR REPLACE PROCEDURE \"target_schema\".\"target_name\"\nAS")
+        );
+        assert!(!sql.contains("\"source_name\""));
     }
 
     #[test]

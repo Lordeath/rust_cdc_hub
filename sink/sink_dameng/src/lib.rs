@@ -17,7 +17,7 @@ use common::{
 use dameng::Client;
 use dameng::ToDmValue;
 use dameng_types::DmValue;
-use mysql_to_dameng::convert_mysql_routine_to_dameng;
+use mysql_to_dameng::convert_mysql_routine_to_dameng_with_name;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
@@ -26,6 +26,7 @@ use tracing::{debug, error, info, trace, warn};
 const DAMENG_INLINE_STRING_CHAR_LIMIT: u32 = 512;
 const DAMENG_DECIMAL_MAX_PRECISION: u32 = 38;
 const DAMENG_BLOB_WRITE_CHUNK_SIZE: usize = 1000;
+const DAMENG_IDENTIFIER_CHAR_LIMIT: usize = 128;
 
 #[derive(Debug, Clone)]
 enum DamengParam {
@@ -393,6 +394,7 @@ impl DamengSink {
         routine: &MySqlRoutineDefinition,
         overwrite: bool,
     ) -> Result<(), String> {
+        let mut target_routine_name = routine.name.clone();
         let exists = self
             .dameng_routine_exists(target_schema, routine.kind, routine.name.as_str())
             .await?;
@@ -408,30 +410,52 @@ impl DamengSink {
             return Ok(());
         }
         if !exists
-            && !overwrite
             && self
                 .dameng_object_name_exists(target_schema, routine.name.as_str())
                 .await?
         {
+            let (renamed_routine_name, renamed_exists) = self
+                .dameng_conflict_routine_name(target_schema, routine.kind, routine.name.as_str())
+                .await?;
+            if renamed_exists && !overwrite {
+                info!(
+                    "Dameng renamed stored routine exists, skip: {} {}.{} -> {}.{} original_target={}.{}",
+                    routine.kind.routine_type(),
+                    source_database,
+                    routine.name,
+                    target_schema,
+                    renamed_routine_name,
+                    target_schema,
+                    routine.name
+                );
+                return Ok(());
+            }
             warn!(
-                "Dameng object name exists, skip stored routine: {} {}.{} -> {}.{}",
+                "Dameng object name exists, rename stored routine: {} {}.{} -> {}.{} original_target={}.{}",
                 routine.kind.routine_type(),
                 source_database,
                 routine.name,
                 target_schema,
+                renamed_routine_name,
+                target_schema,
                 routine.name
             );
-            return Ok(());
+            target_routine_name = renamed_routine_name;
         }
 
-        let create_sql = convert_mysql_routine_to_dameng(target_schema, routine).map_err(|e| {
+        let create_sql = convert_mysql_routine_to_dameng_with_name(
+            target_schema,
+            Some(target_routine_name.as_str()),
+            routine,
+        )
+        .map_err(|e| {
             format!(
                 "convert stored routine failed: {} {}.{} -> {}.{} {}",
                 routine.kind.routine_type(),
                 source_database,
                 routine.name,
                 target_schema,
-                routine.name,
+                target_routine_name,
                 e
             )
         })?;
@@ -442,7 +466,7 @@ impl DamengSink {
                 source_database,
                 routine.name,
                 target_schema,
-                routine.name,
+                target_routine_name,
                 overwrite,
                 Self::sql_preview(create_sql.as_str()),
                 e
@@ -454,10 +478,63 @@ impl DamengSink {
             source_database,
             routine.name,
             target_schema,
-            routine.name,
+            target_routine_name,
             overwrite
         );
         Ok(())
+    }
+
+    async fn dameng_conflict_routine_name(
+        &self,
+        schema: &str,
+        routine_kind: MySqlRoutineKind,
+        routine_name: &str,
+    ) -> Result<(String, bool), String> {
+        for index in 0..100 {
+            let candidate = Self::conflict_routine_name(routine_name, routine_kind, index);
+            if self
+                .dameng_routine_exists(schema, routine_kind, candidate.as_str())
+                .await?
+            {
+                return Ok((candidate, true));
+            }
+            if !self
+                .dameng_object_name_exists(schema, candidate.as_str())
+                .await?
+            {
+                return Ok((candidate, false));
+            }
+        }
+        Err(format!(
+            "no available Dameng routine name for object conflict: {}.{} {}",
+            schema,
+            routine_name,
+            routine_kind.routine_type()
+        ))
+    }
+
+    fn conflict_routine_name(
+        routine_name: &str,
+        routine_kind: MySqlRoutineKind,
+        index: usize,
+    ) -> String {
+        let suffix = match routine_kind {
+            MySqlRoutineKind::Procedure => "_procedure",
+            MySqlRoutineKind::Function => "_function",
+        };
+        let suffix = if index == 0 {
+            suffix.to_string()
+        } else {
+            format!("{}_{}", suffix, index + 1)
+        };
+        Self::identifier_with_suffix(routine_name, suffix.as_str())
+    }
+
+    fn identifier_with_suffix(identifier: &str, suffix: &str) -> String {
+        let suffix_len = suffix.chars().count();
+        let prefix_len = DAMENG_IDENTIFIER_CHAR_LIMIT.saturating_sub(suffix_len);
+        let prefix = identifier.chars().take(prefix_len).collect::<String>();
+        format!("{}{}", prefix, suffix)
     }
 
     async fn dameng_routine_exists(
@@ -2978,6 +3055,28 @@ mod tests {
             DamengSink::dameng_routine_exists_sql("", MySqlRoutineKind::Procedure, "sync_demo"),
             "SELECT COUNT(*) FROM USER_OBJECTS WHERE OBJECT_TYPE = 'PROCEDURE' AND (OBJECT_NAME = 'sync_demo' OR OBJECT_NAME = 'SYNC_DEMO')"
         );
+    }
+
+    #[test]
+    fn conflict_routine_name_adds_kind_suffix_and_limits_length() {
+        assert_eq!(
+            DamengSink::conflict_routine_name(
+                "ns_report_classification",
+                MySqlRoutineKind::Procedure,
+                0
+            ),
+            "ns_report_classification_procedure"
+        );
+        assert_eq!(
+            DamengSink::conflict_routine_name("calc_total", MySqlRoutineKind::Function, 1),
+            "calc_total_function_2"
+        );
+
+        let long_name = "a".repeat(140);
+        let renamed =
+            DamengSink::conflict_routine_name(long_name.as_str(), MySqlRoutineKind::Procedure, 0);
+        assert_eq!(renamed.chars().count(), 128);
+        assert!(renamed.ends_with("_procedure"));
     }
 
     #[test]
