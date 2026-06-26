@@ -8,6 +8,7 @@ members = [
     "sink/sink_meilisearch",
     "sink/sink_starrocks",
     "sink/sink_dameng",
+    "mysql_to_dameng",
     "common",
     "plugin"
 ]

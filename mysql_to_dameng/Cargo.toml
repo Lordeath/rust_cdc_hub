@@ -1,0 +1,8 @@
+[package]
+name = "mysql_to_dameng"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+common = { path = "../common" }

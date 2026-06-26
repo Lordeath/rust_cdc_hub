@@ -2230,6 +2230,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mysql_to_dameng"
+version = "0.1.0"
+dependencies = [
+ "common",
+]
+
+[[package]]
 name = "native-tls"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3401,6 +3408,7 @@ dependencies = [
  "common",
  "dameng",
  "dameng-types",
+ "mysql_to_dameng",
  "tokio",
  "tracing",
 ]

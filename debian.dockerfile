@@ -25,6 +25,7 @@ RUN mkdir -p /usr/local/cargo \
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY common ./common
+COPY mysql_to_dameng ./mysql_to_dameng
 COPY plugin ./plugin
 COPY sink ./sink
 COPY source ./source

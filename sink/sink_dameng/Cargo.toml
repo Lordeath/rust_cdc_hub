@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 common = { path = "../../common" }
+mysql_to_dameng = { path = "../../mysql_to_dameng" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 async-trait = "0.1.89"
