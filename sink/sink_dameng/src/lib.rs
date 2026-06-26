@@ -407,6 +407,22 @@ impl DamengSink {
             );
             return Ok(());
         }
+        if !exists
+            && !overwrite
+            && self
+                .dameng_object_name_exists(target_schema, routine.name.as_str())
+                .await?
+        {
+            warn!(
+                "Dameng object name exists, skip stored routine: {} {}.{} -> {}.{}",
+                routine.kind.routine_type(),
+                source_database,
+                routine.name,
+                target_schema,
+                routine.name
+            );
+            return Ok(());
+        }
 
         let create_sql = convert_mysql_routine_to_dameng(target_schema, routine).map_err(|e| {
             format!(
@@ -459,6 +475,20 @@ impl DamengSink {
         Ok(count > 0)
     }
 
+    async fn dameng_object_name_exists(
+        &self,
+        schema: &str,
+        object_name: &str,
+    ) -> Result<bool, String> {
+        let sql = Self::dameng_object_name_exists_sql(schema, object_name);
+        let rows = self.query(sql.as_str(), &[]).await?;
+        let count = rows
+            .first()
+            .and_then(|row| row.get::<i32>(0).ok())
+            .unwrap_or(0);
+        Ok(count > 0)
+    }
+
     fn dameng_routine_exists_sql(
         schema: &str,
         routine_kind: MySqlRoutineKind,
@@ -481,6 +511,21 @@ impl DamengSink {
         }
     }
 
+    fn dameng_object_name_exists_sql(schema: &str, object_name: &str) -> String {
+        if schema.is_empty() {
+            format!(
+                "SELECT COUNT(*) FROM USER_OBJECTS WHERE {}",
+                Self::eq_original_or_upper_sql("OBJECT_NAME", object_name)
+            )
+        } else {
+            format!(
+                "SELECT COUNT(*) FROM ALL_OBJECTS WHERE {} AND {}",
+                Self::eq_original_or_upper_sql("OWNER", schema),
+                Self::eq_original_or_upper_sql("OBJECT_NAME", object_name)
+            )
+        }
+    }
+
     fn sql_preview(sql: &str) -> String {
         let mut compact = sql
             .lines()
@@ -489,7 +534,7 @@ impl DamengSink {
             .collect::<Vec<_>>()
             .join(" ");
         if compact.len() > 500 {
-            compact.truncate(500);
+            compact = compact.chars().take(500).collect();
             compact.push_str("...");
         }
         compact
@@ -778,24 +823,32 @@ impl DamengSink {
         schema: &str,
         table_name: &str,
     ) -> Result<HashMap<String, DamengColumnInfo>, String> {
-        let sql = if schema.is_empty() {
+        let sql = Self::columns_metadata_sql(schema, table_name);
+        let rows = self.query(sql.as_str(), &[]).await?;
+        let metadata = rows
+            .iter()
+            .filter_map(|row| row.get::<String>(0).ok())
+            .collect::<Vec<_>>()
+            .join("\x1e");
+        Ok(Self::parse_columns_metadata(metadata.as_str()))
+    }
+
+    fn columns_metadata_sql(schema: &str, table_name: &str) -> String {
+        let expr = "COLUMN_NAME || CHR(31) || DATA_TYPE || CHR(31) || DATA_LENGTH || CHR(31) || CHAR_LENGTH || CHR(31) || NVL(REPLACE(REPLACE(TRIM(DATA_DEFAULT), CHR(30), ' '), CHR(31), ' '), '')";
+        if schema.is_empty() {
             format!(
-                "SELECT LISTAGG(COLUMN_NAME || ':' || DATA_TYPE || ':' || DATA_LENGTH || ':' || CHAR_LENGTH || ':' || NVL(REPLACE(REPLACE(TRIM(DATA_DEFAULT), '|', ' '), ':', ' '), ''), '|') WITHIN GROUP (ORDER BY COLUMN_ID) FROM USER_TAB_COLUMNS WHERE {}",
+                "SELECT {} FROM USER_TAB_COLUMNS WHERE {} ORDER BY COLUMN_ID",
+                expr,
                 Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
             )
         } else {
             format!(
-                "SELECT LISTAGG(COLUMN_NAME || ':' || DATA_TYPE || ':' || DATA_LENGTH || ':' || CHAR_LENGTH || ':' || NVL(REPLACE(REPLACE(TRIM(DATA_DEFAULT), '|', ' '), ':', ' '), ''), '|') WITHIN GROUP (ORDER BY COLUMN_ID) FROM ALL_TAB_COLUMNS WHERE {} AND {}",
+                "SELECT {} FROM ALL_TAB_COLUMNS WHERE {} AND {} ORDER BY COLUMN_ID",
+                expr,
                 Self::eq_original_or_upper_sql("OWNER", schema),
                 Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
             )
-        };
-        let rows = self.query(sql.as_str(), &[]).await?;
-        let metadata = rows
-            .first()
-            .and_then(|row| row.get::<String>(0).ok())
-            .unwrap_or_default();
-        Ok(Self::parse_columns_metadata(metadata.as_str()))
+        }
     }
 
     async fn existing_column_comments(
@@ -863,40 +916,55 @@ impl DamengSink {
 
     fn parse_columns_metadata(metadata: &str) -> HashMap<String, DamengColumnInfo> {
         let mut cols = HashMap::new();
-        for column in metadata.split('|').filter(|s| !s.is_empty()) {
-            let mut parts = column.splitn(5, ':');
-            let name = match parts.next() {
-                Some(v) if !v.is_empty() => v,
-                _ => continue,
-            };
-            let data_type = match parts.next() {
-                Some(v) if !v.is_empty() => v,
-                _ => continue,
-            };
-            let data_length = parts
-                .next()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(0);
-            let char_length = parts
-                .next()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(0);
-            let default_value = parts
-                .next()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(ToString::to_string);
-            cols.insert(
-                name.to_ascii_lowercase(),
-                DamengColumnInfo {
-                    data_type: data_type.to_string(),
-                    data_length,
-                    char_length,
-                    default_value,
-                },
-            );
+        let row_separator = if metadata.contains('\x1e') || metadata.contains('\x1f') {
+            '\x1e'
+        } else {
+            '|'
+        };
+        for column in metadata.split(row_separator).filter(|s| !s.is_empty()) {
+            let field_separator = if column.contains('\x1f') { '\x1f' } else { ':' };
+            if let Some((name, info)) = Self::parse_column_metadata(column, field_separator) {
+                cols.insert(name.to_ascii_lowercase(), info);
+            }
         }
         cols
+    }
+
+    fn parse_column_metadata(
+        column: &str,
+        field_separator: char,
+    ) -> Option<(&str, DamengColumnInfo)> {
+        let mut parts = column.splitn(5, field_separator);
+        let name = match parts.next() {
+            Some(v) if !v.is_empty() => v,
+            _ => return None,
+        };
+        let data_type = match parts.next() {
+            Some(v) if !v.is_empty() => v,
+            _ => return None,
+        };
+        let data_length = parts
+            .next()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        let char_length = parts
+            .next()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        let default_value = parts
+            .next()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string);
+        Some((
+            name,
+            DamengColumnInfo {
+                data_type: data_type.to_string(),
+                data_length,
+                char_length,
+                default_value,
+            },
+        ))
     }
 
     fn parse_column_comments_metadata(metadata: &str) -> HashMap<String, String> {
@@ -2913,6 +2981,27 @@ mod tests {
     }
 
     #[test]
+    fn object_name_exists_sql_checks_any_object_type() {
+        assert_eq!(
+            DamengSink::dameng_object_name_exists_sql("target_schema", "ns_report_classification"),
+            "SELECT COUNT(*) FROM ALL_OBJECTS WHERE (OWNER = 'target_schema' OR OWNER = 'TARGET_SCHEMA') AND (OBJECT_NAME = 'ns_report_classification' OR OBJECT_NAME = 'NS_REPORT_CLASSIFICATION')"
+        );
+        assert_eq!(
+            DamengSink::dameng_object_name_exists_sql("", "sync_demo"),
+            "SELECT COUNT(*) FROM USER_OBJECTS WHERE (OBJECT_NAME = 'sync_demo' OR OBJECT_NAME = 'SYNC_DEMO')"
+        );
+    }
+
+    #[test]
+    fn sql_preview_truncates_on_char_boundary() {
+        let sql = format!("SELECT '{}'", "\u{5404}".repeat(600));
+        let preview = DamengSink::sql_preview(sql.as_str());
+
+        assert!(preview.ends_with("..."));
+        assert!(preview.is_char_boundary(preview.len()));
+    }
+
+    #[test]
     fn foreign_key_sql_maps_restrict_to_no_action() {
         let foreign_key = ForeignKeyInfo {
             constraint_name: "fk_child_parent".to_string(),
@@ -3238,6 +3327,18 @@ mod tests {
     }
 
     #[test]
+    fn columns_metadata_sql_reads_one_row_per_column() {
+        let sql = DamengSink::columns_metadata_sql("target_schema", "orders");
+
+        assert!(sql.contains("FROM ALL_TAB_COLUMNS"));
+        assert!(sql.contains("ORDER BY COLUMN_ID"));
+        assert!(sql.contains("CHR(31)"));
+        assert!(!sql.contains("LISTAGG"));
+        assert!(sql.contains("(OWNER = 'target_schema' OR OWNER = 'TARGET_SCHEMA')"));
+        assert!(sql.contains("(TABLE_NAME = 'orders' OR TABLE_NAME = 'ORDERS')"));
+    }
+
+    #[test]
     fn parses_dameng_columns_metadata() {
         let cols = DamengSink::parse_columns_metadata(
             "id:BIGINT:8:0:|param:VARCHAR:16000:4000:|sys_time:TIMESTAMP:8:0:CURRENT_TIMESTAMP",
@@ -3252,6 +3353,15 @@ mod tests {
         let sys_time = cols.get("sys_time").unwrap();
         assert_eq!(sys_time.data_type, "TIMESTAMP");
         assert_eq!(sys_time.default_value.as_deref(), Some("CURRENT_TIMESTAMP"));
+
+        let row_cols = DamengSink::parse_columns_metadata(
+            "incomeType\x1fINT\x1f4\x1f0\x1f0\x1eintegralDeductItems\x1fVARCHAR\x1f1024\x1f256\x1f",
+        );
+        assert_eq!(row_cols.get("incometype").unwrap().data_type, "INT");
+        assert_eq!(
+            row_cols.get("integraldeductitems").unwrap().char_length,
+            256
+        );
     }
 
     #[test]
