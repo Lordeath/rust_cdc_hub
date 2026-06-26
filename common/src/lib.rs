@@ -1045,6 +1045,253 @@ pub fn mysql_row_text_value(row: &MySqlRow, column_name: &str) -> String {
         .unwrap_or_else(|e| panic!("读取MySQL文本列失败: {} {}", column_name, e))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MySqlRoutineKind {
+    Procedure,
+    Function,
+}
+
+impl MySqlRoutineKind {
+    pub fn routine_type(self) -> &'static str {
+        match self {
+            MySqlRoutineKind::Procedure => "PROCEDURE",
+            MySqlRoutineKind::Function => "FUNCTION",
+        }
+    }
+
+    pub fn create_row_name_column(self) -> &'static str {
+        match self {
+            MySqlRoutineKind::Procedure => "Procedure",
+            MySqlRoutineKind::Function => "Function",
+        }
+    }
+
+    pub fn create_row_sql_column(self) -> &'static str {
+        match self {
+            MySqlRoutineKind::Procedure => "Create Procedure",
+            MySqlRoutineKind::Function => "Create Function",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MySqlRoutineDefinition {
+    pub kind: MySqlRoutineKind,
+    pub name: String,
+    pub create_sql: String,
+    pub sql_mode: String,
+}
+
+pub fn quote_mysql_identifier(identifier: &str) -> String {
+    format!("`{}`", identifier.replace('`', "``"))
+}
+
+pub fn qualified_mysql_name(database: &str, name: &str) -> String {
+    format!(
+        "{}.{}",
+        quote_mysql_identifier(database),
+        quote_mysql_identifier(name)
+    )
+}
+
+pub fn show_create_mysql_routine_sql(
+    source_database: &str,
+    routine_kind: MySqlRoutineKind,
+    routine_name: &str,
+) -> String {
+    format!(
+        "SHOW CREATE {} {}",
+        routine_kind.routine_type(),
+        qualified_mysql_name(source_database, routine_name)
+    )
+}
+
+pub fn mysql_utf8mb4_string_expr(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut sql = String::with_capacity("CONVERT(0x USING utf8mb4)".len() + value.len() * 2);
+    sql.push_str("CONVERT(0x");
+    for byte in value.as_bytes() {
+        sql.push(HEX[(byte >> 4) as usize] as char);
+        sql.push(HEX[(byte & 0x0F) as usize] as char);
+    }
+    sql.push_str(" USING utf8mb4)");
+    sql
+}
+
+pub async fn fetch_mysql_routines(
+    source_pool: &Pool<MySql>,
+    source_database: &str,
+    routine_kinds: &[MySqlRoutineKind],
+) -> Result<Vec<MySqlRoutineDefinition>, String> {
+    if routine_kinds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let routine_types = routine_kinds
+        .iter()
+        .map(|kind| format!("'{}'", kind.routine_type()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let routine_sql = format!(
+        r#"
+        SELECT ROUTINE_NAME, ROUTINE_TYPE
+        FROM information_schema.ROUTINES
+        WHERE ROUTINE_SCHEMA = {}
+          AND ROUTINE_TYPE IN ({})
+        ORDER BY FIELD(ROUTINE_TYPE, 'FUNCTION', 'PROCEDURE'), ROUTINE_NAME
+        "#,
+        mysql_utf8mb4_string_expr(source_database),
+        routine_types
+    );
+    let routine_rows = sqlx::raw_sql(routine_sql.as_str())
+        .fetch_all(source_pool)
+        .await
+        .map_err(|e| format!("{}: {}", routine_sql, e))?;
+
+    let mut routines = Vec::with_capacity(routine_rows.len());
+    for row in routine_rows {
+        let name = mysql_row_text_value(&row, "ROUTINE_NAME");
+        let routine_type = mysql_row_text_value(&row, "ROUTINE_TYPE");
+        let kind = parse_mysql_routine_kind(routine_type.as_str())?;
+        let show_sql = show_create_mysql_routine_sql(source_database, kind, name.as_str());
+        let create_row = sqlx::raw_sql(show_sql.as_str())
+            .fetch_one(source_pool)
+            .await
+            .map_err(|e| format!("{}: {}", show_sql, e))?;
+        routines.push(parse_show_create_mysql_routine_row(
+            kind,
+            name.as_str(),
+            &create_row,
+        )?);
+    }
+    Ok(routines)
+}
+
+fn parse_mysql_routine_kind(value: &str) -> Result<MySqlRoutineKind, String> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "PROCEDURE" => Ok(MySqlRoutineKind::Procedure),
+        "FUNCTION" => Ok(MySqlRoutineKind::Function),
+        _ => Err(format!("unsupported MySQL routine type: {}", value)),
+    }
+}
+
+fn parse_show_create_mysql_routine_row(
+    kind: MySqlRoutineKind,
+    fallback_name: &str,
+    row: &MySqlRow,
+) -> Result<MySqlRoutineDefinition, String> {
+    let name = row
+        .try_get::<String, _>(kind.create_row_name_column())
+        .or_else(|_| row.try_get::<String, _>(0))
+        .unwrap_or_else(|_| fallback_name.to_string());
+    let sql_mode = row
+        .try_get::<String, _>("sql_mode")
+        .or_else(|_| row.try_get::<String, _>(1))
+        .unwrap_or_default();
+    let create_sql = row
+        .try_get::<String, _>(kind.create_row_sql_column())
+        .or_else(|_| row.try_get::<String, _>(2))
+        .map_err(|e| {
+            format!(
+                "SHOW CREATE {} 读取 {} 失败: {}",
+                kind.routine_type(),
+                kind.create_row_sql_column(),
+                e
+            )
+        })?;
+    Ok(MySqlRoutineDefinition {
+        kind,
+        name,
+        create_sql: strip_create_routine_definer(create_sql.as_str(), kind),
+        sql_mode,
+    })
+}
+
+pub fn strip_create_routine_definer(create_sql: &str, routine_kind: MySqlRoutineKind) -> String {
+    let sql = create_sql.trim_start();
+    if !starts_with_keyword(sql, 0, "CREATE") {
+        return create_sql.to_string();
+    }
+    let mut pos = skip_ascii_whitespace(sql, "CREATE".len());
+    if !starts_with_keyword(sql, pos, "DEFINER") {
+        return create_sql.to_string();
+    }
+    pos = skip_ascii_whitespace(sql, pos + "DEFINER".len());
+    if sql.as_bytes().get(pos) != Some(&b'=') {
+        return create_sql.to_string();
+    }
+    let Some(routine_keyword_pos) =
+        find_keyword_outside_quotes(sql, pos + 1, routine_kind.routine_type())
+    else {
+        return create_sql.to_string();
+    };
+    format!("CREATE {}", sql[routine_keyword_pos..].trim_start())
+}
+
+fn skip_ascii_whitespace(value: &str, mut pos: usize) -> usize {
+    while value
+        .as_bytes()
+        .get(pos)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        pos += 1;
+    }
+    pos
+}
+
+fn starts_with_keyword(value: &str, pos: usize, keyword: &str) -> bool {
+    let bytes = value.as_bytes();
+    let keyword_bytes = keyword.as_bytes();
+    if pos + keyword_bytes.len() > bytes.len() {
+        return false;
+    }
+    if !bytes[pos..pos + keyword_bytes.len()].eq_ignore_ascii_case(keyword_bytes) {
+        return false;
+    }
+    let before_ok = pos == 0 || !is_ascii_identifier_byte(bytes[pos - 1]);
+    let after_pos = pos + keyword_bytes.len();
+    let after_ok = after_pos >= bytes.len() || !is_ascii_identifier_byte(bytes[after_pos]);
+    before_ok && after_ok
+}
+
+fn find_keyword_outside_quotes(value: &str, start: usize, keyword: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    let mut quote = None;
+    let mut pos = start;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if let Some(quote_byte) = quote {
+            if byte == quote_byte {
+                if bytes.get(pos + 1) == Some(&quote_byte) {
+                    pos += 2;
+                } else {
+                    quote = None;
+                    pos += 1;
+                }
+            } else {
+                pos += 1;
+            }
+            continue;
+        }
+        if matches!(byte, b'`' | b'\'' | b'"') {
+            quote = Some(byte);
+            pos += 1;
+            continue;
+        }
+        if starts_with_keyword(value, pos, keyword) {
+            return Some(pos);
+        }
+        pos += 1;
+    }
+    None
+}
+
+fn is_ascii_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 pub async fn get_mysql_pool_by_url(
     connection_url: &str,
     from: &str,
@@ -1287,6 +1534,29 @@ mod tests {
         assert!(is_mysql_binary_type("VARBINARY"));
         assert!(is_mysql_binary_type("binary"));
         assert!(!is_mysql_binary_type("VARCHAR"));
+    }
+
+    #[test]
+    fn mysql_routine_sql_quotes_database_and_name() {
+        assert_eq!(
+            show_create_mysql_routine_sql("source-db", MySqlRoutineKind::Function, "sync`demo"),
+            "SHOW CREATE FUNCTION `source-db`.`sync``demo`"
+        );
+        assert_eq!(
+            mysql_utf8mb4_string_expr("newsee-backlog"),
+            "CONVERT(0x6E65777365652D6261636B6C6F67 USING utf8mb4)"
+        );
+        assert_eq!(mysql_utf8mb4_string_expr(""), "''");
+    }
+
+    #[test]
+    fn strips_create_function_definer() {
+        let sql = "CREATE DEFINER=`source_user`@`%` FUNCTION `sync_demo`() RETURNS int DETERMINISTIC BEGIN RETURN 1; END";
+
+        assert_eq!(
+            strip_create_routine_definer(sql, MySqlRoutineKind::Function),
+            "CREATE FUNCTION `sync_demo`() RETURNS int DETERMINISTIC BEGIN RETURN 1; END"
+        );
     }
 
     #[test]

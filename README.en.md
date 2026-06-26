@@ -131,8 +131,8 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 | `auto_modify_column` | No | Modify target columns automatically. |
 | `sync_foreign_key_tables` | No | Include foreign-key-related tables during `table_name: "*"` discovery and add foreign-key constraints after MySQL/Dameng target initialization. Defaults to `true`. For MySQL targets, initial data writes temporarily disable foreign-key checks on the current session so existing target constraints do not block child rows loaded before parent rows. Set to `false` to keep the legacy behavior that excludes tables with foreign-key dependencies or references. |
 | `sync_no_pk_table_schema` | No | Whether to sync table schemas that are not selected for CDC. Defaults to `true`; this includes no-primary-key tables, string primary keys, composite primary keys, and other unsupported primary-key shapes. These tables are schema-only, with primary keys and satisfiable foreign keys created when supported, but no initial data load or CDC writes. StarRocks skips them with a warning. |
-| `sync_stored_procedure` | No | Sync source stored procedures for MySQL → MySQL. Defaults to `false`; `sync_stored_procedures` is also accepted. |
-| `overwrite_stored_procedure` | No | When syncing stored procedures, drop and recreate an existing target procedure with the same name. Defaults to `false`; `overwrite_stored_procedures` is also accepted. |
+| `sync_stored_procedure` | No | Sync source stored procedures and functions for MySQL → MySQL/Dameng. Defaults to `false`; `sync_stored_procedures` is also accepted. |
+| `overwrite_stored_procedure` | No | When syncing stored procedures/functions, overwrite an existing target object with the same name. Defaults to `false`; `overwrite_stored_procedures` is also accepted. |
 | `plugins` | No | Plugin configuration list. |
 | `source_batch_size` | No | Source batch size. |
 | `sink_batch_size` | No | Sink batch size. |
@@ -225,7 +225,7 @@ enable_ui: true
 ui_port: 8080
 ```
 
-When `sync_stored_procedure` is enabled, the MySQL sink syncs `PROCEDURE` definitions during initialization according to the source-to-target database route. If a target procedure already exists and `overwrite_stored_procedure: false`, it is skipped; when set to `true`, the sink runs `DROP PROCEDURE IF EXISTS` and recreates it. The sink removes `DEFINER=\`user\`@\`host\`` from `SHOW CREATE PROCEDURE` before creating the target procedure, so the source database user is not copied to the target.
+When `sync_stored_procedure` is enabled, the MySQL/Dameng sinks sync `PROCEDURE` and `FUNCTION` definitions during initialization according to the source-to-target database route. If a target object already exists and `overwrite_stored_procedure: false`, it is skipped; when set to `true`, the MySQL sink runs `DROP PROCEDURE/FUNCTION IF EXISTS` and recreates it, while the Dameng sink uses `CREATE OR REPLACE`. The sink removes `DEFINER=\`user\`@\`host\`` from `SHOW CREATE PROCEDURE/FUNCTION` before creating the target object, so the source database user is not copied to the target. MySQL → Dameng performs a basic DMSQL conversion; complex MySQL-specific routine syntax can fail initialization with the object name and error reason.
 
 ### MySQL → MeiliSearch example
 

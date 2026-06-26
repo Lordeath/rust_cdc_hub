@@ -10,8 +10,9 @@ use common::schema::{
     mysql_primary_key_columns_from_create_table_sql, mysql_type_token_from_column_definition,
 };
 use common::{
-    CdcConfig, DataBuffer, FlushByOperation, ForeignKeyInfo, Operation, Sink, TableInfoVo, Value,
-    database_table_key,
+    CdcConfig, DataBuffer, FlushByOperation, ForeignKeyInfo, MySqlRoutineDefinition,
+    MySqlRoutineKind, Operation, Sink, TableInfoVo, Value, database_table_key,
+    fetch_mysql_routines, get_mysql_pool_by_url, mysql_connection_url_from_config,
 };
 use dameng::Client;
 use dameng::ToDmValue;
@@ -62,6 +63,13 @@ struct DamengColumnInfo {
     data_length: u32,
     char_length: u32,
     default_value: Option<String>,
+}
+
+#[derive(Debug)]
+struct MysqlRoutineSignature {
+    name: String,
+    params: String,
+    after_params: String,
 }
 
 pub struct DamengSink {
@@ -145,6 +153,11 @@ impl DamengSink {
         sink.ensure_schema()
             .await
             .unwrap_or_else(|e| panic!("Dameng ensure schema failed: {}", e));
+        if config.sync_stored_procedure_enabled() {
+            sink.sync_stored_routines(config)
+                .await
+                .unwrap_or_else(|e| panic!("Dameng sync stored routines failed: {}", e));
+        }
         sink
     }
 
@@ -324,6 +337,645 @@ impl DamengSink {
         }
         info!("Dameng auto create schema success: {}", schema);
         Ok(())
+    }
+
+    async fn sync_stored_routines(&self, config: &CdcConfig) -> Result<(), String> {
+        let overwrite = config.overwrite_stored_procedure_enabled();
+        let source_databases = config.source_databases();
+        for (source_index, source_database) in source_databases.iter().enumerate() {
+            if source_database.trim().is_empty() {
+                continue;
+            }
+            let source_config_index = if config.multi_mode_open() {
+                0
+            } else {
+                source_index
+            };
+            let mut target_schema = config.target_database_for_source(source_database);
+            if target_schema.trim().is_empty() {
+                target_schema = self.schema.clone();
+            }
+            let source_url = mysql_connection_url_from_config(
+                &config.source_config[source_config_index],
+                Some(source_database),
+            );
+            let source_pool =
+                get_mysql_pool_by_url(&source_url, "dameng sink 同步存储程序-读取源库存储程序")
+                    .await?;
+            let routines = fetch_mysql_routines(
+                &source_pool,
+                source_database,
+                &[MySqlRoutineKind::Function, MySqlRoutineKind::Procedure],
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "fetch source stored routines failed: {} -> {} {}",
+                    source_database, target_schema, e
+                )
+            })?;
+            if routines.is_empty() {
+                info!("MySQL source stored routine not found: {}", source_database);
+                continue;
+            }
+
+            for routine in routines {
+                self.sync_one_stored_routine(
+                    source_database,
+                    target_schema.as_str(),
+                    &routine,
+                    overwrite,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn sync_one_stored_routine(
+        &self,
+        source_database: &str,
+        target_schema: &str,
+        routine: &MySqlRoutineDefinition,
+        overwrite: bool,
+    ) -> Result<(), String> {
+        let exists = self
+            .dameng_routine_exists(target_schema, routine.kind, routine.name.as_str())
+            .await?;
+        if exists && !overwrite {
+            info!(
+                "Dameng stored routine exists, skip: {} {}.{} -> {}.{}",
+                routine.kind.routine_type(),
+                source_database,
+                routine.name,
+                target_schema,
+                routine.name
+            );
+            return Ok(());
+        }
+
+        let create_sql =
+            Self::convert_mysql_routine_to_dameng(target_schema, routine).map_err(|e| {
+                format!(
+                    "convert stored routine failed: {} {}.{} -> {}.{} {}",
+                    routine.kind.routine_type(),
+                    source_database,
+                    routine.name,
+                    target_schema,
+                    routine.name,
+                    e
+                )
+            })?;
+        self.execute(create_sql.as_str()).await.map_err(|e| {
+            format!(
+                "create Dameng stored routine failed: {} {}.{} -> {}.{} overwrite={} sql={} error={}",
+                routine.kind.routine_type(),
+                source_database,
+                routine.name,
+                target_schema,
+                routine.name,
+                overwrite,
+                Self::sql_preview(create_sql.as_str()),
+                e
+            )
+        })?;
+        info!(
+            "Dameng sync stored routine success: {} {}.{} -> {}.{} overwrite={}",
+            routine.kind.routine_type(),
+            source_database,
+            routine.name,
+            target_schema,
+            routine.name,
+            overwrite
+        );
+        Ok(())
+    }
+
+    async fn dameng_routine_exists(
+        &self,
+        schema: &str,
+        routine_kind: MySqlRoutineKind,
+        routine_name: &str,
+    ) -> Result<bool, String> {
+        let sql = Self::dameng_routine_exists_sql(schema, routine_kind, routine_name);
+        let rows = self.query(sql.as_str(), &[]).await?;
+        let count = rows
+            .first()
+            .and_then(|row| row.get::<i32>(0).ok())
+            .unwrap_or(0);
+        Ok(count > 0)
+    }
+
+    fn dameng_routine_exists_sql(
+        schema: &str,
+        routine_kind: MySqlRoutineKind,
+        routine_name: &str,
+    ) -> String {
+        let object_type = routine_kind.routine_type();
+        if schema.is_empty() {
+            format!(
+                "SELECT COUNT(*) FROM USER_OBJECTS WHERE OBJECT_TYPE = {} AND {}",
+                Self::quote_literal(object_type),
+                Self::eq_original_or_upper_sql("OBJECT_NAME", routine_name)
+            )
+        } else {
+            format!(
+                "SELECT COUNT(*) FROM ALL_OBJECTS WHERE {} AND OBJECT_TYPE = {} AND {}",
+                Self::eq_original_or_upper_sql("OWNER", schema),
+                Self::quote_literal(object_type),
+                Self::eq_original_or_upper_sql("OBJECT_NAME", routine_name)
+            )
+        }
+    }
+
+    fn convert_mysql_routine_to_dameng(
+        target_schema: &str,
+        routine: &MySqlRoutineDefinition,
+    ) -> Result<String, String> {
+        let signature =
+            Self::parse_mysql_routine_signature(routine.create_sql.as_str(), routine.kind)?;
+        let params = Self::convert_mysql_routine_params(signature.params.as_str(), routine.kind)?;
+        let params_sql = if params.is_empty() {
+            String::new()
+        } else {
+            format!("({})", params.join(", "))
+        };
+        let body_pos =
+            Self::find_keyword_outside_quotes(signature.after_params.as_str(), 0, "BEGIN")
+                .ok_or_else(|| "routine body BEGIN not found".to_string())?;
+        let body = Self::convert_mysql_routine_body(&signature.after_params[body_pos..]);
+        let qualified_name = Self::qualified_routine(target_schema, signature.name.as_str());
+        match routine.kind {
+            MySqlRoutineKind::Procedure => Ok(format!(
+                "CREATE OR REPLACE PROCEDURE {}{}\nAS\n{}",
+                qualified_name, params_sql, body
+            )),
+            MySqlRoutineKind::Function => {
+                let return_type =
+                    Self::mysql_function_return_type(&signature.after_params[..body_pos])?;
+                Ok(format!(
+                    "CREATE OR REPLACE FUNCTION {}{}\nRETURN {}\nAS\n{}",
+                    qualified_name, params_sql, return_type, body
+                ))
+            }
+        }
+    }
+
+    fn parse_mysql_routine_signature(
+        create_sql: &str,
+        routine_kind: MySqlRoutineKind,
+    ) -> Result<MysqlRoutineSignature, String> {
+        let sql = create_sql.trim_start();
+        let keyword_pos = Self::find_keyword_outside_quotes(sql, 0, routine_kind.routine_type())
+            .ok_or_else(|| format!("CREATE {} keyword not found", routine_kind.routine_type()))?;
+        let mut pos =
+            Self::skip_ascii_whitespace(sql, keyword_pos + routine_kind.routine_type().len());
+        let (mut name, next_pos) = Self::take_mysql_identifier(sql, pos)
+            .ok_or_else(|| "routine name not found".to_string())?;
+        pos = Self::skip_ascii_whitespace(sql, next_pos);
+        loop {
+            if sql.as_bytes().get(pos) == Some(&b'.') {
+                let next_name_pos = Self::skip_ascii_whitespace(sql, pos + 1);
+                let (part, next_pos) = Self::take_mysql_identifier(sql, next_name_pos)
+                    .ok_or_else(|| "routine name not found after schema qualifier".to_string())?;
+                name = part;
+                pos = Self::skip_ascii_whitespace(sql, next_pos);
+                continue;
+            }
+            break;
+        }
+
+        if sql.as_bytes().get(pos) != Some(&b'(') {
+            return Err("routine parameter list not found".to_string());
+        }
+        let close_pos = Self::find_matching_paren(sql, pos)
+            .ok_or_else(|| "routine parameter list is not closed".to_string())?;
+        Ok(MysqlRoutineSignature {
+            name,
+            params: sql[pos + 1..close_pos].to_string(),
+            after_params: sql[close_pos + 1..].to_string(),
+        })
+    }
+
+    fn convert_mysql_routine_params(
+        params: &str,
+        routine_kind: MySqlRoutineKind,
+    ) -> Result<Vec<String>, String> {
+        let mut result = Vec::new();
+        for param in Self::split_top_level_commas(params) {
+            let param = param.trim();
+            if param.is_empty() {
+                continue;
+            }
+            let mut pos = Self::skip_ascii_whitespace(param, 0);
+            let mut mode = "IN".to_string();
+            if let Some((word, next_pos)) = Self::take_ascii_word(param, pos) {
+                match word.to_ascii_uppercase().as_str() {
+                    "IN" | "OUT" | "INOUT" => {
+                        mode = if word.eq_ignore_ascii_case("INOUT") {
+                            "IN OUT".to_string()
+                        } else {
+                            word.to_ascii_uppercase()
+                        };
+                        pos = Self::skip_ascii_whitespace(param, next_pos);
+                    }
+                    _ => {}
+                }
+            }
+            let (name, next_pos) = Self::take_mysql_identifier(param, pos)
+                .ok_or_else(|| format!("routine parameter name not found: {}", param))?;
+            let mysql_type = param[next_pos..].trim();
+            if mysql_type.is_empty() {
+                return Err(format!("routine parameter type not found: {}", param));
+            }
+            let dameng_type = Self::map_mysql_type_to_dameng(mysql_type);
+            let name = Self::dameng_routine_param_name(name.as_str());
+            result.push(format!("{} {} {}", name, mode, dameng_type));
+        }
+
+        if matches!(routine_kind, MySqlRoutineKind::Function) {
+            for param in &result {
+                if param.contains(" OUT ") {
+                    return Err(format!("function parameter cannot be OUT/INOUT: {}", param));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn mysql_function_return_type(before_body: &str) -> Result<String, String> {
+        let rest = before_body.trim_start();
+        if !Self::starts_with_keyword(rest, 0, "RETURNS") {
+            return Err("function RETURNS clause not found".to_string());
+        }
+        let type_and_attrs = rest["RETURNS".len()..].trim_start();
+        let mysql_type = Self::take_mysql_type_before_routine_attrs(type_and_attrs)
+            .ok_or_else(|| "function return type not found".to_string())?;
+        Ok(Self::map_mysql_type_to_dameng(mysql_type))
+    }
+
+    fn take_mysql_type_before_routine_attrs(value: &str) -> Option<&str> {
+        let bytes = value.as_bytes();
+        let mut quote = None;
+        let mut paren_depth = 0u32;
+        let mut pos = 0usize;
+        let mut end = bytes.len();
+        while pos < bytes.len() {
+            let byte = bytes[pos];
+            if let Some(quote_byte) = quote {
+                if byte == quote_byte {
+                    if bytes.get(pos + 1) == Some(&quote_byte) {
+                        pos += 2;
+                    } else {
+                        quote = None;
+                        pos += 1;
+                    }
+                } else {
+                    pos += 1;
+                }
+                continue;
+            }
+            match byte {
+                b'\'' | b'"' | b'`' => {
+                    quote = Some(byte);
+                    pos += 1;
+                }
+                b'(' => {
+                    paren_depth += 1;
+                    pos += 1;
+                }
+                b')' => {
+                    paren_depth = paren_depth.saturating_sub(1);
+                    pos += 1;
+                }
+                b if b.is_ascii_whitespace() && paren_depth == 0 => {
+                    let next = Self::skip_ascii_whitespace(value, pos);
+                    if next < bytes.len() && Self::is_mysql_routine_attribute_start(value, next) {
+                        end = pos;
+                        break;
+                    }
+                    pos += 1;
+                }
+                _ => pos += 1,
+            }
+        }
+
+        let mysql_type = value[..end].trim();
+        if mysql_type.is_empty() {
+            None
+        } else {
+            Some(mysql_type)
+        }
+    }
+
+    fn is_mysql_routine_attribute_start(value: &str, pos: usize) -> bool {
+        const ATTRS: &[&str] = &[
+            "deterministic",
+            "not",
+            "contains",
+            "no",
+            "reads",
+            "modifies",
+            "sql",
+            "comment",
+            "language",
+            "begin",
+        ];
+        ATTRS
+            .iter()
+            .any(|keyword| Self::starts_with_keyword(value, pos, keyword))
+    }
+
+    fn convert_mysql_routine_body(body: &str) -> String {
+        let body = Self::mysql_backticks_to_dameng_quotes(body.trim());
+        let body = Self::convert_mysql_set_assignments(body.as_str());
+        let mut body = body.trim_end().to_string();
+        if !body.ends_with(';') {
+            body.push(';');
+        }
+        body
+    }
+
+    fn convert_mysql_set_assignments(body: &str) -> String {
+        body.lines()
+            .map(Self::convert_mysql_set_assignment_line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn convert_mysql_set_assignment_line(line: &str) -> String {
+        let leading_len = line.len() - line.trim_start().len();
+        let leading = &line[..leading_len];
+        let trimmed = &line[leading_len..];
+        if !Self::starts_with_keyword(trimmed, 0, "SET") {
+            return line.to_string();
+        }
+        let rest = trimmed["SET".len()..].trim_start();
+        if Self::split_top_level_commas(rest).len() > 1 {
+            return line.to_string();
+        }
+        let Some(eq_pos) = Self::find_char_outside_quotes(rest, '=') else {
+            return line.to_string();
+        };
+        let lhs = rest[..eq_pos].trim();
+        if lhs.is_empty() || lhs.contains(char::is_whitespace) || lhs.contains(',') {
+            return line.to_string();
+        }
+        format!("{}{} :={}", leading, lhs, &rest[eq_pos + 1..])
+    }
+
+    fn mysql_backticks_to_dameng_quotes(value: &str) -> String {
+        let mut result = String::with_capacity(value.len());
+        let mut chars = value.chars().peekable();
+        let mut quote: Option<char> = None;
+        while let Some(ch) = chars.next() {
+            if let Some(quote_char) = quote {
+                result.push(ch);
+                if ch == '\\' && quote_char == '\'' {
+                    if let Some(next) = chars.next() {
+                        result.push(next);
+                    }
+                    continue;
+                }
+                if ch == quote_char {
+                    if chars.peek() == Some(&quote_char) {
+                        result.push(chars.next().unwrap());
+                    } else {
+                        quote = None;
+                    }
+                }
+                continue;
+            }
+
+            match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    result.push(ch);
+                }
+                '`' => {
+                    let mut ident = String::new();
+                    while let Some(inner) = chars.next() {
+                        if inner == '`' {
+                            if chars.peek() == Some(&'`') {
+                                ident.push('`');
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        } else {
+                            ident.push(inner);
+                        }
+                    }
+                    result.push_str(Self::quote_ident(ident.as_str()).as_str());
+                }
+                _ => result.push(ch),
+            }
+        }
+        result
+    }
+
+    fn take_mysql_identifier(value: &str, start: usize) -> Option<(String, usize)> {
+        let bytes = value.as_bytes();
+        let first = *bytes.get(start)?;
+        if matches!(first, b'`' | b'"') {
+            let quote = first;
+            let mut pos = start + 1;
+            let mut ident = String::new();
+            while pos < bytes.len() {
+                let byte = bytes[pos];
+                if byte == quote {
+                    if bytes.get(pos + 1) == Some(&quote) {
+                        ident.push(quote as char);
+                        pos += 2;
+                    } else {
+                        return Some((ident, pos + 1));
+                    }
+                } else {
+                    ident.push(value[pos..].chars().next()?);
+                    pos += value[pos..].chars().next()?.len_utf8();
+                }
+            }
+            return None;
+        }
+
+        let mut pos = start;
+        while pos < bytes.len() {
+            let byte = bytes[pos];
+            if byte.is_ascii_whitespace() || matches!(byte, b'.' | b'(' | b')' | b',') {
+                break;
+            }
+            pos += 1;
+        }
+        if pos == start {
+            None
+        } else {
+            Some((value[start..pos].to_string(), pos))
+        }
+    }
+
+    fn take_ascii_word(value: &str, start: usize) -> Option<(&str, usize)> {
+        let bytes = value.as_bytes();
+        let mut pos = start;
+        while pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
+            pos += 1;
+        }
+        if pos == start {
+            None
+        } else {
+            Some((&value[start..pos], pos))
+        }
+    }
+
+    fn find_matching_paren(value: &str, open_pos: usize) -> Option<usize> {
+        if value.as_bytes().get(open_pos) != Some(&b'(') {
+            return None;
+        }
+        let bytes = value.as_bytes();
+        let mut quote = None;
+        let mut depth = 0u32;
+        let mut pos = open_pos;
+        while pos < bytes.len() {
+            let byte = bytes[pos];
+            if let Some(quote_byte) = quote {
+                if byte == quote_byte {
+                    if bytes.get(pos + 1) == Some(&quote_byte) {
+                        pos += 2;
+                    } else {
+                        quote = None;
+                        pos += 1;
+                    }
+                } else {
+                    pos += 1;
+                }
+                continue;
+            }
+            match byte {
+                b'\'' | b'"' | b'`' => {
+                    quote = Some(byte);
+                    pos += 1;
+                }
+                b'(' => {
+                    depth += 1;
+                    pos += 1;
+                }
+                b')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(pos);
+                    }
+                    pos += 1;
+                }
+                _ => pos += 1,
+            }
+        }
+        None
+    }
+
+    fn split_top_level_commas(value: &str) -> Vec<&str> {
+        let bytes = value.as_bytes();
+        let mut result = Vec::new();
+        let mut quote = None;
+        let mut paren_depth = 0u32;
+        let mut start = 0usize;
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            let byte = bytes[pos];
+            if let Some(quote_byte) = quote {
+                if byte == quote_byte {
+                    if bytes.get(pos + 1) == Some(&quote_byte) {
+                        pos += 2;
+                    } else {
+                        quote = None;
+                        pos += 1;
+                    }
+                } else {
+                    pos += 1;
+                }
+                continue;
+            }
+            match byte {
+                b'\'' | b'"' | b'`' => {
+                    quote = Some(byte);
+                    pos += 1;
+                }
+                b'(' => {
+                    paren_depth += 1;
+                    pos += 1;
+                }
+                b')' => {
+                    paren_depth = paren_depth.saturating_sub(1);
+                    pos += 1;
+                }
+                b',' if paren_depth == 0 => {
+                    result.push(&value[start..pos]);
+                    start = pos + 1;
+                    pos += 1;
+                }
+                _ => pos += 1,
+            }
+        }
+        result.push(&value[start..]);
+        result
+    }
+
+    fn find_char_outside_quotes(value: &str, target: char) -> Option<usize> {
+        let mut quote = None;
+        let mut chars = value.char_indices().peekable();
+        while let Some((idx, ch)) = chars.next() {
+            if let Some(quote_char) = quote {
+                if ch == '\\' && quote_char == '\'' {
+                    chars.next();
+                    continue;
+                }
+                if ch == quote_char {
+                    if chars.peek().is_some_and(|(_, next)| *next == quote_char) {
+                        chars.next();
+                    } else {
+                        quote = None;
+                    }
+                }
+                continue;
+            }
+            match ch {
+                '\'' | '"' | '`' => quote = Some(ch),
+                _ if ch == target => return Some(idx),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn dameng_routine_param_name(name: &str) -> String {
+        if Self::is_safe_unquoted_identifier(name) {
+            name.to_string()
+        } else {
+            Self::quote_ident(name)
+        }
+    }
+
+    fn is_safe_unquoted_identifier(name: &str) -> bool {
+        let mut chars = name.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if !first.is_ascii_alphabetic() && first != '_' {
+            return false;
+        }
+        chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
+    }
+
+    fn sql_preview(sql: &str) -> String {
+        let mut compact = sql
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if compact.len() > 500 {
+            compact.truncate(500);
+            compact.push_str("...");
+        }
+        compact
     }
 
     async fn ensure_table(&self, schema: &str, table_info: &TableInfoVo) -> Result<(), String> {
@@ -1123,6 +1775,10 @@ impl DamengSink {
                 Self::quote_ident(table_name)
             )
         }
+    }
+
+    fn qualified_routine(schema: &str, routine_name: &str) -> String {
+        Self::qualified_table(schema, routine_name)
     }
 
     fn foreign_key_sql(schema: &str, foreign_key: &ForeignKeyInfo) -> Option<String> {
@@ -2672,7 +3328,7 @@ impl DamengSink {
 
 #[cfg(test)]
 mod tests {
-    use common::{ForeignKeyInfo, TableInfoVo, Value};
+    use common::{ForeignKeyInfo, MySqlRoutineDefinition, MySqlRoutineKind, TableInfoVo, Value};
     use dameng::ToDmValue;
     use dameng_types::DmValue;
     use std::collections::HashMap;
@@ -2724,6 +3380,71 @@ mod tests {
         assert_eq!(
             DamengSink::target_table_key("TARGET_SCHEMA", "orders"),
             "TARGET_SCHEMA.orders"
+        );
+    }
+
+    #[test]
+    fn routine_exists_sql_quotes_schema_kind_and_name() {
+        assert_eq!(
+            DamengSink::dameng_routine_exists_sql(
+                "target_schema",
+                MySqlRoutineKind::Function,
+                "calc`demo"
+            ),
+            "SELECT COUNT(*) FROM ALL_OBJECTS WHERE (OWNER = 'target_schema' OR OWNER = 'TARGET_SCHEMA') AND OBJECT_TYPE = 'FUNCTION' AND (OBJECT_NAME = 'calc`demo' OR OBJECT_NAME = 'CALC`DEMO')"
+        );
+        assert_eq!(
+            DamengSink::dameng_routine_exists_sql("", MySqlRoutineKind::Procedure, "sync_demo"),
+            "SELECT COUNT(*) FROM USER_OBJECTS WHERE OBJECT_TYPE = 'PROCEDURE' AND (OBJECT_NAME = 'sync_demo' OR OBJECT_NAME = 'SYNC_DEMO')"
+        );
+    }
+
+    #[test]
+    fn converts_mysql_procedure_to_dameng_routine() {
+        let routine = MySqlRoutineDefinition {
+            kind: MySqlRoutineKind::Procedure,
+            name: "sync_demo".to_string(),
+            create_sql: "CREATE PROCEDURE `sync_demo`(IN p_id bigint unsigned, OUT p_name varchar(50)) BEGIN\n SET p_name = CONCAT('id:', p_id);\n SELECT `name` FROM `orders` WHERE `id` = p_id;\nEND".to_string(),
+            sql_mode: String::new(),
+        };
+
+        let sql = DamengSink::convert_mysql_routine_to_dameng("target_schema", &routine).unwrap();
+
+        assert!(sql.starts_with(
+            "CREATE OR REPLACE PROCEDURE \"target_schema\".\"sync_demo\"(p_id IN DECIMAL(20,0), p_name OUT VARCHAR(50 CHAR))\nAS\nBEGIN"
+        ));
+        assert!(sql.contains("p_name := CONCAT('id:', p_id);"));
+        assert!(sql.contains("SELECT \"name\" FROM \"orders\" WHERE \"id\" = p_id;"));
+        assert!(sql.ends_with("END;"));
+    }
+
+    #[test]
+    fn converts_mysql_function_to_dameng_routine() {
+        let routine = MySqlRoutineDefinition {
+            kind: MySqlRoutineKind::Function,
+            name: "calc_name".to_string(),
+            create_sql: "CREATE FUNCTION `calc_name`(p_name varchar(50)) RETURNS varchar(50) DETERMINISTIC READS SQL DATA BEGIN RETURN CONCAT(p_name, 'x'); END".to_string(),
+            sql_mode: String::new(),
+        };
+
+        let sql = DamengSink::convert_mysql_routine_to_dameng("target_schema", &routine).unwrap();
+
+        assert!(sql.starts_with(
+            "CREATE OR REPLACE FUNCTION \"target_schema\".\"calc_name\"(p_name IN VARCHAR(50 CHAR))\nRETURN VARCHAR(50 CHAR)\nAS\nBEGIN"
+        ));
+        assert!(sql.contains("RETURN CONCAT(p_name, 'x');"));
+        assert!(sql.ends_with("END;"));
+    }
+
+    #[test]
+    fn routine_set_assignment_conversion_skips_multi_assignment() {
+        assert_eq!(
+            DamengSink::convert_mysql_set_assignment_line(" SET p_name = CONCAT('id:', p_id);"),
+            " p_name := CONCAT('id:', p_id);"
+        );
+        assert_eq!(
+            DamengSink::convert_mysql_set_assignment_line(" SET a = 1, b = 2;"),
+            " SET a = 1, b = 2;"
         );
     }
 

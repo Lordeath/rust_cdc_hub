@@ -9,28 +9,23 @@ use common::schema::{
     mysql_type_token_from_column_definition, normalize_mysql_column_type_token,
 };
 use common::{
-    CdcConfig, DataBuffer, FlushByOperation, ForeignKeyInfo, Operation, Sink, TableInfoVo, Value,
-    database_table_key, get_mysql_pool_by_url, mysql_connection_url_from_config,
-    mysql_row_text_value,
+    CdcConfig, DataBuffer, FlushByOperation, ForeignKeyInfo, MySqlRoutineDefinition,
+    MySqlRoutineKind, Operation, Sink, TableInfoVo, Value, database_table_key,
+    fetch_mysql_routines, get_mysql_pool_by_url, mysql_connection_url_from_config,
+    mysql_row_text_value, mysql_utf8mb4_string_expr,
 };
-use sqlx::mysql::{MySqlArguments, MySqlQueryResult, MySqlRow};
+#[cfg(test)]
+use common::{show_create_mysql_routine_sql, strip_create_routine_definer};
+use sqlx::mysql::{MySqlArguments, MySqlQueryResult};
 use sqlx::query::Query;
 use sqlx::{Executor, MySql, Pool, Row};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
-use std::fmt::Write as _;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tracing::log::trace;
 use tracing::{debug, error, info};
-
-#[derive(Debug, Clone)]
-struct MySqlRoutineDefinition {
-    name: String,
-    create_sql: String,
-    sql_mode: String,
-}
 
 pub struct MySqlSink {
     primary_database: String,
@@ -78,9 +73,9 @@ impl MySqlSink {
         }
 
         if config.sync_stored_procedure_enabled() {
-            Self::sync_stored_procedures(config, &target_pools, primary_database.as_str())
+            Self::sync_stored_routines(config, &target_pools, primary_database.as_str())
                 .await
-                .unwrap_or_else(|e| panic!("MySQL sync stored procedure failed: {}", e));
+                .unwrap_or_else(|e| panic!("MySQL sync stored routines failed: {}", e));
         }
 
         let mut target_tables: HashMap<String, TableInfoVo> = HashMap::new();
@@ -513,7 +508,7 @@ impl MySqlSink {
         Self::qualified_table_name(database, routine_name)
     }
 
-    async fn sync_stored_procedures(
+    async fn sync_stored_routines(
         config: &CdcConfig,
         target_pools: &HashMap<String, Pool<MySql>>,
         primary_database: &str,
@@ -542,25 +537,26 @@ impl MySqlSink {
                 Some(source_database),
             );
             let source_pool =
-                get_mysql_pool_by_url(&source_url, "mysql sink 同步存储过程-读取源库存储过程")
+                get_mysql_pool_by_url(&source_url, "mysql sink 同步存储程序-读取源库存储程序")
                     .await?;
-            let routines = Self::fetch_source_stored_procedures(&source_pool, source_database)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "fetch source stored procedures failed: {} {}",
-                        source_database, e
-                    )
-                })?;
+            let routines = fetch_mysql_routines(
+                &source_pool,
+                source_database,
+                &[MySqlRoutineKind::Function, MySqlRoutineKind::Procedure],
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "fetch source stored routines failed: {} {}",
+                    source_database, e
+                )
+            })?;
             if routines.is_empty() {
-                info!(
-                    "MySQL source stored procedure not found: {}",
-                    source_database
-                );
+                info!("MySQL source stored routine not found: {}", source_database);
                 continue;
             }
             for routine in routines {
-                Self::sync_one_stored_procedure(
+                Self::sync_one_stored_routine(
                     target_pool,
                     source_database,
                     target_database.as_str(),
@@ -573,95 +569,42 @@ impl MySqlSink {
         Ok(())
     }
 
-    async fn fetch_source_stored_procedures(
-        source_pool: &Pool<MySql>,
-        source_database: &str,
-    ) -> Result<Vec<MySqlRoutineDefinition>, String> {
-        let routine_sql = format!(
-            r#"
-            SELECT ROUTINE_NAME
-            FROM information_schema.ROUTINES
-            WHERE ROUTINE_SCHEMA = {}
-              AND ROUTINE_TYPE = 'PROCEDURE'
-            ORDER BY ROUTINE_NAME
-            "#,
-            Self::mysql_utf8mb4_string_expr(source_database)
-        );
-        let routine_rows = sqlx::raw_sql(routine_sql.as_str())
-            .fetch_all(source_pool)
-            .await
-            .map_err(|e| format!("{}: {}", routine_sql, e))?;
-
-        let mut routines = Vec::with_capacity(routine_rows.len());
-        for row in routine_rows {
-            let name = mysql_row_text_value(&row, "ROUTINE_NAME");
-            let show_sql = Self::show_create_procedure_sql(source_database, name.as_str());
-            let create_row = sqlx::raw_sql(show_sql.as_str())
-                .fetch_one(source_pool)
-                .await
-                .map_err(|e| format!("{}: {}", show_sql, e))?;
-            routines.push(Self::parse_show_create_procedure_row(&name, &create_row)?);
-        }
-        Ok(routines)
-    }
-
+    #[cfg(test)]
     fn show_create_procedure_sql(source_database: &str, routine_name: &str) -> String {
-        format!(
-            "SHOW CREATE PROCEDURE {}",
-            Self::qualified_routine_name(source_database, routine_name)
-        )
+        show_create_mysql_routine_sql(source_database, MySqlRoutineKind::Procedure, routine_name)
     }
 
     fn mysql_utf8mb4_string_expr(value: &str) -> String {
-        if value.is_empty() {
-            return "''".to_string();
-        }
-        let mut sql = String::with_capacity("CONVERT(0x USING utf8mb4)".len() + value.len() * 2);
-        sql.push_str("CONVERT(0x");
-        for byte in value.as_bytes() {
-            let _ = write!(&mut sql, "{:02X}", byte);
-        }
-        sql.push_str(" USING utf8mb4)");
-        sql
+        mysql_utf8mb4_string_expr(value)
     }
 
-    fn parse_show_create_procedure_row(
-        fallback_name: &str,
-        row: &MySqlRow,
-    ) -> Result<MySqlRoutineDefinition, String> {
-        let name = row
-            .try_get::<String, _>("Procedure")
-            .or_else(|_| row.try_get::<String, _>(0))
-            .unwrap_or_else(|_| fallback_name.to_string());
-        let sql_mode = row
-            .try_get::<String, _>("sql_mode")
-            .or_else(|_| row.try_get::<String, _>(1))
-            .unwrap_or_default();
-        let create_sql = row
-            .try_get::<String, _>("Create Procedure")
-            .or_else(|_| row.try_get::<String, _>(2))
-            .map_err(|e| format!("SHOW CREATE PROCEDURE 读取 Create Procedure 失败: {}", e))?;
-        Ok(MySqlRoutineDefinition {
-            name,
-            create_sql: Self::strip_create_procedure_definer(create_sql.as_str()),
-            sql_mode,
-        })
+    #[cfg(test)]
+    fn strip_create_procedure_definer(create_sql: &str) -> String {
+        strip_create_routine_definer(create_sql, MySqlRoutineKind::Procedure)
     }
 
-    async fn sync_one_stored_procedure(
+    async fn sync_one_stored_routine(
         target_pool: &Pool<MySql>,
         source_database: &str,
         target_database: &str,
         routine: &MySqlRoutineDefinition,
         overwrite: bool,
     ) -> Result<(), String> {
-        let exists =
-            Self::target_stored_procedure_exists(target_pool, target_database, &routine.name)
-                .await?;
+        let exists = Self::target_stored_routine_exists(
+            target_pool,
+            target_database,
+            routine.kind,
+            &routine.name,
+        )
+        .await?;
         if exists && !overwrite {
             info!(
-                "MySQL stored procedure exists, skip: {}.{} -> {}.{}",
-                source_database, routine.name, target_database, routine.name
+                "MySQL stored routine exists, skip: {} {}.{} -> {}.{}",
+                routine.kind.routine_type(),
+                source_database,
+                routine.name,
+                target_database,
+                routine.name
             );
             return Ok(());
         }
@@ -693,7 +636,8 @@ impl MySqlSink {
                 .map_err(|e| e.to_string())?;
             if exists {
                 let drop_sql = format!(
-                    "DROP PROCEDURE IF EXISTS {}",
+                    "DROP {} IF EXISTS {}",
+                    routine.kind.routine_type(),
                     Self::qualified_routine_name(target_database, routine.name.as_str())
                 );
                 sqlx::raw_sql(drop_sql.as_str())
@@ -706,8 +650,11 @@ impl MySqlSink {
                 .await
                 .map_err(|e| {
                     format!(
-                        "create stored procedure failed: {}.{} {}",
-                        target_database, routine.name, e
+                        "create stored routine failed: {} {}.{} {}",
+                        routine.kind.routine_type(),
+                        target_database,
+                        routine.name,
+                        e
                     )
                 })
         }
@@ -733,15 +680,21 @@ impl MySqlSink {
             }
         }
         info!(
-            "MySQL sync stored procedure success: {}.{} -> {}.{} overwrite={}",
-            source_database, routine.name, target_database, routine.name, overwrite
+            "MySQL sync stored routine success: {} {}.{} -> {}.{} overwrite={}",
+            routine.kind.routine_type(),
+            source_database,
+            routine.name,
+            target_database,
+            routine.name,
+            overwrite
         );
         Ok(())
     }
 
-    async fn target_stored_procedure_exists(
+    async fn target_stored_routine_exists(
         target_pool: &Pool<MySql>,
         target_database: &str,
+        routine_kind: MySqlRoutineKind,
         routine_name: &str,
     ) -> Result<bool, String> {
         let sql = format!(
@@ -749,10 +702,11 @@ impl MySqlSink {
             SELECT COUNT(*) AS cnt
             FROM information_schema.ROUTINES
             WHERE ROUTINE_SCHEMA = {}
-              AND ROUTINE_TYPE = 'PROCEDURE'
+              AND ROUTINE_TYPE = '{}'
               AND ROUTINE_NAME = {}
             "#,
             Self::mysql_utf8mb4_string_expr(target_database),
+            routine_kind.routine_type(),
             Self::mysql_utf8mb4_string_expr(routine_name)
         );
         let row = sqlx::raw_sql(sql.as_str())
@@ -766,90 +720,6 @@ impl MySqlSink {
             .or_else(|_| row.try_get::<u64, _>(0).map(|v| v as i64))
             .unwrap_or(0);
         Ok(count > 0)
-    }
-
-    fn strip_create_procedure_definer(create_sql: &str) -> String {
-        let sql = create_sql.trim_start();
-        if !Self::starts_with_keyword(sql, 0, "CREATE") {
-            return create_sql.to_string();
-        }
-        let mut pos = Self::skip_ascii_whitespace(sql, "CREATE".len());
-        if !Self::starts_with_keyword(sql, pos, "DEFINER") {
-            return create_sql.to_string();
-        }
-        pos = Self::skip_ascii_whitespace(sql, pos + "DEFINER".len());
-        if sql.as_bytes().get(pos) != Some(&b'=') {
-            return create_sql.to_string();
-        }
-        let Some(routine_keyword_pos) =
-            Self::find_keyword_outside_quotes(sql, pos + 1, "PROCEDURE")
-        else {
-            return create_sql.to_string();
-        };
-        format!("CREATE {}", sql[routine_keyword_pos..].trim_start())
-    }
-
-    fn skip_ascii_whitespace(value: &str, mut pos: usize) -> usize {
-        while value
-            .as_bytes()
-            .get(pos)
-            .is_some_and(|byte| byte.is_ascii_whitespace())
-        {
-            pos += 1;
-        }
-        pos
-    }
-
-    fn starts_with_keyword(value: &str, pos: usize, keyword: &str) -> bool {
-        let bytes = value.as_bytes();
-        let keyword_bytes = keyword.as_bytes();
-        if pos + keyword_bytes.len() > bytes.len() {
-            return false;
-        }
-        if !bytes[pos..pos + keyword_bytes.len()].eq_ignore_ascii_case(keyword_bytes) {
-            return false;
-        }
-        let before_ok = pos == 0 || !Self::is_ascii_identifier_byte(bytes[pos - 1]);
-        let after_pos = pos + keyword_bytes.len();
-        let after_ok =
-            after_pos >= bytes.len() || !Self::is_ascii_identifier_byte(bytes[after_pos]);
-        before_ok && after_ok
-    }
-
-    fn find_keyword_outside_quotes(value: &str, start: usize, keyword: &str) -> Option<usize> {
-        let bytes = value.as_bytes();
-        let mut quote = None;
-        let mut pos = start;
-        while pos < bytes.len() {
-            let byte = bytes[pos];
-            if let Some(quote_byte) = quote {
-                if byte == quote_byte {
-                    if bytes.get(pos + 1) == Some(&quote_byte) {
-                        pos += 2;
-                    } else {
-                        quote = None;
-                        pos += 1;
-                    }
-                } else {
-                    pos += 1;
-                }
-                continue;
-            }
-            if matches!(byte, b'`' | b'\'' | b'"') {
-                quote = Some(byte);
-                pos += 1;
-                continue;
-            }
-            if Self::starts_with_keyword(value, pos, keyword) {
-                return Some(pos);
-            }
-            pos += 1;
-        }
-        None
-    }
-
-    fn is_ascii_identifier_byte(byte: u8) -> bool {
-        byte.is_ascii_alphanumeric() || byte == b'_'
     }
 
     fn validate_merged_target_schema(table_info_list: &[TableInfoVo]) -> Result<(), String> {
