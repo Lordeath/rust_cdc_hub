@@ -442,6 +442,7 @@ To add a new Source or Sink:
 - [ ] Split task operation records: persist sync checks, dry-runs, SQL generation events, confirmations, and operator notes
 - [ ] Generic command plugin for optional config cutover, service restart, notifications, and other external actions
 - [ ] Dameng Sink support: prioritize writing MySQL CDC events into Dameng, including connectivity, type mapping, DDL compatibility, and sync validation
+- [ ] Dameng Source support: support Dameng as a source database, covering change capture, schema introspection, type mapping, and checkpoint resume
 - [ ] More complete DDL synchronization: MODIFY/DROP/RENAME and more
 - [ ] Multi-target fan-out or table-based routing
 - [ ] Failure bypass and replay: DLQ, error classification, exponential backoff
