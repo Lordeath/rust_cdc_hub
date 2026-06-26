@@ -72,6 +72,12 @@ struct MysqlRoutineSignature {
     after_params: String,
 }
 
+#[derive(Debug)]
+struct DamengRoutineBody {
+    declarations: Vec<String>,
+    body: String,
+}
+
 pub struct DamengSink {
     client: Mutex<Client>,
     host: String,
@@ -503,19 +509,27 @@ impl DamengSink {
         let body_pos =
             Self::find_keyword_outside_quotes(signature.after_params.as_str(), 0, "BEGIN")
                 .ok_or_else(|| "routine body BEGIN not found".to_string())?;
-        let body = Self::convert_mysql_routine_body(&signature.after_params[body_pos..]);
+        let body = Self::convert_mysql_routine_body(
+            &signature.after_params[body_pos..],
+            routine.sql_mode.as_str(),
+        );
+        let declaration_sql = if body.declarations.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", body.declarations.join("\n"))
+        };
         let qualified_name = Self::qualified_routine(target_schema, signature.name.as_str());
         match routine.kind {
             MySqlRoutineKind::Procedure => Ok(format!(
-                "CREATE OR REPLACE PROCEDURE {}{}\nAS\n{}",
-                qualified_name, params_sql, body
+                "CREATE OR REPLACE PROCEDURE {}{}\nAS\n{}{}",
+                qualified_name, params_sql, declaration_sql, body.body
             )),
             MySqlRoutineKind::Function => {
                 let return_type =
                     Self::mysql_function_return_type(&signature.after_params[..body_pos])?;
                 Ok(format!(
-                    "CREATE OR REPLACE FUNCTION {}{}\nRETURN {}\nAS\n{}",
-                    qualified_name, params_sql, return_type, body
+                    "CREATE OR REPLACE FUNCTION {}{}\nRETURN {}\nAS\n{}{}",
+                    qualified_name, params_sql, return_type, declaration_sql, body.body
                 ))
             }
         }
@@ -686,14 +700,63 @@ impl DamengSink {
             .any(|keyword| Self::starts_with_keyword(value, pos, keyword))
     }
 
-    fn convert_mysql_routine_body(body: &str) -> String {
-        let body = Self::mysql_backticks_to_dameng_quotes(body.trim());
+    fn convert_mysql_routine_body(body: &str, sql_mode: &str) -> DamengRoutineBody {
+        let (declarations, body) = Self::extract_mysql_routine_declarations(body.trim());
+        let declarations = declarations
+            .into_iter()
+            .map(|declaration| {
+                format!(
+                    "    {}",
+                    Self::convert_mysql_sql_tokens(declaration.as_str(), sql_mode)
+                )
+            })
+            .collect::<Vec<_>>();
+        let body = Self::convert_mysql_sql_tokens(body.as_str(), sql_mode);
         let body = Self::convert_mysql_set_assignments(body.as_str());
         let mut body = body.trim_end().to_string();
         if !body.ends_with(';') {
             body.push(';');
         }
-        body
+        DamengRoutineBody { declarations, body }
+    }
+
+    fn extract_mysql_routine_declarations(body: &str) -> (Vec<String>, String) {
+        let body = body.trim_start();
+        if !Self::starts_with_keyword(body, 0, "BEGIN") {
+            return (Vec::new(), body.to_string());
+        }
+
+        let after_begin = &body["BEGIN".len()..];
+        let mut pos = 0usize;
+        let mut declarations = Vec::new();
+        loop {
+            pos = Self::skip_ascii_whitespace(after_begin, pos);
+            if !Self::starts_with_keyword(after_begin, pos, "DECLARE") {
+                break;
+            }
+            let Some(stmt_end) = Self::find_statement_semicolon_outside_quotes(after_begin, pos)
+            else {
+                break;
+            };
+            let declaration = after_begin[pos + "DECLARE".len()..=stmt_end].trim();
+            if declaration.is_empty() {
+                break;
+            }
+            declarations.push(declaration.to_string());
+            pos = stmt_end + 1;
+        }
+
+        if declarations.is_empty() {
+            return (declarations, body.to_string());
+        }
+
+        let remaining = after_begin[pos..].trim_start();
+        let body = if remaining.is_empty() {
+            "BEGIN\nEND".to_string()
+        } else {
+            format!("BEGIN\n{}", remaining)
+        };
+        (declarations, body)
     }
 
     fn convert_mysql_set_assignments(body: &str) -> String {
@@ -724,7 +787,13 @@ impl DamengSink {
         format!("{}{} :={}", leading, lhs, &rest[eq_pos + 1..])
     }
 
-    fn mysql_backticks_to_dameng_quotes(value: &str) -> String {
+    fn convert_mysql_sql_tokens(value: &str, sql_mode: &str) -> String {
+        let value = Self::convert_mysql_quotes_to_dameng(value, sql_mode);
+        Self::convert_mysql_now_calls(value.as_str())
+    }
+
+    fn convert_mysql_quotes_to_dameng(value: &str, sql_mode: &str) -> String {
+        let ansi_quotes = Self::mysql_sql_mode_has_ansi_quotes(sql_mode);
         let mut result = String::with_capacity(value.len());
         let mut chars = value.chars().peekable();
         let mut quote: Option<char> = None;
@@ -748,9 +817,17 @@ impl DamengSink {
             }
 
             match ch {
-                '\'' | '"' => {
+                '\'' => {
                     quote = Some(ch);
                     result.push(ch);
+                }
+                '"' if ansi_quotes => {
+                    quote = Some(ch);
+                    result.push(ch);
+                }
+                '"' => {
+                    let literal = Self::take_mysql_double_quoted_string(&mut chars);
+                    result.push_str(Self::quote_literal(literal.as_str()).as_str());
                 }
                 '`' => {
                     let mut ident = String::new();
@@ -772,6 +849,131 @@ impl DamengSink {
             }
         }
         result
+    }
+
+    fn mysql_sql_mode_has_ansi_quotes(sql_mode: &str) -> bool {
+        sql_mode
+            .split(',')
+            .any(|mode| mode.trim().eq_ignore_ascii_case("ANSI_QUOTES"))
+    }
+
+    fn take_mysql_double_quoted_string<I>(chars: &mut std::iter::Peekable<I>) -> String
+    where
+        I: Iterator<Item = char>,
+    {
+        let mut literal = String::new();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                if let Some(next) = chars.next() {
+                    literal.push(next);
+                }
+                continue;
+            }
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    literal.push('"');
+                    chars.next();
+                    continue;
+                }
+                break;
+            }
+            literal.push(ch);
+        }
+        literal
+    }
+
+    fn convert_mysql_now_calls(value: &str) -> String {
+        let bytes = value.as_bytes();
+        let mut result = String::with_capacity(value.len());
+        let mut quote = None;
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            let byte = bytes[pos];
+            if let Some(quote_byte) = quote {
+                let ch = value[pos..].chars().next().unwrap();
+                result.push(ch);
+                if byte == b'\\' && quote_byte == b'\'' {
+                    pos += ch.len_utf8();
+                    if pos < bytes.len() {
+                        let next = value[pos..].chars().next().unwrap();
+                        result.push(next);
+                        pos += next.len_utf8();
+                    }
+                    continue;
+                }
+                if byte == quote_byte {
+                    if bytes.get(pos + 1) == Some(&quote_byte) {
+                        result.push(quote_byte as char);
+                        pos += 2;
+                    } else {
+                        quote = None;
+                        pos += ch.len_utf8();
+                    }
+                } else {
+                    pos += ch.len_utf8();
+                }
+                continue;
+            }
+
+            if matches!(byte, b'\'' | b'"') {
+                quote = Some(byte);
+                result.push(byte as char);
+                pos += 1;
+                continue;
+            }
+
+            if Self::starts_with_keyword(value, pos, "now") {
+                let after_keyword = Self::skip_ascii_whitespace(value, pos + "now".len());
+                if bytes.get(after_keyword) == Some(&b'(') {
+                    let after_open = Self::skip_ascii_whitespace(value, after_keyword + 1);
+                    if bytes.get(after_open) == Some(&b')') {
+                        result.push_str("CURRENT_TIMESTAMP");
+                        pos = after_open + 1;
+                        continue;
+                    }
+                }
+            }
+
+            let ch = value[pos..].chars().next().unwrap();
+            result.push(ch);
+            pos += ch.len_utf8();
+        }
+        result
+    }
+
+    fn find_statement_semicolon_outside_quotes(value: &str, start: usize) -> Option<usize> {
+        let bytes = value.as_bytes();
+        let mut quote = None;
+        let mut pos = start;
+        while pos < bytes.len() {
+            let byte = bytes[pos];
+            if let Some(quote_byte) = quote {
+                if byte == b'\\' && quote_byte == b'\'' {
+                    pos = (pos + 2).min(bytes.len());
+                    continue;
+                }
+                if byte == quote_byte {
+                    if bytes.get(pos + 1) == Some(&quote_byte) {
+                        pos += 2;
+                    } else {
+                        quote = None;
+                        pos += 1;
+                    }
+                } else {
+                    pos += 1;
+                }
+                continue;
+            }
+            match byte {
+                b'\'' | b'"' | b'`' => {
+                    quote = Some(byte);
+                    pos += 1;
+                }
+                b';' => return Some(pos),
+                _ => pos += 1,
+            }
+        }
+        None
     }
 
     fn take_mysql_identifier(value: &str, start: usize) -> Option<(String, usize)> {
@@ -3434,6 +3636,55 @@ mod tests {
         ));
         assert!(sql.contains("RETURN CONCAT(p_name, 'x');"));
         assert!(sql.ends_with("END;"));
+    }
+
+    #[test]
+    fn converts_mysql_routine_declarations_and_literals() {
+        let routine = MySqlRoutineDefinition {
+            kind: MySqlRoutineKind::Procedure,
+            name: "addAll_ns_canal_config_item_4".to_string(),
+            create_sql: r#"CREATE PROCEDURE `addAll_ns_canal_config_item_4`()
+BEGIN
+    DECLARE existing_count INT DEFAULT 0;
+
+    -- 检查是否存在相同 id 的记录
+    SELECT COUNT(*) INTO existing_count
+    FROM `ns_canal_config_item`
+    WHERE `id` = 4;
+    IF existing_count = 0 THEN
+        INSERT INTO `ns_canal_config_field` VALUES (NULL, 4, 'shouldAccountBook', '', '', "", 1, now(), 'admin', now(), 'admin');
+        INSERT INTO `ns_canal_config_field` VALUES (NULL, 4, 'actualAccountBook', '', 'split,sharding', "0", 1, now(), 'admin', now(), 'admin');
+    END IF;
+END"#.to_string(),
+            sql_mode: String::new(),
+        };
+
+        let sql = DamengSink::convert_mysql_routine_to_dameng("newsee-bill-10", &routine).unwrap();
+
+        assert!(sql.contains(
+            "AS\n    existing_count INT DEFAULT 0;\nBEGIN\n-- 检查是否存在相同 id 的记录"
+        ));
+        assert!(!sql.contains("BEGIN\n    DECLARE existing_count"));
+        assert!(sql.contains("SELECT COUNT(*) INTO existing_count"));
+        assert!(sql.contains("FROM \"ns_canal_config_item\""));
+        assert!(sql.contains("'', 1, CURRENT_TIMESTAMP"));
+        assert!(sql.contains("'0', 1, CURRENT_TIMESTAMP"));
+        assert!(!sql.contains("\"0\""));
+    }
+
+    #[test]
+    fn mysql_double_quotes_follow_sql_mode() {
+        assert_eq!(
+            DamengSink::convert_mysql_sql_tokens(r#"SELECT `name`, "0", "", now(), 'now()'"#, ""),
+            r#"SELECT "name", '0', '', CURRENT_TIMESTAMP, 'now()'"#
+        );
+        assert_eq!(
+            DamengSink::convert_mysql_sql_tokens(
+                r#"SELECT `name`, "quoted_ident", now()"#,
+                "STRICT_TRANS_TABLES,ANSI_QUOTES"
+            ),
+            r#"SELECT "name", "quoted_ident", CURRENT_TIMESTAMP"#
+        );
     }
 
     #[test]
