@@ -24,6 +24,7 @@
 - `rust_cdc_hub` 是 Rust CDC 同步工具，当前重点是 MySQL source 和各类 sink，特别是 Dameng sink。
 - 运行配置由 `CONFIG_PATH` 指向 YAML/JSON。
 - Dameng 里的 `auto_create_database` 按 schema 处理；建 schema/table/字段时注意达梦大小写、引号、字符长度语义。
+- 修改 MySQL 到 Dameng 同步、DDL、类型映射或存储程序转换前，先看 `docs/mysql-to-dameng-migration-notes.md`。
 - 表过滤配置在 `source_config`：`table_name: "*"` 表示全表，排除优先看 `exclude_table_regex`、`except_table_name_prefix`。
 - 新增 source/sink 时按现有 workspace crate、factory 和 trait 模式接入。
 

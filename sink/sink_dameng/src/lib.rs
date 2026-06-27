@@ -2421,13 +2421,13 @@ impl DamengSink {
             return false;
         }
 
+        if expected_type == "CLOB" {
+            return !existing_col.data_type.eq_ignore_ascii_case("CLOB");
+        }
+
         let t = mysql_type_token.to_ascii_lowercase();
         if !t.starts_with("varchar") && !t.starts_with("char") {
             return false;
-        }
-
-        if expected_type == "CLOB" {
-            return !existing_col.data_type.eq_ignore_ascii_case("CLOB");
         }
 
         let expected_prefix = if t.starts_with("varchar") {
@@ -3770,6 +3770,23 @@ mod tests {
             "`errorMessage` varchar(50) DEFAULT NULL",
             &clob
         ));
+    }
+
+    #[test]
+    fn existing_varchar_is_modified_to_clob_for_mysql_text() {
+        let varchar = super::DamengColumnInfo {
+            data_type: "VARCHAR".to_string(),
+            data_length: 800,
+            char_length: 200,
+            default_value: None,
+        };
+
+        assert!(DamengSink::should_modify_existing_column(
+            "text",
+            "`billType` text COMMENT '票据可开类型'",
+            &varchar
+        ));
+        assert_eq!(DamengSink::dameng_modify_column_definition("text"), "CLOB");
     }
 
     #[test]
