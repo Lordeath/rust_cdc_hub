@@ -143,6 +143,8 @@ pub struct CdcConfig {
     pub sync_stored_procedure: Option<bool>,
     #[serde(alias = "overwrite_stored_procedures")]
     pub overwrite_stored_procedure: Option<bool>,
+    pub random_check_data_after_init: Option<bool>,
+    pub random_check_data_after_init_batch_size_min: Option<usize>,
     pub plugins: Option<Vec<PluginConfig>>,
     pub source_batch_size: Option<usize>,
     pub sink_batch_size: Option<usize>,
@@ -232,6 +234,16 @@ impl CdcConfig {
 
     pub fn overwrite_stored_procedure_enabled(&self) -> bool {
         self.overwrite_stored_procedure.unwrap_or(false)
+    }
+
+    pub fn random_check_data_after_init_enabled(&self) -> bool {
+        self.random_check_data_after_init.unwrap_or(false)
+    }
+
+    pub fn random_check_data_after_init_batch_size_min(&self) -> usize {
+        self.random_check_data_after_init_batch_size_min
+            .unwrap_or(10)
+            .max(1)
     }
 
     pub fn target_database_for_source(&self, source_database: &str) -> String {
@@ -841,14 +853,11 @@ pub fn mysql_row_to_hashmap(row: &MySqlRow) -> CaseInsensitiveHashMap {
                         panic!("类型转换失败: {}", column.type_info().name());
                     }
                 },
-                "BOOLEAN" => match row.try_get::<bool, _>(name.as_str()) {
-                    Ok(v) => {
-                        if v {
-                            Value::Int8(0)
-                        } else {
-                            Value::Int8(1)
-                        }
-                    }
+                "BOOLEAN" => match row
+                    .try_get::<i8, _>(name.as_str())
+                    .or_else(|_| row.try_get::<bool, _>(name.as_str()).map(i8::from))
+                {
+                    Ok(v) => Value::Int8(v),
                     Err(e) => {
                         error!("类型转换失败: {}", column.type_info().name());
                         error!("{}", e);
@@ -1680,6 +1689,8 @@ mod tests {
             sync_no_pk_table_schema: None,
             sync_stored_procedure: None,
             overwrite_stored_procedure: None,
+            random_check_data_after_init: None,
+            random_check_data_after_init_batch_size_min: None,
             plugins: None,
             source_batch_size: None,
             sink_batch_size: None,
@@ -1701,6 +1712,40 @@ mod tests {
             vec!["src_a".to_string(), "src_b".to_string()]
         );
         assert_eq!(config.target_database_for_source("src_b"), "dst_b");
+    }
+
+    #[test]
+    fn random_check_after_init_defaults_are_disabled() {
+        let config: CdcConfig = serde_json::from_str(
+            r#"{
+                "source_type": "MySQL",
+                "sink_type": "Dameng",
+                "source_config": [{}],
+                "sink_config": [{}]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!config.random_check_data_after_init_enabled());
+        assert_eq!(config.random_check_data_after_init_batch_size_min(), 10);
+    }
+
+    #[test]
+    fn random_check_after_init_batch_size_is_at_least_one() {
+        let config: CdcConfig = serde_json::from_str(
+            r#"{
+                "source_type": "MySQL",
+                "sink_type": "Dameng",
+                "source_config": [{}],
+                "sink_config": [{}],
+                "random_check_data_after_init": false,
+                "random_check_data_after_init_batch_size_min": 0
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!config.random_check_data_after_init_enabled());
+        assert_eq!(config.random_check_data_after_init_batch_size_min(), 1);
     }
 
     #[test]

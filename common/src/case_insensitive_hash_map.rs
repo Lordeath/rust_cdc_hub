@@ -33,6 +33,10 @@ impl CaseInsensitiveHashMap {
             .unwrap_or(&Value::None)
     }
 
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.map.contains_key(key.to_lowercase().as_str())
+    }
+
     pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
         self.raw_map.insert(k.clone(), v.clone());
         self.map.insert(k.to_lowercase(), v)

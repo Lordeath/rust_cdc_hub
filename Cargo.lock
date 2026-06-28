@@ -3409,6 +3409,8 @@ dependencies = [
  "dameng",
  "dameng-types",
  "mysql_to_dameng",
+ "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
 ]

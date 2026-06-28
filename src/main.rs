@@ -31,6 +31,7 @@ use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 
 const DEFAULT_UI_PORT: u16 = 18088;
+const DAMENG_RANDOM_CHECK_RESULT_FILE: &str = "/opt/fxm/datacheck-resule.log";
 
 #[cfg(target_os = "linux")]
 unsafe extern "C" {
@@ -70,6 +71,22 @@ fn ensure_default_backtrace() {
         unsafe {
             env::set_var("RUST_BACKTRACE", "1");
         }
+    }
+}
+
+fn reset_random_check_result_file_on_start(config: &CdcConfig) {
+    if !config.random_check_data_after_init_enabled() {
+        return;
+    }
+    let header = format!(
+        "START status=booting result_file={}",
+        DAMENG_RANDOM_CHECK_RESULT_FILE
+    );
+    if let Err(e) = fs::write(DAMENG_RANDOM_CHECK_RESULT_FILE, format!("{}\n", header)) {
+        warn!(
+            "Random data check result file reset failed: path={} error={}",
+            DAMENG_RANDOM_CHECK_RESULT_FILE, e
+        );
     }
 }
 
@@ -113,6 +130,8 @@ impl UiState {
             "sync_no_pk_table_schema": config.sync_no_pk_table_schema_enabled(),
             "sync_stored_procedure": config.sync_stored_procedure_enabled(),
             "overwrite_stored_procedure": config.overwrite_stored_procedure_enabled(),
+            "random_check_data_after_init": config.random_check_data_after_init_enabled(),
+            "random_check_data_after_init_batch_size_min": config.random_check_data_after_init_batch_size_min(),
             "ui_bind": config.ui_bind.clone(),
             "ui_port": config.ui_port,
             "database_split": database_split.clone(),
@@ -1944,6 +1963,7 @@ async fn main() {
         error!("{}", e);
         panic!("{}", e);
     }
+    reset_random_check_result_file_on_start(&config);
     let ui_state = UiState::new(&config);
     if config.enable_ui.unwrap_or(true) {
         let bind = config.ui_bind.clone().unwrap_or("0.0.0.0".to_string());

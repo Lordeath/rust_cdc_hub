@@ -16,10 +16,13 @@ sink_config:
     username: SYSDBA
     password: SYSDBA
     database: TARGET_SCHEMA
+    init_insert_batch_rows: 16  # 初始化数据写入时合并多行 INSERT，默认 16
 
 auto_create_database: true  # Dameng: creates target schema when missing
 auto_create_table: true
 auto_add_column: true
 sync_stored_procedure: false  # 基础转换并同步 MySQL 存储过程/函数到 Dameng
 overwrite_stored_procedure: false
+random_check_data_after_init: false
+random_check_data_after_init_batch_size_min: 10
 log_level: info

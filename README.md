@@ -133,6 +133,8 @@ export CONFIG_PATH=/path/to/config.yaml
 | `sync_no_pk_table_schema` | 否 | 是否同步不参与 CDC 的表结构，默认 `true`；包括无主键、字符串主键、复合主键和其他不支持同步主键的表。这些表只建结构、主键和可满足依赖的外键，不做初始化数据和 CDC 同步；StarRocks 目标端会跳过并告警。 |
 | `sync_stored_procedure` | 否 | MySQL → MySQL/Dameng 时是否同步源库存储过程和函数，默认 `false`；也兼容 `sync_stored_procedures`。 |
 | `overwrite_stored_procedure` | 否 | 同步存储过程/函数时，目标库已存在同名对象是否覆盖，默认 `false`；也兼容 `overwrite_stored_procedures`。 |
+| `random_check_data_after_init` | 否 | MySQL → Dameng 快速样本验证模式，默认 `false`。开启后初始化阶段每张 CDC 表只同步少量样本数据，不做完整初始化。 |
+| `random_check_data_after_init_batch_size_min` | 否 | 快速样本验证模式下每张 CDC 表同步并验证的样本行数，默认 `10`；程序会记录已同步主键，并按主键查询 MySQL 和达梦逐字段比较。 |
 | `plugins` | 否 | 插件配置列表。 |
 | `source_batch_size` | 否 | Source 批量读取/处理大小。 |
 | `sink_batch_size` | 否 | Sink 批量写入大小。 |
@@ -269,13 +271,16 @@ sink_config:
     username: SYSDBA
     password: SYSDBA
     database: TARGET_SCHEMA
+    init_insert_batch_rows: 16
 
 auto_create_database: true  # 达梦：自动创建目标 schema，不是物理数据库
 auto_create_table: true
 auto_add_column: true
+random_check_data_after_init: false
+random_check_data_after_init_batch_size_min: 10
 ```
 
-达梦是单库多模式模型，`sink_config.database`/`sink_config.schema` 会作为目标 schema 使用；开启 `auto_create_database` 时会执行 `CREATE SCHEMA`，然后切换到该 schema 再自动建表/补列。多库模式下，`database_route[].sink` 表示目标 schema，写入、建表、补列和 `IDENTITY_INSERT` 状态都会按目标 schema 隔离。
+达梦是单库多模式模型，`sink_config.database`/`sink_config.schema` 会作为目标 schema 使用；开启 `auto_create_database` 时会执行 `CREATE SCHEMA`，然后切换到该 schema 再自动建表/补列。多库模式下，`database_route[].sink` 表示目标 schema，写入、建表、补列和 `IDENTITY_INSERT` 状态都会按目标 schema 隔离。`sink_config.init_insert_batch_rows` 控制初始化数据写入时每条多行 `INSERT` 合并的行数，默认 `16`；批量写失败会退回逐行写入。开启 `random_check_data_after_init` 时，每次启动随机验证模式都会先覆盖写入 `/opt/fxm/datacheck-resule.log`，校验开始后再次覆盖并追加表级结果和字段差异。
 
 ### MySQL → Print 示例
 

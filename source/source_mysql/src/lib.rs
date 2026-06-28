@@ -107,6 +107,8 @@ struct MysqlSourceConfigDetail {
     connection_url: String,
     table_info_list: Vec<TableInfoVo>,
     batchsize: usize,
+    random_check_data_after_init: bool,
+    random_check_data_after_init_batch_size_min: usize,
     start_binlog_filename: Option<String>,
     start_binlog_position: Option<u32>,
 }
@@ -297,6 +299,9 @@ impl MysqlSourceConfig {
                 connection_url,
                 table_info_list,
                 batchsize: config.source_batch_size.unwrap_or(8192),
+                random_check_data_after_init: config.random_check_data_after_init_enabled(),
+                random_check_data_after_init_batch_size_min: config
+                    .random_check_data_after_init_batch_size_min(),
                 start_binlog_filename,
                 start_binlog_position,
             });
@@ -676,44 +681,90 @@ impl MysqlSourceConfigDetail {
         table_name: &str,
         pk_column: &str,
         cursor: &InitPkCursor,
+        limit: usize,
+        random_sample: bool,
         executor: &mut Transaction<'_, MySql>,
     ) -> Vec<DataBuffer> {
-        let where_clause = cursor
-            .sql_literal()
-            .map(|id| format!("where {} > {}", quote_mysql_identifier(pk_column), id))
-            .unwrap_or_default();
-        let sql = format!(
-            r#"
-                select *
-                FROM {}
-                {}
-                order by {}
-                limit {}
-            "#,
-            qualified_mysql_table_name(&self.database, table_name),
-            where_clause,
-            quote_mysql_identifier(pk_column),
-            self.batchsize
-        );
+        let limit = limit.max(1);
+        let table_ref = qualified_mysql_table_name(&self.database, table_name);
+        let pk_ident = quote_mysql_identifier(pk_column);
+        let mut random_start = None;
+        let sql = if random_sample {
+            let start = self
+                .random_init_pk_start(table_name, pk_column, executor)
+                .await
+                .unwrap_or_else(|| "0".to_string());
+            random_start = Some(start.clone());
+            format!(
+                r#"
+                    select *
+                    FROM {}
+                    where {} >= {}
+                    order by {}
+                    limit {}
+                "#,
+                table_ref, pk_ident, start, pk_ident, limit
+            )
+        } else {
+            let where_clause = cursor
+                .sql_literal()
+                .map(|id| format!("where {} > {}", pk_ident, id))
+                .unwrap_or_default();
+            format!(
+                r#"
+                    select *
+                    FROM {}
+                    {}
+                    order by {}
+                    limit {}
+                "#,
+                table_ref, where_clause, pk_ident, limit
+            )
+        };
         debug!(
-            "extract_init_data: [{}.{}] {} {}",
-            self.database,
-            table_name,
-            pk_column,
-            cursor.display_value()
-        );
-        // 查询 Row，而不是 HashMap
-        let rows: Vec<MySqlRow> = sqlx::query(&sql)
-            .fetch_all(&mut **executor)
-            .await
-            .expect("query failed");
-        info!(
-            "extract_init_data: [{}.{}] {} {} {} rows",
+            "extract_init_data: [{}.{}] {} {} random_sample={}",
             self.database,
             table_name,
             pk_column,
             cursor.display_value(),
-            rows.len()
+            random_sample
+        );
+        // 查询 Row，而不是 HashMap
+        let mut rows: Vec<MySqlRow> = sqlx::query(&sql)
+            .fetch_all(&mut **executor)
+            .await
+            .expect("query failed");
+        if random_sample && rows.len() < limit {
+            if let Some(start) = random_start.as_deref() {
+                let wrap_sql = format!(
+                    r#"
+                        select *
+                        FROM {}
+                        where {} < {}
+                        order by {}
+                        limit {}
+                    "#,
+                    table_ref,
+                    pk_ident,
+                    start,
+                    pk_ident,
+                    limit.saturating_sub(rows.len())
+                );
+                let wrap_rows: Vec<MySqlRow> = sqlx::query(&wrap_sql)
+                    .fetch_all(&mut **executor)
+                    .await
+                    .expect("query failed");
+                rows.extend(wrap_rows);
+            }
+        }
+        info!(
+            "extract_init_data: [{}.{}] {} {} {} rows random_sample={}",
+            self.database,
+            table_name,
+            pk_column,
+            cursor.display_value(),
+            rows.len(),
+            random_sample
         );
         let mut result: Vec<DataBuffer> = vec![];
         for row in rows {
@@ -733,6 +784,37 @@ impl MysqlSourceConfigDetail {
             ));
         }
         result
+    }
+
+    async fn random_init_pk_start(
+        &self,
+        table_name: &str,
+        pk_column: &str,
+        executor: &mut Transaction<'_, MySql>,
+    ) -> Option<String> {
+        let table_ref = qualified_mysql_table_name(&self.database, table_name);
+        let pk_ident = quote_mysql_identifier(pk_column);
+        let sql = format!(
+            r#"
+                select CAST(
+                    FLOOR(
+                        COALESCE(MIN({pk}), 0)
+                        + RAND() * GREATEST(COALESCE(MAX({pk}), 0) - COALESCE(MIN({pk}), 0), 0)
+                    ) AS CHAR
+                ) AS random_pk
+                FROM {table_ref}
+            "#,
+            pk = pk_ident,
+            table_ref = table_ref
+        );
+        sqlx::query(&sql)
+            .fetch_optional(&mut **executor)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|row| row.try_get::<Option<String>, _>("random_pk").ok().flatten())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
     }
 }
 
@@ -759,15 +841,20 @@ impl MySQLSource {
                 .collect::<Vec<String>>();
             let mut mysql_checkpoint_detail_entity_map = HashMap::new();
             for table in tables {
-                let mysql_checkpoint_detail_entity = MysqlCheckPointDetailEntity::from_config(
-                    config
-                        .checkpoint_file_path
-                        .clone()
-                        .unwrap_or("/checkpoint".to_string()),
-                    &connection_url,
-                    table.clone(),
-                )
-                .await;
+                let mysql_checkpoint_detail_entity =
+                    if config.random_check_data_after_init_enabled() {
+                        Self::random_check_checkpoint_entity(table.clone())
+                    } else {
+                        MysqlCheckPointDetailEntity::from_config(
+                            config
+                                .checkpoint_file_path
+                                .clone()
+                                .unwrap_or("/checkpoint".to_string()),
+                            &connection_url,
+                            table.clone(),
+                        )
+                        .await
+                    };
                 mysql_checkpoint_detail_entity_map
                     .insert(table.to_lowercase(), mysql_checkpoint_detail_entity);
             }
@@ -817,6 +904,17 @@ impl MySQLSource {
             binlog_position_list,
             checkpoint_manager,
             init_parallelism: config.multi_mode_init_parallelism(),
+        }
+    }
+
+    fn random_check_checkpoint_entity(table: String) -> MysqlCheckPointDetailEntity {
+        MysqlCheckPointDetailEntity {
+            last_binlog_filename: String::new(),
+            last_binlog_position: 0,
+            retry_times: 0,
+            is_new: true,
+            checkpoint_filepath: format!("memory://random-check/{}", table),
+            table,
         }
     }
 
@@ -989,9 +1087,26 @@ impl MySQLSource {
             let start = Instant::now();
             let mut count = 0;
             let mut cursor = InitPkCursor::Start;
+            let validation_init_limit = config
+                .random_check_data_after_init
+                .then_some(config.random_check_data_after_init_batch_size_min);
+            if let Some(limit) = validation_init_limit {
+                info!(
+                    "MySQL数据源初始化验证模式已开启，仅同步样本数据: {}.{} limit={}",
+                    config.database, table_name, limit
+                );
+            }
             loop {
+                let extract_limit = validation_init_limit.unwrap_or(config.batchsize);
                 let data_buffer_list: Vec<DataBuffer> = config
-                    .extract_init_data(&table_name, &pk_column, &cursor, &mut tx)
+                    .extract_init_data(
+                        &table_name,
+                        &pk_column,
+                        &cursor,
+                        extract_limit,
+                        validation_init_limit.is_some(),
+                        &mut tx,
+                    )
                     .await;
                 let len = data_buffer_list.len();
                 for data_buffer in data_buffer_list {
@@ -1019,14 +1134,19 @@ impl MySQLSource {
                 }
                 count += len;
                 debug!("当前最大id为 {}", cursor.display_value());
+                if validation_init_limit.is_some() {
+                    break;
+                }
                 if len != config.batchsize {
                     break;
                 }
             }
-            sink.lock()
-                .await
-                .flush_with_retry(&FlushByOperation::Init)
-                .await;
+            if validation_init_limit.is_none() {
+                sink.lock()
+                    .await
+                    .flush_with_retry(&FlushByOperation::Init)
+                    .await;
+            }
             info!(
                 "MySQL数据源初始化完成 {}.{} count: {} cost: {:?}",
                 redacted_connection_url,
@@ -1036,6 +1156,13 @@ impl MySQLSource {
             );
             runtime_progress::finish_table_initialization(&progress_label).await;
             if let Some(cp) = checkpoints.get_mut(table_key.to_lowercase().as_str()) {
+                if validation_init_limit.is_some() {
+                    info!(
+                        "MySQL数据源初始化验证模式跳过checkpoint完成标记: {}.{}",
+                        config.database, table_name
+                    );
+                    continue;
+                }
                 cp.is_new = false;
                 match checkpoint_manager.save(&table_key, cp).await {
                     Ok(_) => info!("alter_flush success {}", cp.checkpoint_filepath),
@@ -2713,6 +2840,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn random_check_checkpoint_entity_is_memory_only_and_new() {
+        let entity = MySQLSource::random_check_checkpoint_entity("source_db.orders".to_string());
+
+        assert!(entity.is_new);
+        assert_eq!(entity.last_binlog_filename, "");
+        assert_eq!(entity.last_binlog_position, 0);
+        assert_eq!(
+            entity.checkpoint_filepath,
+            "memory://random-check/source_db.orders"
+        );
+        assert_eq!(entity.table, "source_db.orders");
+    }
+
     fn table_map_event_with_column_names(names: Vec<Option<&str>>) -> TableMapEvent {
         let columns = names
             .iter()
@@ -3039,6 +3180,8 @@ mod tests {
             connection_url: "".to_string(),
             table_info_list: vec![],
             batchsize: 100,
+            random_check_data_after_init: false,
+            random_check_data_after_init_batch_size_min: 10,
             start_binlog_filename: None,
             start_binlog_position: None,
         };
@@ -3095,6 +3238,8 @@ mod tests {
             connection_url: "".to_string(),
             table_info_list: vec![],
             batchsize: 100,
+            random_check_data_after_init: false,
+            random_check_data_after_init_batch_size_min: 10,
             start_binlog_filename: None,
             start_binlog_position: None,
         };
@@ -3354,6 +3499,8 @@ mod tests {
             connection_url: "".to_string(),
             table_info_list: vec![table_info],
             batchsize: 100,
+            random_check_data_after_init: false,
+            random_check_data_after_init_batch_size_min: 10,
             start_binlog_filename: None,
             start_binlog_position: None,
         };
