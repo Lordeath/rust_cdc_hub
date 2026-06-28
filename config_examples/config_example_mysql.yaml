@@ -18,6 +18,8 @@ sink_config:
     database: XXXXXXXXXXXX
     # 默认 ssl_mode: disabled；如果目标库必须使用SSL，可设置 ssl_mode: required
 
+sync_stored_view: true
+
 plugins:
   - plugin_type: ColumnIn
     config:

@@ -132,6 +132,7 @@ export CONFIG_PATH=/path/to/config.yaml
 | `sync_foreign_key_tables` | 否 | 是否在 `table_name: "*"` 自动发现时纳入外键相关表，并在 MySQL/Dameng 目标端初始化后补外键约束，默认 `true`。MySQL 目标端初始化写入期间会临时关闭当前 session 的外键检查，避免目标库已有外键时子表先写入失败。设为 `false` 时保留旧行为：排除有外键依赖或被外键引用的表。 |
 | `sync_no_pk_table_schema` | 否 | 是否同步不参与 CDC 的表结构，默认 `true`；包括无主键、字符串主键、复合主键和其他不支持同步主键的表。这些表只建结构、主键和可满足依赖的外键，不做初始化数据和 CDC 同步；StarRocks 目标端会跳过并告警。 |
 | `sync_stored_procedure` | 否 | MySQL → MySQL/Dameng 时是否同步源库存储过程和函数，默认 `false`；也兼容 `sync_stored_procedures`。 |
+| `sync_stored_view` | 否 | MySQL → MySQL/Dameng 时是否同步源库视图，默认 `true`；也兼容 `sync_stored_views`。目标库已有同名视图时跳过。 |
 | `overwrite_stored_procedure` | 否 | 同步存储过程/函数时，目标库已存在同名对象是否覆盖，默认 `false`；也兼容 `overwrite_stored_procedures`。 |
 | `random_check_data_after_init` | 否 | MySQL → Dameng 快速样本验证模式，默认 `false`。开启后初始化阶段每张 CDC 表只同步少量样本数据，不做完整初始化。 |
 | `random_check_data_after_init_batch_size_min` | 否 | 快速样本验证模式下每张 CDC 表同步并验证的样本行数，默认 `10`；程序会记录已同步主键，并按主键查询 MySQL 和达梦逐字段比较。 |
@@ -222,6 +223,7 @@ auto_create_database: true
 auto_create_table: true
 auto_add_column: true
 sync_stored_procedure: false
+sync_stored_view: true
 overwrite_stored_procedure: false
 log_level: info
 enable_ui: true
@@ -229,6 +231,8 @@ ui_port: 8080
 ```
 
 开启 `sync_stored_procedure` 后，MySQL/Dameng sink 初始化时会按源库到目标库的路由同步 `PROCEDURE` 和 `FUNCTION`。目标库已有同名对象且 `overwrite_stored_procedure: false` 时会跳过；设为 `true` 时，MySQL 目标端会先 `DROP PROCEDURE/FUNCTION IF EXISTS` 再重建，Dameng 目标端会使用 `CREATE OR REPLACE` 覆盖。同步前会从 `SHOW CREATE PROCEDURE/FUNCTION` 结果里去掉 `DEFINER=\`user\`@\`host\``，避免把源库用户带到目标库。MySQL → Dameng 会做基础 DMSQL 转换，复杂 MySQL 专有语法可能导致初始化失败并输出对象名和错误原因。
+
+`sync_stored_view` 默认开启。MySQL/Dameng sink 会在目标表结构准备好后读取源库 `SHOW CREATE VIEW` 结果，去掉 `DEFINER`，按库/schema 路由创建目标视图；目标库已有同名视图时跳过。MySQL → Dameng 会做基础 DMSQL 转换，若视图依赖其他视图会自动重试，最终仍失败时会输出视图名、目标 schema 和 SQL 摘要。
 
 ### MySQL → MeiliSearch 示例
 
@@ -276,6 +280,7 @@ sink_config:
 auto_create_database: true  # 达梦：自动创建目标 schema，不是物理数据库
 auto_create_table: true
 auto_add_column: true
+sync_stored_view: true
 random_check_data_after_init: false
 random_check_data_after_init_batch_size_min: 10
 ```

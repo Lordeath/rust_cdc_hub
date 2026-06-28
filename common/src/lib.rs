@@ -8,6 +8,7 @@ pub mod schema;
 
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use regex::Regex;
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::{HashMap, HashSet};
@@ -141,6 +142,8 @@ pub struct CdcConfig {
     pub sync_no_pk_table_schema: Option<bool>,
     #[serde(alias = "sync_stored_procedures")]
     pub sync_stored_procedure: Option<bool>,
+    #[serde(alias = "sync_stored_views")]
+    pub sync_stored_view: Option<bool>,
     #[serde(alias = "overwrite_stored_procedures")]
     pub overwrite_stored_procedure: Option<bool>,
     pub random_check_data_after_init: Option<bool>,
@@ -222,6 +225,10 @@ impl CdcConfig {
 
     pub fn sync_stored_procedure_enabled(&self) -> bool {
         self.sync_stored_procedure.unwrap_or(false)
+    }
+
+    pub fn sync_stored_view_enabled(&self) -> bool {
+        self.sync_stored_view.unwrap_or(true)
     }
 
     pub fn sync_no_pk_table_schema_enabled(&self) -> bool {
@@ -1091,11 +1098,22 @@ pub struct MySqlRoutineDefinition {
     pub sql_mode: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct MySqlViewDefinition {
+    pub name: String,
+    pub create_sql: String,
+    pub character_set_client: String,
+    pub collation_connection: String,
+}
+
 pub fn quote_mysql_identifier(identifier: &str) -> String {
     format!("`{}`", identifier.replace('`', "``"))
 }
 
 pub fn qualified_mysql_name(database: &str, name: &str) -> String {
+    if database.trim().is_empty() {
+        return quote_mysql_identifier(name);
+    }
     format!(
         "{}.{}",
         quote_mysql_identifier(database),
@@ -1112,6 +1130,13 @@ pub fn show_create_mysql_routine_sql(
         "SHOW CREATE {} {}",
         routine_kind.routine_type(),
         qualified_mysql_name(source_database, routine_name)
+    )
+}
+
+pub fn show_create_mysql_view_sql(source_database: &str, view_name: &str) -> String {
+    format!(
+        "SHOW CREATE VIEW {}",
+        qualified_mysql_name(source_database, view_name)
     )
 }
 
@@ -1178,6 +1203,164 @@ pub async fn fetch_mysql_routines(
     Ok(routines)
 }
 
+pub async fn fetch_mysql_views(
+    source_pool: &Pool<MySql>,
+    source_database: &str,
+    config: &CdcConfig,
+) -> Result<Vec<MySqlViewDefinition>, String> {
+    let configured_names = CdcConfig::split_csv_value(config.first_source("table_name").as_str());
+    let full_discovery = configured_names.is_empty()
+        || (configured_names.len() == 1
+            && (configured_names[0].eq_ignore_ascii_case("all")
+                || configured_names[0].eq_ignore_ascii_case("*")));
+    let view_names = if full_discovery {
+        fetch_mysql_view_names(source_pool, source_database).await?
+    } else {
+        configured_names
+    };
+    let mut filtered_view_names = Vec::with_capacity(view_names.len());
+    for name in view_names {
+        if mysql_source_object_filter_matches(config, name.as_str())? {
+            filtered_view_names.push(name);
+        }
+    }
+    let mut view_names = filtered_view_names;
+    view_names.sort_by_key(|name| name.to_ascii_lowercase());
+    view_names.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+
+    let mut views = Vec::with_capacity(view_names.len());
+    for view_name in view_names {
+        if !mysql_view_exists(source_pool, source_database, view_name.as_str()).await? {
+            continue;
+        }
+        let show_sql = show_create_mysql_view_sql(source_database, view_name.as_str());
+        let create_row = sqlx::raw_sql(show_sql.as_str())
+            .fetch_one(source_pool)
+            .await
+            .map_err(|e| format!("{}: {}", show_sql, e))?;
+        views.push(parse_show_create_mysql_view_row(
+            view_name.as_str(),
+            &create_row,
+        )?);
+    }
+    Ok(views)
+}
+
+async fn fetch_mysql_view_names(
+    source_pool: &Pool<MySql>,
+    source_database: &str,
+) -> Result<Vec<String>, String> {
+    let sql = format!(
+        r#"
+        SELECT TABLE_NAME AS table_name
+        FROM information_schema.VIEWS
+        WHERE TABLE_SCHEMA = {}
+        ORDER BY TABLE_NAME
+        "#,
+        mysql_utf8mb4_string_expr(source_database)
+    );
+    let rows = sqlx::raw_sql(sql.as_str())
+        .fetch_all(source_pool)
+        .await
+        .map_err(|e| format!("{}: {}", sql, e))?;
+    Ok(rows
+        .iter()
+        .map(|row| mysql_row_text_value(row, "table_name"))
+        .collect())
+}
+
+pub async fn mysql_view_exists(
+    pool: &Pool<MySql>,
+    database: &str,
+    view_name: &str,
+) -> Result<bool, String> {
+    let sql = format!(
+        r#"
+        SELECT COUNT(*) AS cnt
+        FROM information_schema.VIEWS
+        WHERE TABLE_SCHEMA = {}
+          AND TABLE_NAME = {}
+        "#,
+        mysql_utf8mb4_string_expr(database),
+        mysql_utf8mb4_string_expr(view_name)
+    );
+    let row = sqlx::raw_sql(sql.as_str())
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("{}: {}", sql, e))?;
+    Ok(mysql_row_count_value(&row, "cnt") > 0)
+}
+
+fn mysql_row_count_value(row: &MySqlRow, column_name: &str) -> i64 {
+    row.try_get::<i64, _>(column_name)
+        .or_else(|_| row.try_get::<i64, _>(0))
+        .or_else(|_| row.try_get::<u64, _>(column_name).map(|v| v as i64))
+        .or_else(|_| row.try_get::<u64, _>(0).map(|v| v as i64))
+        .unwrap_or(0)
+}
+
+fn mysql_source_object_filter_matches(
+    config: &CdcConfig,
+    object_name: &str,
+) -> Result<bool, String> {
+    let except_table_name_prefix =
+        CdcConfig::split_csv_value(config.first_source("except_table_name_prefix").as_str());
+    if except_table_name_prefix.iter().any(|prefix| {
+        object_name
+            .to_ascii_lowercase()
+            .starts_with(prefix.to_ascii_lowercase().as_str())
+    }) {
+        return Ok(false);
+    }
+
+    let include_table_regex = config.first_source("include_table_regex");
+    if !include_table_regex.is_empty() {
+        let re = Regex::new(include_table_regex.as_str())
+            .map_err(|e| format!("Invalid include_table_regex: {}", e))?;
+        if !re.is_match(object_name) {
+            return Ok(false);
+        }
+    }
+
+    let exclude_table_regex = config.first_source("exclude_table_regex");
+    if !exclude_table_regex.is_empty() {
+        let re = Regex::new(exclude_table_regex.as_str())
+            .map_err(|e| format!("Invalid exclude_table_regex: {}", e))?;
+        if re.is_match(object_name) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn parse_show_create_mysql_view_row(
+    fallback_name: &str,
+    row: &MySqlRow,
+) -> Result<MySqlViewDefinition, String> {
+    let name = row
+        .try_get::<String, _>("View")
+        .or_else(|_| row.try_get::<String, _>(0))
+        .unwrap_or_else(|_| fallback_name.to_string());
+    let create_sql = row
+        .try_get::<String, _>("Create View")
+        .or_else(|_| row.try_get::<String, _>(1))
+        .map_err(|e| format!("SHOW CREATE VIEW 读取 Create View 失败: {}", e))?;
+    let character_set_client = row
+        .try_get::<String, _>("character_set_client")
+        .or_else(|_| row.try_get::<String, _>(2))
+        .unwrap_or_default();
+    let collation_connection = row
+        .try_get::<String, _>("collation_connection")
+        .or_else(|_| row.try_get::<String, _>(3))
+        .unwrap_or_default();
+    Ok(MySqlViewDefinition {
+        name,
+        create_sql: strip_create_view_definer(create_sql.as_str()),
+        character_set_client,
+        collation_connection,
+    })
+}
+
 fn parse_mysql_routine_kind(value: &str) -> Result<MySqlRoutineKind, String> {
     match value.trim().to_ascii_uppercase().as_str() {
         "PROCEDURE" => Ok(MySqlRoutineKind::Procedure),
@@ -1237,6 +1420,217 @@ pub fn strip_create_routine_definer(create_sql: &str, routine_kind: MySqlRoutine
         return create_sql.to_string();
     };
     format!("CREATE {}", sql[routine_keyword_pos..].trim_start())
+}
+
+pub fn strip_create_view_definer(create_sql: &str) -> String {
+    let sql = create_sql.trim_start();
+    if !starts_with_keyword(sql, 0, "CREATE") {
+        return create_sql.to_string();
+    }
+    let Some(definer_pos) = find_keyword_outside_quotes(sql, "CREATE".len(), "DEFINER") else {
+        return create_sql.to_string();
+    };
+    let Some(view_pos) = find_keyword_outside_quotes(sql, "CREATE".len(), "VIEW") else {
+        return create_sql.to_string();
+    };
+    if definer_pos > view_pos {
+        return create_sql.to_string();
+    }
+
+    let mut pos = skip_ascii_whitespace(sql, definer_pos + "DEFINER".len());
+    if sql.as_bytes().get(pos) != Some(&b'=') {
+        return create_sql.to_string();
+    }
+    pos = skip_ascii_whitespace(sql, pos + 1);
+    let end_pos = find_keyword_outside_quotes(sql, pos, "SQL").unwrap_or(view_pos);
+    if end_pos <= definer_pos {
+        return create_sql.to_string();
+    }
+    format!(
+        "{} {}",
+        sql[..definer_pos].trim_end(),
+        sql[end_pos..].trim_start()
+    )
+}
+
+pub fn rewrite_mysql_create_view_for_target(
+    create_sql: &str,
+    source_database: &str,
+    target_database: &str,
+    view_name: &str,
+) -> Result<String, String> {
+    let sql = strip_create_view_definer(create_sql);
+    let view_pos = find_keyword_outside_quotes(sql.as_str(), 0, "VIEW")
+        .ok_or_else(|| "CREATE VIEW keyword not found".to_string())?;
+    let name_pos = skip_ascii_whitespace(sql.as_str(), view_pos + "VIEW".len());
+    let name_end = take_mysql_qualified_identifier_end(sql.as_str(), name_pos)
+        .ok_or_else(|| "CREATE VIEW name not found".to_string())?;
+    let qualified_view_name = qualified_mysql_name(target_database, view_name);
+    let rewritten = format!(
+        "{}{}{}",
+        &sql[..name_pos],
+        qualified_view_name,
+        &sql[name_end..]
+    );
+    Ok(replace_mysql_schema_qualifiers(
+        rewritten.as_str(),
+        source_database,
+        target_database,
+    ))
+}
+
+fn take_mysql_qualified_identifier_end(value: &str, start: usize) -> Option<usize> {
+    let mut end = take_mysql_identifier_end(value, start)?;
+    loop {
+        let dot_pos = skip_ascii_whitespace(value, end);
+        if value.as_bytes().get(dot_pos) != Some(&b'.') {
+            return Some(end);
+        }
+        let next_start = skip_ascii_whitespace(value, dot_pos + 1);
+        end = take_mysql_identifier_end(value, next_start)?;
+    }
+}
+
+fn take_mysql_identifier_end(value: &str, start: usize) -> Option<usize> {
+    let bytes = value.as_bytes();
+    let first = *bytes.get(start)?;
+    if first == b'`' {
+        let mut pos = start + 1;
+        while pos < bytes.len() {
+            if bytes[pos] == b'`' {
+                if bytes.get(pos + 1) == Some(&b'`') {
+                    pos += 2;
+                } else {
+                    return Some(pos + 1);
+                }
+            } else {
+                let ch = value[pos..].chars().next()?;
+                pos += ch.len_utf8();
+            }
+        }
+        return None;
+    }
+
+    let mut pos = start;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if byte.is_ascii_whitespace() || matches!(byte, b'.' | b'(' | b')' | b',' | b';') {
+            break;
+        }
+        pos += 1;
+    }
+    if pos == start { None } else { Some(pos) }
+}
+
+fn replace_mysql_schema_qualifiers(
+    value: &str,
+    source_database: &str,
+    target_database: &str,
+) -> String {
+    if source_database.eq_ignore_ascii_case(target_database) || source_database.trim().is_empty() {
+        return value.to_string();
+    }
+    let bytes = value.as_bytes();
+    let mut result = String::with_capacity(value.len());
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if matches!(byte, b'\'' | b'"') {
+            let end = skip_mysql_quoted_fragment(value, pos);
+            result.push_str(&value[pos..end]);
+            pos = end;
+            continue;
+        }
+        if byte == b'`' {
+            if let Some((identifier, end)) = read_mysql_backtick_identifier(value, pos) {
+                let dot_pos = skip_ascii_whitespace(value, end);
+                if identifier.eq_ignore_ascii_case(source_database)
+                    && bytes.get(dot_pos) == Some(&b'.')
+                {
+                    result.push_str(quote_mysql_identifier(target_database).as_str());
+                    pos = end;
+                    continue;
+                }
+            }
+        } else if starts_with_identifier_ignore_case(value, pos, source_database) {
+            let dot_pos = skip_ascii_whitespace(value, pos + source_database.len());
+            if bytes.get(dot_pos) == Some(&b'.') {
+                result.push_str(quote_mysql_identifier(target_database).as_str());
+                pos += source_database.len();
+                continue;
+            }
+        }
+
+        let ch = value[pos..].chars().next().unwrap();
+        result.push(ch);
+        pos += ch.len_utf8();
+    }
+    result
+}
+
+fn read_mysql_backtick_identifier(value: &str, start: usize) -> Option<(String, usize)> {
+    if value.as_bytes().get(start) != Some(&b'`') {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    let mut pos = start + 1;
+    let mut identifier = String::new();
+    while pos < bytes.len() {
+        if bytes[pos] == b'`' {
+            if bytes.get(pos + 1) == Some(&b'`') {
+                identifier.push('`');
+                pos += 2;
+            } else {
+                return Some((identifier, pos + 1));
+            }
+        } else {
+            let ch = value[pos..].chars().next()?;
+            identifier.push(ch);
+            pos += ch.len_utf8();
+        }
+    }
+    None
+}
+
+fn skip_mysql_quoted_fragment(value: &str, start: usize) -> usize {
+    let bytes = value.as_bytes();
+    let Some(&quote) = bytes.get(start) else {
+        return start;
+    };
+    let mut pos = start + 1;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if byte == b'\\' && quote == b'\'' {
+            pos = (pos + 2).min(bytes.len());
+            continue;
+        }
+        if byte == quote {
+            if bytes.get(pos + 1) == Some(&quote) {
+                pos += 2;
+            } else {
+                return pos + 1;
+            }
+        } else {
+            let ch = value[pos..].chars().next().unwrap();
+            pos += ch.len_utf8();
+        }
+    }
+    bytes.len()
+}
+
+fn starts_with_identifier_ignore_case(value: &str, pos: usize, identifier: &str) -> bool {
+    let bytes = value.as_bytes();
+    let identifier_bytes = identifier.as_bytes();
+    if identifier_bytes.is_empty() || pos + identifier_bytes.len() > bytes.len() {
+        return false;
+    }
+    if !bytes[pos..pos + identifier_bytes.len()].eq_ignore_ascii_case(identifier_bytes) {
+        return false;
+    }
+    let before_ok = pos == 0 || !is_ascii_identifier_byte(bytes[pos - 1]);
+    let after_pos = pos + identifier_bytes.len();
+    let after_ok = after_pos >= bytes.len() || !is_ascii_identifier_byte(bytes[after_pos]);
+    before_ok && after_ok
 }
 
 fn skip_ascii_whitespace(value: &str, mut pos: usize) -> usize {
@@ -1688,6 +2082,7 @@ mod tests {
             sync_foreign_key_tables: None,
             sync_no_pk_table_schema: None,
             sync_stored_procedure: None,
+            sync_stored_view: None,
             overwrite_stored_procedure: None,
             random_check_data_after_init: None,
             random_check_data_after_init_batch_size_min: None,
@@ -1779,6 +2174,7 @@ mod tests {
     fn test_stored_procedure_flags_default_false_and_parse_aliases() {
         let default_config = multi_mode_config();
         assert!(!default_config.sync_stored_procedure_enabled());
+        assert!(default_config.sync_stored_view_enabled());
         assert!(!default_config.overwrite_stored_procedure_enabled());
 
         let config: CdcConfig = serde_json::from_str(
@@ -1788,13 +2184,49 @@ mod tests {
                 "source_config": [{}],
                 "sink_config": [{}],
                 "sync_stored_procedures": true,
+                "sync_stored_views": false,
                 "overwrite_stored_procedures": true
             }"#,
         )
         .unwrap();
 
         assert!(config.sync_stored_procedure_enabled());
+        assert!(!config.sync_stored_view_enabled());
         assert!(config.overwrite_stored_procedure_enabled());
+    }
+
+    #[test]
+    fn mysql_view_sql_quotes_database_and_name() {
+        assert_eq!(
+            show_create_mysql_view_sql("source-db", "view`demo"),
+            "SHOW CREATE VIEW `source-db`.`view``demo`"
+        );
+    }
+
+    #[test]
+    fn strips_create_view_definer_after_algorithm() {
+        let sql = "CREATE ALGORITHM=UNDEFINED DEFINER=`source_user`@`%` SQL SECURITY DEFINER VIEW `src`.`v_demo` AS select 1 AS `id`";
+
+        assert_eq!(
+            strip_create_view_definer(sql),
+            "CREATE ALGORITHM=UNDEFINED SQL SECURITY DEFINER VIEW `src`.`v_demo` AS select 1 AS `id`"
+        );
+    }
+
+    #[test]
+    fn rewrites_mysql_create_view_name_and_source_schema() {
+        let sql = "CREATE ALGORITHM=UNDEFINED DEFINER=`source_user`@`%` SQL SECURITY DEFINER VIEW `source-db`.`v_demo` AS select `source-db`.`orders`.`id` AS `id`, 'source-db.orders' AS `label` from `source-db`.`orders`";
+
+        let rewritten =
+            rewrite_mysql_create_view_for_target(sql, "source-db", "target-db", "v_demo").unwrap();
+
+        assert!(rewritten.starts_with(
+            "CREATE ALGORITHM=UNDEFINED SQL SECURITY DEFINER VIEW `target-db`.`v_demo` AS"
+        ));
+        assert!(rewritten.contains("`target-db`.`orders`.`id`"));
+        assert!(rewritten.contains("from `target-db`.`orders`"));
+        assert!(rewritten.contains("'source-db.orders'"));
+        assert!(!rewritten.contains("DEFINER=`source_user`"));
     }
 
     #[test]

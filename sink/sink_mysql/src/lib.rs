@@ -10,9 +10,10 @@ use common::schema::{
 };
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, ForeignKeyInfo, MySqlRoutineDefinition,
-    MySqlRoutineKind, Operation, Sink, TableInfoVo, Value, database_table_key,
-    fetch_mysql_routines, get_mysql_pool_by_url, mysql_connection_url_from_config,
-    mysql_row_text_value, mysql_utf8mb4_string_expr,
+    MySqlRoutineKind, MySqlViewDefinition, Operation, Sink, TableInfoVo, Value, database_table_key,
+    fetch_mysql_routines, fetch_mysql_views, get_mysql_pool_by_url,
+    mysql_connection_url_from_config, mysql_row_text_value, mysql_utf8mb4_string_expr,
+    mysql_view_exists, rewrite_mysql_create_view_for_target,
 };
 #[cfg(test)]
 use common::{show_create_mysql_routine_sql, strip_create_routine_definer};
@@ -255,6 +256,11 @@ impl MySqlSink {
                     }
                 }
             }
+        }
+        if config.sync_stored_view_enabled() {
+            Self::sync_stored_views(config, &target_pools, primary_database.as_str())
+                .await
+                .unwrap_or_else(|e| panic!("MySQL sync stored views failed: {}", e));
         }
         let sink_batch_size = config.sink_batch_size.unwrap_or(256);
         MySqlSink {
@@ -720,6 +726,245 @@ impl MySqlSink {
             .or_else(|_| row.try_get::<u64, _>(0).map(|v| v as i64))
             .unwrap_or(0);
         Ok(count > 0)
+    }
+
+    async fn sync_stored_views(
+        config: &CdcConfig,
+        target_pools: &HashMap<String, Pool<MySql>>,
+        primary_database: &str,
+    ) -> Result<(), String> {
+        let source_databases = config.source_databases();
+        for (source_index, source_database) in source_databases.iter().enumerate() {
+            if source_database.trim().is_empty() {
+                continue;
+            }
+            let source_config_index = if config.multi_mode_open() {
+                0
+            } else {
+                source_index
+            };
+            let target_database = if config.multi_mode_open() {
+                config.target_database_for_source(source_database)
+            } else {
+                primary_database.to_string()
+            };
+            let target_pool = target_pools
+                .get(target_database.to_ascii_lowercase().as_str())
+                .ok_or_else(|| format!("target database pool not found: {}", target_database))?;
+            let source_url = mysql_connection_url_from_config(
+                &config.source_config[source_config_index],
+                Some(source_database),
+            );
+            let source_pool =
+                get_mysql_pool_by_url(&source_url, "mysql sink 同步视图-读取源库视图").await?;
+            let views = fetch_mysql_views(&source_pool, source_database, config)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "fetch source views failed: {} -> {} {}",
+                        source_database, target_database, e
+                    )
+                })?;
+            if views.is_empty() {
+                info!("MySQL source view not found: {}", source_database);
+                continue;
+            }
+            Self::sync_views_with_retry(
+                target_pool,
+                source_database,
+                target_database.as_str(),
+                views,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn sync_views_with_retry(
+        target_pool: &Pool<MySql>,
+        source_database: &str,
+        target_database: &str,
+        mut pending: Vec<MySqlViewDefinition>,
+    ) -> Result<(), String> {
+        while !pending.is_empty() {
+            let mut next_pending = Vec::new();
+            let mut errors = Vec::new();
+            let mut progress = false;
+            for view in pending {
+                match Self::sync_one_stored_view(
+                    target_pool,
+                    source_database,
+                    target_database,
+                    &view,
+                )
+                .await
+                {
+                    Ok(created) => {
+                        if created {
+                            progress = true;
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(e);
+                        next_pending.push(view);
+                    }
+                }
+            }
+            if next_pending.is_empty() {
+                return Ok(());
+            }
+            if !progress {
+                return Err(format!(
+                    "create MySQL views failed after dependency retry:\n{}",
+                    errors.join("\n")
+                ));
+            }
+            pending = next_pending;
+        }
+        Ok(())
+    }
+
+    async fn sync_one_stored_view(
+        target_pool: &Pool<MySql>,
+        source_database: &str,
+        target_database: &str,
+        view: &MySqlViewDefinition,
+    ) -> Result<bool, String> {
+        if mysql_view_exists(target_pool, target_database, view.name.as_str()).await? {
+            info!(
+                "MySQL view exists, skip: {}.{} -> {}.{}",
+                source_database, view.name, target_database, view.name
+            );
+            return Ok(false);
+        }
+
+        let create_sql = rewrite_mysql_create_view_for_target(
+            view.create_sql.as_str(),
+            source_database,
+            target_database,
+            view.name.as_str(),
+        )
+        .map_err(|e| {
+            format!(
+                "rewrite MySQL view failed: {}.{} -> {}.{} {}",
+                source_database, view.name, target_database, view.name, e
+            )
+        })?;
+        Self::create_view_on_target(target_pool, target_database, view, create_sql.as_str())
+            .await
+            .map_err(|e| {
+                format!(
+                    "create MySQL view failed: {}.{} -> {}.{} sql={} error={}",
+                    source_database,
+                    view.name,
+                    target_database,
+                    view.name,
+                    Self::sql_preview(create_sql.as_str()),
+                    e
+                )
+            })?;
+        info!(
+            "MySQL sync view success: {}.{} -> {}.{}",
+            source_database, view.name, target_database, view.name
+        );
+        Ok(true)
+    }
+
+    async fn create_view_on_target(
+        target_pool: &Pool<MySql>,
+        target_database: &str,
+        view: &MySqlViewDefinition,
+        create_sql: &str,
+    ) -> Result<(), String> {
+        let mut conn = target_pool.acquire().await.map_err(|e| e.to_string())?;
+        let charset_row =
+            sqlx::raw_sql("SELECT @@SESSION.character_set_client AS character_set_client, @@SESSION.collation_connection AS collation_connection")
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| e.to_string())?;
+        let original_character_set_client =
+            mysql_row_text_value(&charset_row, "character_set_client");
+        let original_collation_connection =
+            mysql_row_text_value(&charset_row, "collation_connection");
+
+        let sync_result = async {
+            let use_sql = format!("USE {}", Self::quote_mysql_identifier(target_database));
+            sqlx::raw_sql(use_sql.as_str())
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| e.to_string())?;
+            if !view.character_set_client.trim().is_empty() {
+                let set_sql = format!(
+                    "SET SESSION character_set_client = {}",
+                    Self::mysql_utf8mb4_string_expr(view.character_set_client.as_str())
+                );
+                sqlx::raw_sql(set_sql.as_str())
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            if !view.collation_connection.trim().is_empty() {
+                let set_sql = format!(
+                    "SET SESSION collation_connection = {}",
+                    Self::mysql_utf8mb4_string_expr(view.collation_connection.as_str())
+                );
+                sqlx::raw_sql(set_sql.as_str())
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            sqlx::raw_sql(create_sql)
+                .execute(&mut *conn)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+        .await;
+
+        let restore_result = async {
+            let restore_character_set_sql = format!(
+                "SET SESSION character_set_client = {}",
+                Self::mysql_utf8mb4_string_expr(original_character_set_client.as_str())
+            );
+            sqlx::raw_sql(restore_character_set_sql.as_str())
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| e.to_string())?;
+            let restore_collation_sql = format!(
+                "SET SESSION collation_connection = {}",
+                Self::mysql_utf8mb4_string_expr(original_collation_connection.as_str())
+            );
+            sqlx::raw_sql(restore_collation_sql.as_str())
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        }
+        .await;
+
+        match (sync_result, restore_result) {
+            (Ok(_), Ok(_)) => Ok(()),
+            (Err(e), Ok(_)) => Err(e),
+            (Ok(_), Err(e)) => Err(format!("restore target charset failed: {}", e)),
+            (Err(e), Err(restore_error)) => Err(format!(
+                "{}; restore target charset failed: {}",
+                e, restore_error
+            )),
+        }
+    }
+
+    fn sql_preview(sql: &str) -> String {
+        let mut compact = sql
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if compact.len() > 500 {
+            compact = compact.chars().take(500).collect();
+            compact.push_str("...");
+        }
+        compact
     }
 
     fn validate_merged_target_schema(table_info_list: &[TableInfoVo]) -> Result<(), String> {

@@ -1,4 +1,8 @@
-use common::{MySqlRoutineDefinition, MySqlRoutineKind};
+use std::collections::HashSet;
+
+use common::{
+    MySqlRoutineDefinition, MySqlRoutineKind, MySqlViewDefinition, strip_create_view_definer,
+};
 
 const DAMENG_INLINE_STRING_CHAR_LIMIT: u32 = 512;
 const DAMENG_DECIMAL_MAX_PRECISION: u32 = 38;
@@ -14,6 +18,12 @@ struct MysqlRoutineSignature {
 struct DamengRoutineBody {
     declarations: Vec<String>,
     body: String,
+}
+
+#[derive(Debug)]
+struct MysqlViewSignature {
+    name: String,
+    select_sql: String,
 }
 
 pub fn convert_mysql_routine_to_dameng(
@@ -75,6 +85,111 @@ pub fn convert_mysql_routine_to_dameng_with_name(
             ))
         }
     }
+}
+
+pub fn convert_mysql_view_to_dameng(
+    target_schema: &str,
+    source_database: &str,
+    view: &MySqlViewDefinition,
+) -> Result<String, String> {
+    convert_mysql_view_to_dameng_with_name(target_schema, source_database, None, view)
+}
+
+pub fn convert_mysql_view_to_dameng_with_name(
+    target_schema: &str,
+    source_database: &str,
+    target_view_name: Option<&str>,
+    view: &MySqlViewDefinition,
+) -> Result<String, String> {
+    convert_mysql_view_to_dameng_with_name_and_schema_routes(
+        target_schema,
+        source_database,
+        target_view_name,
+        view,
+        &[],
+    )
+}
+
+pub fn convert_mysql_view_to_dameng_with_name_and_schema_routes(
+    target_schema: &str,
+    source_database: &str,
+    target_view_name: Option<&str>,
+    view: &MySqlViewDefinition,
+    schema_routes: &[(String, String)],
+) -> Result<String, String> {
+    let signature = parse_mysql_view_signature(view.create_sql.as_str())?;
+    let target_view_name = target_view_name.unwrap_or(signature.name.as_str());
+    let select_sql = convert_mysql_view_select_sql(
+        signature.select_sql.as_str(),
+        source_database,
+        target_schema,
+        schema_routes,
+    );
+    Ok(format!(
+        "CREATE VIEW {} AS {}",
+        qualified_table(target_schema, target_view_name),
+        select_sql
+    ))
+}
+
+fn parse_mysql_view_signature(create_sql: &str) -> Result<MysqlViewSignature, String> {
+    let stripped = strip_create_view_definer(create_sql);
+    let sql = stripped.trim_start();
+    let create_pos = find_keyword_outside_quotes(sql, 0, "CREATE")
+        .ok_or_else(|| "CREATE keyword not found".to_string())?;
+    let view_pos = find_keyword_outside_quotes(sql, create_pos + "CREATE".len(), "VIEW")
+        .ok_or_else(|| "CREATE VIEW keyword not found".to_string())?;
+    let name_pos = skip_ascii_whitespace(sql, view_pos + "VIEW".len());
+    let (name, next_pos) = take_sql_table_identifier(sql, name_pos)
+        .ok_or_else(|| "CREATE VIEW name not found".to_string())?;
+    let as_pos = find_keyword_outside_quotes(sql, next_pos, "AS")
+        .ok_or_else(|| "CREATE VIEW AS keyword not found".to_string())?;
+    let select_sql = trim_statement_semicolon(&sql[as_pos + "AS".len()..]);
+    if !starts_with_keyword(select_sql, 0, "SELECT") && !starts_with_keyword(select_sql, 0, "WITH")
+    {
+        return Err("CREATE VIEW SELECT/WITH body not found".to_string());
+    }
+    Ok(MysqlViewSignature {
+        name,
+        select_sql: select_sql.to_string(),
+    })
+}
+
+fn convert_mysql_view_select_sql(
+    select_sql: &str,
+    source_database: &str,
+    target_schema: &str,
+    schema_routes: &[(String, String)],
+) -> String {
+    let sql = convert_mysql_sql_tokens(select_sql, "");
+    let sql = convert_mysql_regexp_operators(sql.as_str());
+    let sql = convert_mysql_single_quoted_aliases(sql.as_str());
+    let sql = convert_mysql_group_concat_calls(sql.as_str());
+    let sql = convert_mysql_if_calls(sql.as_str());
+    let sql = convert_mysql_substring_index_calls(sql.as_str());
+    let sql = convert_mysql_limit_clauses(sql.as_str());
+    let sql = convert_mysql_null_safe_equals(sql.as_str());
+    let sql = convert_mysql_exists_is_false(sql.as_str());
+    let sql = convert_mysql_boolean_aliases(sql.as_str());
+    let aliases = collect_sql_table_aliases(sql.as_str());
+    let mut sql = replace_dameng_schema_qualifiers(
+        sql.as_str(),
+        source_database,
+        target_schema,
+        Some(&aliases),
+    );
+    for (route_source, route_target) in schema_routes {
+        if route_source.eq_ignore_ascii_case(source_database) {
+            continue;
+        }
+        sql = replace_dameng_schema_qualifiers(
+            sql.as_str(),
+            route_source,
+            route_target,
+            Some(&aliases),
+        );
+    }
+    convert_mysql_column_equals_to_varchar(sql.as_str())
 }
 
 fn parse_mysql_routine_signature(
@@ -2136,6 +2251,8 @@ fn convert_mysql_single_quoted_aliases(value: &str) -> String {
             result.push_str(quote_ident(alias.as_str()).as_str());
             copied_pos = alias_end;
             search_pos = alias_end;
+        } else if value.as_bytes().get(alias_pos) == Some(&b'"') {
+            search_pos = alias_pos + 1;
         } else {
             let Some((alias, alias_end)) = take_unquoted_alias_token(value, alias_pos) else {
                 search_pos = as_pos + "AS".len();
@@ -2391,6 +2508,580 @@ fn qualified_table(schema: &str, table_name: &str) -> String {
     } else {
         format!("{}.{}", quote_ident(schema), quote_ident(table_name))
     }
+}
+
+fn replace_dameng_schema_qualifiers(
+    value: &str,
+    source_database: &str,
+    target_schema: &str,
+    aliases: Option<&HashSet<String>>,
+) -> String {
+    if source_database.trim().is_empty()
+        || (source_database.eq_ignore_ascii_case(target_schema)
+            && aliases.is_none_or(|aliases| aliases.is_empty()))
+    {
+        return value.to_string();
+    }
+    let bytes = value.as_bytes();
+    let mut result = String::with_capacity(value.len());
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if byte == b'\'' {
+            let end = skip_sql_single_quoted_fragment(value, pos);
+            result.push_str(&value[pos..end]);
+            pos = end;
+            continue;
+        }
+        if byte == b'"' {
+            if let Some((identifier, end)) = read_double_quoted_identifier(value, pos) {
+                let dot_pos = skip_ascii_whitespace(value, end);
+                if identifier.eq_ignore_ascii_case(source_database)
+                    && bytes.get(dot_pos) == Some(&b'.')
+                {
+                    let next_part_pos = skip_ascii_whitespace(value, dot_pos + 1);
+                    if schema_qualifier_points_to_alias(value, next_part_pos, aliases) {
+                        pos = next_part_pos;
+                        continue;
+                    }
+                    result.push_str(quote_ident(target_schema).as_str());
+                    pos = end;
+                    continue;
+                }
+            }
+        } else if starts_with_identifier_ignore_case(value, pos, source_database) {
+            let dot_pos = skip_ascii_whitespace(value, pos + source_database.len());
+            if bytes.get(dot_pos) == Some(&b'.') {
+                let next_part_pos = skip_ascii_whitespace(value, dot_pos + 1);
+                if schema_qualifier_points_to_alias(value, next_part_pos, aliases) {
+                    pos = next_part_pos;
+                    continue;
+                }
+                result.push_str(quote_ident(target_schema).as_str());
+                pos += source_database.len();
+                continue;
+            }
+        }
+
+        let ch = value[pos..].chars().next().unwrap();
+        result.push(ch);
+        pos += ch.len_utf8();
+    }
+    result
+}
+
+fn schema_qualifier_points_to_alias(
+    value: &str,
+    alias_pos: usize,
+    aliases: Option<&HashSet<String>>,
+) -> bool {
+    let Some(aliases) = aliases else {
+        return false;
+    };
+    let Some((alias, alias_end)) = read_sql_identifier_any(value, alias_pos) else {
+        return false;
+    };
+    let dot_pos = skip_ascii_whitespace(value, alias_end);
+    value.as_bytes().get(dot_pos) == Some(&b'.') && aliases.contains(&alias.to_ascii_lowercase())
+}
+
+fn collect_sql_table_aliases(value: &str) -> HashSet<String> {
+    let mut aliases = HashSet::new();
+    let mut search_pos = 0usize;
+    while let Some(from_pos) = find_keyword_outside_quotes(value, search_pos, "FROM") {
+        collect_one_sql_table_alias(value, from_pos + "FROM".len(), &mut aliases);
+        search_pos = from_pos + "FROM".len();
+    }
+
+    search_pos = 0;
+    while let Some(join_pos) = find_keyword_outside_quotes(value, search_pos, "JOIN") {
+        collect_one_sql_table_alias(value, join_pos + "JOIN".len(), &mut aliases);
+        search_pos = join_pos + "JOIN".len();
+    }
+    aliases
+}
+
+fn collect_one_sql_table_alias(value: &str, start: usize, aliases: &mut HashSet<String>) {
+    let mut pos = skip_ascii_whitespace(value, start);
+    if value.as_bytes().get(pos) == Some(&b'(') {
+        let Some(close_pos) = find_matching_paren(value, pos) else {
+            return;
+        };
+        pos = skip_ascii_whitespace(value, close_pos + 1);
+    } else {
+        let Some((_parts, next_pos)) = read_sql_qualified_identifier(value, pos) else {
+            return;
+        };
+        pos = skip_ascii_whitespace(value, next_pos);
+    }
+
+    if starts_with_keyword(value, pos, "AS") {
+        pos = skip_ascii_whitespace(value, pos + "AS".len());
+    }
+    if sql_alias_starts_with_stop_keyword(value, pos) {
+        return;
+    }
+    let Some((alias, alias_end)) = read_sql_identifier_any(value, pos) else {
+        return;
+    };
+    if !sql_alias_starts_with_stop_keyword(value, alias_end) {
+        aliases.insert(alias.to_ascii_lowercase());
+    }
+}
+
+fn sql_alias_starts_with_stop_keyword(value: &str, pos: usize) -> bool {
+    [
+        "ON", "WHERE", "LEFT", "RIGHT", "INNER", "FULL", "CROSS", "JOIN", "GROUP", "ORDER",
+        "HAVING", "LIMIT", "FETCH", "UNION", "USING", "AND", "OR",
+    ]
+    .iter()
+    .any(|keyword| starts_with_keyword(value, pos, keyword))
+}
+
+fn convert_mysql_exists_is_false(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut result = String::with_capacity(value.len());
+    let mut copied_pos = 0usize;
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        if matches!(bytes[pos], b'\'' | b'"' | b'`') {
+            pos = skip_sql_quoted_fragment(value, pos);
+            continue;
+        }
+        if !starts_with_keyword(value, pos, "EXISTS") {
+            pos += 1;
+            continue;
+        }
+        let open_pos = skip_ascii_whitespace(value, pos + "EXISTS".len());
+        if bytes.get(open_pos) != Some(&b'(') {
+            pos += "EXISTS".len();
+            continue;
+        }
+        let Some(close_pos) = find_matching_paren(value, open_pos) else {
+            pos += "EXISTS".len();
+            continue;
+        };
+        let is_pos = skip_ascii_whitespace(value, close_pos + 1);
+        if !starts_with_keyword(value, is_pos, "IS") {
+            pos = close_pos + 1;
+            continue;
+        }
+        let false_pos = skip_ascii_whitespace(value, is_pos + "IS".len());
+        if !starts_with_keyword(value, false_pos, "FALSE") {
+            pos = close_pos + 1;
+            continue;
+        }
+        let end = false_pos + "FALSE".len();
+        result.push_str(&value[copied_pos..pos]);
+        result.push_str("NOT EXISTS");
+        result.push_str(&value[open_pos..=close_pos]);
+        copied_pos = end;
+        pos = end;
+    }
+    result.push_str(&value[copied_pos..]);
+    result
+}
+
+fn convert_mysql_if_calls(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut copied_pos = 0usize;
+    let mut search_pos = 0usize;
+    while let Some(if_pos) = find_keyword_outside_quotes(value, search_pos, "IF") {
+        let open_pos = skip_ascii_whitespace(value, if_pos + "IF".len());
+        if value.as_bytes().get(open_pos) != Some(&b'(') {
+            search_pos = if_pos + "IF".len();
+            continue;
+        }
+        let Some(close_pos) = find_matching_paren(value, open_pos) else {
+            search_pos = if_pos + "IF".len();
+            continue;
+        };
+        let args = split_top_level_commas(&value[open_pos + 1..close_pos]);
+        if args.len() != 3 {
+            search_pos = close_pos + 1;
+            continue;
+        }
+        result.push_str(&value[copied_pos..if_pos]);
+        result.push_str("(CASE WHEN ");
+        result.push_str(args[0].trim());
+        result.push_str(" THEN ");
+        result.push_str(args[1].trim());
+        result.push_str(" ELSE ");
+        result.push_str(args[2].trim());
+        result.push_str(" END)");
+        copied_pos = close_pos + 1;
+        search_pos = close_pos + 1;
+    }
+    result.push_str(&value[copied_pos..]);
+    result
+}
+
+fn convert_mysql_substring_index_calls(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut copied_pos = 0usize;
+    let mut search_pos = 0usize;
+    while let Some(call_pos) = find_keyword_outside_quotes(value, search_pos, "SUBSTRING_INDEX") {
+        let open_pos = skip_ascii_whitespace(value, call_pos + "SUBSTRING_INDEX".len());
+        if value.as_bytes().get(open_pos) != Some(&b'(') {
+            search_pos = call_pos + "SUBSTRING_INDEX".len();
+            continue;
+        }
+        let Some(close_pos) = find_matching_paren(value, open_pos) else {
+            search_pos = call_pos + "SUBSTRING_INDEX".len();
+            continue;
+        };
+        let Some(converted) = convert_mysql_substring_index_args(&value[open_pos + 1..close_pos])
+        else {
+            search_pos = close_pos + 1;
+            continue;
+        };
+        result.push_str(&value[copied_pos..call_pos]);
+        result.push_str(converted.as_str());
+        copied_pos = close_pos + 1;
+        search_pos = close_pos + 1;
+    }
+    result.push_str(&value[copied_pos..]);
+    result
+}
+
+fn convert_mysql_substring_index_args(args: &str) -> Option<String> {
+    let args = split_top_level_commas(args);
+    if args.len() != 3 {
+        return None;
+    }
+    let expr = args[0].trim();
+    let delimiter_arg = args[1].trim();
+    let count = normalize_mysql_integer_arg(args[2].trim())?;
+    let (delimiter, delimiter_end) = take_interval_amount(delimiter_arg, 0)?;
+    if expr.is_empty() || delimiter != "," || !delimiter_arg[delimiter_end..].trim().is_empty() {
+        return None;
+    }
+    match count {
+        1 => Some(format!("REGEXP_SUBSTR({}, '[^,]+')", expr)),
+        -1 => Some(format!("REGEXP_SUBSTR({}, '[^,]+$')", expr)),
+        _ => None,
+    }
+}
+
+fn normalize_mysql_integer_arg(value: &str) -> Option<i32> {
+    let value = value.trim();
+    if let Ok(num) = value.parse::<i32>() {
+        return Some(num);
+    }
+    if value.starts_with("-(") && value.ends_with(')') {
+        let inner = value[2..value.len() - 1].trim();
+        return inner.parse::<i32>().ok().map(|num| -num);
+    }
+    None
+}
+
+fn convert_mysql_boolean_aliases(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut copied_pos = 0usize;
+    let mut search_pos = 0usize;
+    while let Some(as_pos) = find_keyword_outside_quotes(value, search_pos, "AS") {
+        let expr_end = skip_ascii_whitespace_back(value, as_pos);
+        if expr_end == 0 || value.as_bytes().get(expr_end - 1) != Some(&b')') {
+            search_pos = as_pos + "AS".len();
+            continue;
+        }
+        let close_pos = expr_end - 1;
+        let Some(open_pos) = find_matching_open_paren_before(value, close_pos) else {
+            search_pos = as_pos + "AS".len();
+            continue;
+        };
+        if open_pos > 0 && is_ascii_identifier_byte(value.as_bytes()[open_pos - 1]) {
+            search_pos = as_pos + "AS".len();
+            continue;
+        }
+        let expr = value[open_pos + 1..close_pos].trim();
+        if !looks_like_boolean_condition(expr) {
+            search_pos = as_pos + "AS".len();
+            continue;
+        }
+        result.push_str(&value[copied_pos..open_pos]);
+        result.push_str("(CASE WHEN ");
+        result.push_str(expr);
+        result.push_str(" THEN 1 ELSE 0 END)");
+        copied_pos = expr_end;
+        search_pos = as_pos + "AS".len();
+    }
+    result.push_str(&value[copied_pos..]);
+    result
+}
+
+fn find_matching_open_paren_before(value: &str, close_pos: usize) -> Option<usize> {
+    let mut search_end = close_pos;
+    while let Some(open_pos) = value[..search_end].rfind('(') {
+        if find_matching_paren(value, open_pos) == Some(close_pos) {
+            return Some(open_pos);
+        }
+        search_end = open_pos;
+    }
+    None
+}
+
+fn looks_like_boolean_condition(value: &str) -> bool {
+    let trimmed = value.trim_start();
+    if starts_with_keyword(trimmed, 0, "CASE") {
+        return false;
+    }
+    if find_keyword_outside_quotes(value, 0, "IS").is_some() {
+        return true;
+    }
+    let bytes = value.as_bytes();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        if matches!(bytes[pos], b'\'' | b'"' | b'`') {
+            pos = skip_sql_quoted_fragment(value, pos);
+            continue;
+        }
+        if matches!(bytes[pos], b'=' | b'<' | b'>') {
+            return true;
+        }
+        pos += 1;
+    }
+    false
+}
+
+fn convert_mysql_column_equals_to_varchar(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut result = String::with_capacity(value.len());
+    let mut copied_pos = 0usize;
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        if matches!(bytes[pos], b'\'' | b'"' | b'`') {
+            pos = skip_sql_quoted_fragment(value, pos);
+            continue;
+        }
+        if bytes[pos] != b'=' || !is_plain_equal_operator(value, pos) {
+            pos += 1;
+            continue;
+        }
+        let Some((left_start, left_operand)) = read_qualified_identifier_before(value, pos) else {
+            pos += 1;
+            continue;
+        };
+        let right_start = skip_ascii_whitespace(value, pos + 1);
+        let Some((right_parts, right_end)) = read_sql_qualified_identifier(value, right_start)
+        else {
+            pos += 1;
+            continue;
+        };
+        if right_parts.len() < 2 {
+            pos += 1;
+            continue;
+        }
+        let right_operand = value[right_start..right_end].trim();
+        result.push_str(&value[copied_pos..left_start]);
+        result.push_str("CAST(");
+        result.push_str(left_operand.as_str());
+        result.push_str(" AS VARCHAR(4000)) = CAST(");
+        result.push_str(right_operand);
+        result.push_str(" AS VARCHAR(4000))");
+        copied_pos = right_end;
+        pos = right_end;
+    }
+    result.push_str(&value[copied_pos..]);
+    result
+}
+
+fn is_plain_equal_operator(value: &str, pos: usize) -> bool {
+    let before = previous_non_whitespace_byte(value, pos);
+    let after = next_non_whitespace_byte(value, pos + 1);
+    !matches!(before, Some(b'<' | b'>' | b'!' | b':' | b'=')) && !matches!(after, Some(b'=' | b'>'))
+}
+
+fn read_qualified_identifier_before(value: &str, end: usize) -> Option<(usize, String)> {
+    let operand_end = skip_ascii_whitespace_back(value, end);
+    let mut pos = operand_end;
+    let mut start;
+    let mut parts = 0usize;
+    loop {
+        let (part_start, _part_end) = read_sql_identifier_part_before(value, pos)?;
+        parts += 1;
+        start = part_start;
+        pos = skip_ascii_whitespace_back(value, part_start);
+        if pos == 0 || value.as_bytes().get(pos - 1) != Some(&b'.') {
+            break;
+        }
+        pos = skip_ascii_whitespace_back(value, pos - 1);
+    }
+    if parts < 2 {
+        return None;
+    }
+    Some((start, value[start..operand_end].trim().to_string()))
+}
+
+fn read_sql_identifier_part_before(value: &str, end: usize) -> Option<(usize, usize)> {
+    let bytes = value.as_bytes();
+    let end = skip_ascii_whitespace_back(value, end);
+    if end == 0 {
+        return None;
+    }
+    if bytes[end - 1] == b'"' {
+        let mut pos = end - 1;
+        while pos > 0 {
+            pos -= 1;
+            if bytes[pos] == b'"' {
+                return Some((pos, end));
+            }
+        }
+        return None;
+    }
+
+    let mut pos = end;
+    while pos > 0 && is_ascii_identifier_byte(bytes[pos - 1]) {
+        pos -= 1;
+    }
+    if pos == end { None } else { Some((pos, end)) }
+}
+
+fn read_sql_qualified_identifier(value: &str, start: usize) -> Option<(Vec<String>, usize)> {
+    let mut parts = Vec::new();
+    let (first, mut pos) = read_sql_identifier_any(value, start)?;
+    parts.push(first);
+    loop {
+        let dot_pos = skip_ascii_whitespace(value, pos);
+        if value.as_bytes().get(dot_pos) != Some(&b'.') {
+            break;
+        }
+        let next_pos = skip_ascii_whitespace(value, dot_pos + 1);
+        let Some((next_part, next_end)) = read_sql_identifier_any(value, next_pos) else {
+            break;
+        };
+        parts.push(next_part);
+        pos = next_end;
+    }
+    Some((parts, pos))
+}
+
+fn read_sql_identifier_any(value: &str, start: usize) -> Option<(String, usize)> {
+    if value.as_bytes().get(start) == Some(&b'"') {
+        return read_double_quoted_identifier(value, start);
+    }
+    let (identifier, end) = take_sql_identifier(value, start)?;
+    Some((identifier, end))
+}
+
+fn read_double_quoted_identifier(value: &str, start: usize) -> Option<(String, usize)> {
+    if value.as_bytes().get(start) != Some(&b'"') {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    let mut pos = start + 1;
+    let mut identifier = String::new();
+    while pos < bytes.len() {
+        if bytes[pos] == b'"' {
+            if bytes.get(pos + 1) == Some(&b'"') {
+                identifier.push('"');
+                pos += 2;
+            } else {
+                return Some((identifier, pos + 1));
+            }
+        } else {
+            let ch = value[pos..].chars().next()?;
+            identifier.push(ch);
+            pos += ch.len_utf8();
+        }
+    }
+    None
+}
+
+fn skip_sql_single_quoted_fragment(value: &str, start: usize) -> usize {
+    let bytes = value.as_bytes();
+    let mut pos = start + 1;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if byte == b'\\' {
+            pos = (pos + 2).min(bytes.len());
+            continue;
+        }
+        if byte == b'\'' {
+            if bytes.get(pos + 1) == Some(&b'\'') {
+                pos += 2;
+            } else {
+                return pos + 1;
+            }
+        } else {
+            let ch = value[pos..].chars().next().unwrap();
+            pos += ch.len_utf8();
+        }
+    }
+    bytes.len()
+}
+
+fn skip_sql_quoted_fragment(value: &str, start: usize) -> usize {
+    let bytes = value.as_bytes();
+    let Some(&quote) = bytes.get(start) else {
+        return start;
+    };
+    if quote == b'\'' {
+        return skip_sql_single_quoted_fragment(value, start);
+    }
+    let mut pos = start + 1;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if byte == quote {
+            if bytes.get(pos + 1) == Some(&quote) {
+                pos += 2;
+            } else {
+                return pos + 1;
+            }
+        } else {
+            let ch = value[pos..].chars().next().unwrap();
+            pos += ch.len_utf8();
+        }
+    }
+    bytes.len()
+}
+
+fn skip_ascii_whitespace_back(value: &str, end: usize) -> usize {
+    let bytes = value.as_bytes();
+    let mut pos = end.min(bytes.len());
+    while pos > 0 && bytes[pos - 1].is_ascii_whitespace() {
+        pos -= 1;
+    }
+    pos
+}
+
+fn previous_non_whitespace_byte(value: &str, end: usize) -> Option<u8> {
+    let bytes = value.as_bytes();
+    let mut pos = end.min(bytes.len());
+    while pos > 0 {
+        pos -= 1;
+        if !bytes[pos].is_ascii_whitespace() {
+            return Some(bytes[pos]);
+        }
+    }
+    None
+}
+
+fn next_non_whitespace_byte(value: &str, start: usize) -> Option<u8> {
+    let bytes = value.as_bytes();
+    let mut pos = start;
+    while pos < bytes.len() {
+        if !bytes[pos].is_ascii_whitespace() {
+            return Some(bytes[pos]);
+        }
+        pos += 1;
+    }
+    None
+}
+
+fn starts_with_identifier_ignore_case(value: &str, pos: usize, identifier: &str) -> bool {
+    let bytes = value.as_bytes();
+    let identifier_bytes = identifier.as_bytes();
+    if identifier_bytes.is_empty() || pos + identifier_bytes.len() > bytes.len() {
+        return false;
+    }
+    if !bytes[pos..pos + identifier_bytes.len()].eq_ignore_ascii_case(identifier_bytes) {
+        return false;
+    }
+    let before_ok = pos == 0 || !is_ascii_identifier_byte(bytes[pos - 1]);
+    let after_pos = pos + identifier_bytes.len();
+    let after_ok = after_pos >= bytes.len() || !is_ascii_identifier_byte(bytes[after_pos]);
+    before_ok && after_ok
 }
 
 fn take_sql_table_identifier(value: &str, start: usize) -> Option<(String, usize)> {
@@ -3579,11 +4270,14 @@ fn convert_mysql_sql_tokens(value: &str, sql_mode: &str) -> String {
     let value = convert_mysql_quotes_to_dameng(value, sql_mode);
     let value = convert_mysql_index_hints(value.as_str());
     let value = convert_mysql_charset_casts(value.as_str());
+    let value = convert_mysql_convert_charset_calls(value.as_str());
     let value = remove_mysql_character_set_clauses(value.as_str());
     let value = remove_mysql_collate_clauses(value.as_str());
     let value = convert_mysql_now_calls(value.as_str());
     let value = convert_mysql_date_add_sub_interval_calls(value.as_str());
-    convert_mysql_date_format_interval_exprs(value.as_str())
+    let value = convert_mysql_date_format_interval_exprs(value.as_str());
+    let value = convert_mysql_date_format_calls(value.as_str());
+    convert_mysql_str_to_date_calls(value.as_str())
 }
 
 fn convert_mysql_index_hints(value: &str) -> String {
@@ -3905,6 +4599,48 @@ fn convert_mysql_charset_cast_args(args: &str) -> Option<String> {
     Some(format!("CAST({} AS VARCHAR(255))", expr))
 }
 
+fn convert_mysql_convert_charset_calls(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut copied_pos = 0usize;
+    let mut search_pos = 0usize;
+    while let Some(convert_pos) = find_keyword_outside_quotes(value, search_pos, "CONVERT") {
+        let open_pos = skip_ascii_whitespace(value, convert_pos + "CONVERT".len());
+        if value.as_bytes().get(open_pos) != Some(&b'(') {
+            search_pos = convert_pos + "CONVERT".len();
+            continue;
+        }
+        let Some(close_pos) = find_matching_paren(value, open_pos) else {
+            search_pos = convert_pos + "CONVERT".len();
+            continue;
+        };
+        let Some(converted) = convert_mysql_convert_charset_args(&value[open_pos + 1..close_pos])
+        else {
+            search_pos = close_pos + 1;
+            continue;
+        };
+        result.push_str(&value[copied_pos..convert_pos]);
+        result.push_str(converted.as_str());
+        copied_pos = close_pos + 1;
+        search_pos = close_pos + 1;
+    }
+    result.push_str(&value[copied_pos..]);
+    result
+}
+
+fn convert_mysql_convert_charset_args(args: &str) -> Option<String> {
+    let using_pos = find_top_level_keyword_outside_quotes(args, 0, "USING")?;
+    let expr = args[..using_pos].trim();
+    if expr.is_empty() {
+        return None;
+    }
+    let charset_pos = skip_ascii_whitespace(args, using_pos + "USING".len());
+    let (_charset, next_pos) = take_sql_identifier(args, charset_pos)?;
+    if !args[next_pos..].trim().is_empty() {
+        return None;
+    }
+    Some(expr.to_string())
+}
+
 fn mysql_cast_type_is_charset_char(mysql_type: &str) -> bool {
     let mut pos = skip_ascii_whitespace(mysql_type, 0);
     if !starts_with_keyword(mysql_type, pos, "CHAR") {
@@ -4121,6 +4857,112 @@ fn convert_mysql_date_format_interval_exprs(value: &str) -> String {
     result
 }
 
+fn convert_mysql_date_format_calls(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut result = String::with_capacity(value.len());
+    let mut quote = None;
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if let Some(quote_byte) = quote {
+            let ch = value[pos..].chars().next().unwrap();
+            result.push(ch);
+            if byte == b'\\' && quote_byte == b'\'' {
+                pos += ch.len_utf8();
+                if pos < bytes.len() {
+                    let next = value[pos..].chars().next().unwrap();
+                    result.push(next);
+                    pos += next.len_utf8();
+                }
+                continue;
+            }
+            if byte == quote_byte {
+                if bytes.get(pos + 1) == Some(&quote_byte) {
+                    result.push(quote_byte as char);
+                    pos += 2;
+                } else {
+                    quote = None;
+                    pos += ch.len_utf8();
+                }
+            } else {
+                pos += ch.len_utf8();
+            }
+            continue;
+        }
+
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            result.push(byte as char);
+            pos += 1;
+            continue;
+        }
+
+        if let Some((converted, next_pos)) = convert_one_date_format_call(value, pos) {
+            result.push_str(converted.as_str());
+            pos = next_pos;
+            continue;
+        }
+
+        let ch = value[pos..].chars().next().unwrap();
+        result.push(ch);
+        pos += ch.len_utf8();
+    }
+    result
+}
+
+fn convert_mysql_str_to_date_calls(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut result = String::with_capacity(value.len());
+    let mut quote = None;
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if let Some(quote_byte) = quote {
+            let ch = value[pos..].chars().next().unwrap();
+            result.push(ch);
+            if byte == b'\\' && quote_byte == b'\'' {
+                pos += ch.len_utf8();
+                if pos < bytes.len() {
+                    let next = value[pos..].chars().next().unwrap();
+                    result.push(next);
+                    pos += next.len_utf8();
+                }
+                continue;
+            }
+            if byte == quote_byte {
+                if bytes.get(pos + 1) == Some(&quote_byte) {
+                    result.push(quote_byte as char);
+                    pos += 2;
+                } else {
+                    quote = None;
+                    pos += ch.len_utf8();
+                }
+            } else {
+                pos += ch.len_utf8();
+            }
+            continue;
+        }
+
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            result.push(byte as char);
+            pos += 1;
+            continue;
+        }
+
+        if let Some((converted, next_pos)) = convert_one_str_to_date_call(value, pos) {
+            result.push_str(converted.as_str());
+            pos = next_pos;
+            continue;
+        }
+
+        let ch = value[pos..].chars().next().unwrap();
+        result.push(ch);
+        pos += ch.len_utf8();
+    }
+    result
+}
+
 fn convert_mysql_date_add_sub_interval_calls(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut result = String::with_capacity(value.len());
@@ -4204,11 +5046,7 @@ fn convert_one_date_add_sub_interval_call(value: &str, pos: usize) -> Option<(St
     if !interval_arg[unit_end..].trim().is_empty() {
         return None;
     }
-    let amount_sql = if op < 0 {
-        format!("-({})", amount)
-    } else {
-        amount
-    };
+    let (unit, amount_sql) = dameng_dateadd_interval_parts(unit, amount.as_str(), op)?;
     Some((
         format!("DATEADD({}, {}, {})", unit, amount_sql, expr),
         close_pos + 1,
@@ -4245,25 +5083,234 @@ fn convert_one_date_format_interval_expr(value: &str, pos: usize) -> Option<(Str
     let (amount, amount_end) = take_interval_amount(value, cursor)?;
     cursor = skip_ascii_whitespace(value, amount_end);
     let (unit, next_pos) = take_interval_unit(value, cursor)?;
+    if unit == "HOUR_SECOND" {
+        return convert_one_date_format_hour_second_interval_expr(
+            value,
+            open_pos,
+            close_pos,
+            amount.as_str(),
+            op,
+            next_pos,
+        );
+    }
     let expr = &value[pos..=close_pos];
-    let amount_sql = if op < 0 {
-        format!("-({})", amount)
-    } else {
-        amount
-    };
+    let (unit, amount_sql) = dameng_dateadd_interval_parts(unit, amount.as_str(), op)?;
     Some((
         format!("DATEADD({}, {}, {})", unit, amount_sql, expr),
         next_pos,
     ))
 }
 
+fn convert_one_date_format_hour_second_interval_expr(
+    value: &str,
+    open_pos: usize,
+    close_pos: usize,
+    amount: &str,
+    op: i32,
+    next_pos: usize,
+) -> Option<(String, usize)> {
+    if op < 0 {
+        return None;
+    }
+    let time_literal = normalize_mysql_hour_second_interval(amount)?;
+    let args = split_top_level_commas(&value[open_pos + 1..close_pos]);
+    if args.len() != 2 {
+        return None;
+    }
+    let expr = args[0].trim();
+    if expr.is_empty() {
+        return None;
+    }
+    let format_arg = args[1].trim();
+    let (mysql_format, format_end) = take_interval_amount(format_arg, 0)?;
+    if !format_arg[format_end..].trim().is_empty() {
+        return None;
+    }
+    let dameng_format = mysql_date_format_to_dameng(mysql_format.as_str())?;
+    Some((
+        format!(
+            "TO_CHAR({}, {}) || {}",
+            expr,
+            quote_literal(dameng_format.as_str()),
+            quote_literal(format!(" {}", time_literal).as_str())
+        ),
+        next_pos,
+    ))
+}
+
+fn convert_one_date_format_call(value: &str, pos: usize) -> Option<(String, usize)> {
+    if !starts_with_keyword(value, pos, "DATE_FORMAT") {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    let open_pos = skip_ascii_whitespace(value, pos + "DATE_FORMAT".len());
+    if bytes.get(open_pos) != Some(&b'(') {
+        return None;
+    }
+    let close_pos = find_matching_paren(value, open_pos)?;
+    let args = split_top_level_commas(&value[open_pos + 1..close_pos]);
+    if args.len() != 2 {
+        return None;
+    }
+    let expr = args[0].trim();
+    if expr.is_empty() {
+        return None;
+    }
+    let format_arg = args[1].trim();
+    let (mysql_format, format_end) = take_interval_amount(format_arg, 0)?;
+    if !format_arg[format_end..].trim().is_empty() {
+        return None;
+    }
+    let dameng_format = mysql_date_format_to_dameng(mysql_format.as_str())?;
+    Some((
+        format!(
+            "TO_CHAR({}, {})",
+            expr,
+            quote_literal(dameng_format.as_str())
+        ),
+        close_pos + 1,
+    ))
+}
+
+fn convert_one_str_to_date_call(value: &str, pos: usize) -> Option<(String, usize)> {
+    if !starts_with_keyword(value, pos, "STR_TO_DATE") {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    let open_pos = skip_ascii_whitespace(value, pos + "STR_TO_DATE".len());
+    if bytes.get(open_pos) != Some(&b'(') {
+        return None;
+    }
+    let close_pos = find_matching_paren(value, open_pos)?;
+    let args = split_top_level_commas(&value[open_pos + 1..close_pos]);
+    if args.len() != 2 {
+        return None;
+    }
+    let expr = args[0].trim();
+    if expr.is_empty() {
+        return None;
+    }
+    let format_arg = args[1].trim();
+    let (mysql_format, format_end) = take_interval_amount(format_arg, 0)?;
+    if !format_arg[format_end..].trim().is_empty() {
+        return None;
+    }
+    let dameng_format = mysql_date_format_to_dameng(mysql_format.as_str())?;
+    Some((
+        format!(
+            "TO_DATE({}, {})",
+            expr,
+            quote_literal(dameng_format.as_str())
+        ),
+        close_pos + 1,
+    ))
+}
+
+fn mysql_date_format_to_dameng(format: &str) -> Option<String> {
+    let mut result = String::with_capacity(format.len());
+    let mut chars = format.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            if ch.is_ascii_alphabetic() {
+                result.push('"');
+                result.push(ch);
+                result.push('"');
+            } else {
+                result.push(ch);
+            }
+            continue;
+        }
+
+        let token = chars.next()?;
+        match token {
+            '%' => result.push('%'),
+            'Y' => result.push_str("YYYY"),
+            'y' => result.push_str("YY"),
+            'm' => result.push_str("MM"),
+            'c' => result.push_str("FMMM"),
+            'd' => result.push_str("DD"),
+            'e' => result.push_str("FMDD"),
+            'H' => result.push_str("HH24"),
+            'h' | 'I' => result.push_str("HH12"),
+            'i' => result.push_str("MI"),
+            's' | 'S' => result.push_str("SS"),
+            'f' => result.push_str("FF6"),
+            'p' => result.push_str("AM"),
+            'b' => result.push_str("MON"),
+            'M' => result.push_str("MONTH"),
+            'W' => result.push_str("DAY"),
+            'a' => result.push_str("DY"),
+            'j' => result.push_str("DDD"),
+            'T' => result.push_str("HH24:MI:SS"),
+            'r' => result.push_str("HH12:MI:SS AM"),
+            _ => return None,
+        }
+    }
+    Some(result)
+}
+
 fn take_interval_unit(value: &str, start: usize) -> Option<(&'static str, usize)> {
-    for unit in ["YEAR", "MONTH", "DAY"] {
+    for unit in [
+        "HOUR_SECOND",
+        "YEAR",
+        "MONTH",
+        "DAY",
+        "HOUR",
+        "MINUTE",
+        "SECOND",
+    ] {
         if starts_with_keyword(value, start, unit) {
             return Some((unit, start + unit.len()));
         }
     }
     None
+}
+
+fn dameng_dateadd_interval_parts(
+    unit: &'static str,
+    amount: &str,
+    op: i32,
+) -> Option<(&'static str, String)> {
+    let (unit, amount_sql) = if unit == "HOUR_SECOND" {
+        (
+            "SECOND",
+            normalize_mysql_hour_second_interval_to_seconds(amount)?.to_string(),
+        )
+    } else {
+        (unit, amount.to_string())
+    };
+    let amount_sql = if op < 0 {
+        format!("-({})", amount_sql)
+    } else {
+        amount_sql
+    };
+    Some((unit, amount_sql))
+}
+
+fn normalize_mysql_hour_second_interval_to_seconds(value: &str) -> Option<i64> {
+    let value = normalize_mysql_hour_second_interval(value)?;
+    let parts: Vec<_> = value.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let hours = parts[0].parse::<i64>().ok()?;
+    let minutes = parts[1].parse::<i64>().ok()?;
+    let seconds = parts[2].parse::<i64>().ok()?;
+    Some(hours * 3600 + minutes * 60 + seconds)
+}
+
+fn normalize_mysql_hour_second_interval(value: &str) -> Option<String> {
+    let parts: Vec<_> = value.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let hours = parts[0].parse::<i64>().ok()?;
+    let minutes = parts[1].parse::<i64>().ok()?;
+    let seconds = parts[2].parse::<i64>().ok()?;
+    if hours < 0 || !(0..60).contains(&minutes) || !(0..60).contains(&seconds) {
+        return None;
+    }
+    Some(format!("{}:{:02}:{:02}", hours, minutes, seconds))
 }
 
 fn take_interval_amount(value: &str, start: usize) -> Option<(String, usize)> {
@@ -4905,6 +5952,98 @@ mod tests {
     }
 
     #[test]
+    fn converts_mysql_view_to_dameng_view() {
+        let view = MySqlViewDefinition {
+            name: "v_demo".to_string(),
+            create_sql: "CREATE ALGORITHM=UNDEFINED DEFINER=`source_user`@`%` SQL SECURITY DEFINER VIEW `source-db`.`v_demo` AS SELECT `o`.`id` AS `id`, DATE_FORMAT(`o`.`created_at`, '%Y-%m-%d') AS `created_day`, CONVERT(DATE_FORMAT(`o`.`updated_at`, '%Y%m%d') USING utf8mb4) AS `updated_day`, GROUP_CONCAT(`o`.`name` ORDER BY `o`.`name` SEPARATOR ',') AS `names`, 'source-db.orders' AS `literal` FROM `source-db`.`orders` `o` WHERE `o`.`deleted_at` <=> NULL LIMIT 10".to_string(),
+            character_set_client: "utf8mb4".to_string(),
+            collation_connection: "utf8mb4_general_ci".to_string(),
+        };
+
+        let sql = convert_mysql_view_to_dameng("target_schema", "source-db", &view).unwrap();
+
+        assert!(sql.starts_with(
+            "CREATE VIEW \"target_schema\".\"v_demo\" AS SELECT \"o\".\"id\" AS \"id\""
+        ));
+        assert!(sql.contains(
+            "LISTAGG(\"o\".\"name\", ',') WITHIN GROUP (ORDER BY \"o\".\"name\") AS \"names\""
+        ));
+        assert!(sql.contains("TO_CHAR(\"o\".\"created_at\", 'YYYY-MM-DD') AS \"created_day\""));
+        assert!(sql.contains("TO_CHAR(\"o\".\"updated_at\", 'YYYYMMDD') AS \"updated_day\""));
+        assert!(sql.contains("FROM \"target_schema\".\"orders\" \"o\""));
+        assert!(sql.contains("\"o\".\"deleted_at\" IS NULL"));
+        assert!(sql.contains("FETCH FIRST 10 ROWS ONLY"));
+        assert!(sql.contains("'source-db.orders'"));
+        assert!(!sql.contains("DEFINER"));
+    }
+
+    #[test]
+    fn converts_mysql_cte_view_and_relaxes_column_comparisons() {
+        let view = MySqlViewDefinition {
+            name: "v_cte".to_string(),
+            create_sql: "CREATE VIEW `source-db`.`v_cte` AS WITH `query_data` AS (SELECT `a`.`enterpriseId` AS `enterpriseId` FROM `source-db`.`table_a` `a` LEFT JOIN `source-db`.`table_b` `b` ON (`source-db`.`b`.`id` = `a`.`id`)) SELECT `query_data`.`enterpriseId` AS `enterpriseId` FROM `query_data` WHERE EXISTS(SELECT 1 FROM `query_data`) IS FALSE".to_string(),
+            character_set_client: "utf8mb4".to_string(),
+            collation_connection: "utf8mb4_general_ci".to_string(),
+        };
+
+        let sql = convert_mysql_view_to_dameng("target_schema", "source-db", &view).unwrap();
+
+        assert!(sql.starts_with("CREATE VIEW \"target_schema\".\"v_cte\" AS WITH"));
+        assert!(
+            sql.contains(
+                "CAST(\"b\".\"id\" AS VARCHAR(4000)) = CAST(\"a\".\"id\" AS VARCHAR(4000))"
+            )
+        );
+        assert!(sql.contains("NOT EXISTS(SELECT 1 FROM \"query_data\")"));
+        assert!(!sql.contains("\"target_schema\".\"b\".\"id\""));
+    }
+
+    #[test]
+    fn converts_mysql_view_cross_schema_references_with_routes() {
+        let view = MySqlViewDefinition {
+            name: "v_cross".to_string(),
+            create_sql: "CREATE VIEW `source-owner`.`v_cross` AS SELECT `b`.`id` AS `id` FROM `source-bill`.`bill_table` `b` JOIN `source-owner`.`owner_table` `o` ON `b`.`id` = `o`.`bill_id`".to_string(),
+            character_set_client: "utf8mb4".to_string(),
+            collation_connection: "utf8mb4_general_ci".to_string(),
+        };
+
+        let sql = convert_mysql_view_to_dameng_with_name_and_schema_routes(
+            "target-owner",
+            "source-owner",
+            None,
+            &view,
+            &[("source-bill".to_string(), "target-bill".to_string())],
+        )
+        .unwrap();
+
+        assert!(sql.contains("FROM \"target-bill\".\"bill_table\" \"b\""));
+        assert!(sql.contains("JOIN \"target-owner\".\"owner_table\" \"o\""));
+    }
+
+    #[test]
+    fn converts_mysql_view_if_substring_index_and_boolean_aliases() {
+        let view = MySqlViewDefinition {
+            name: "v_bool".to_string(),
+            create_sql: "CREATE VIEW `source-db`.`v_bool` AS SELECT (`m`.`id` IS NOT NULL) AS `exists_flag`, IF((`d`.`kind` = '1'), `d`.`created_at`, NULL) AS `created_at`, SUBSTRING_INDEX(GROUP_CONCAT(`d`.`name` ORDER BY `d`.`id` ASC SEPARATOR ','), ',', -1) AS `last_name` FROM `source-db`.`main` `m` LEFT JOIN `source-db`.`detail` `d` ON `m`.`id` = `d`.`main_id`".to_string(),
+            character_set_client: "utf8mb4".to_string(),
+            collation_connection: "utf8mb4_general_ci".to_string(),
+        };
+
+        let sql = convert_mysql_view_to_dameng("target_schema", "source-db", &view).unwrap();
+
+        assert!(
+            sql.contains(
+                "(CASE WHEN \"m\".\"id\" IS NOT NULL THEN 1 ELSE 0 END) AS \"exists_flag\""
+            )
+        );
+        assert!(sql.contains(
+            "(CASE WHEN (\"d\".\"kind\" = '1') THEN \"d\".\"created_at\" ELSE NULL END) AS \"created_at\""
+        ));
+        assert!(sql.contains("REGEXP_SUBSTR(LISTAGG(\"d\".\"name\", ',')"));
+        assert!(sql.contains("'[^,]+$') AS \"last_name\""));
+    }
+
+    #[test]
     fn converts_mysql_routine_declarations_and_literals() {
         let routine = MySqlRoutineDefinition {
             kind: MySqlRoutineKind::Procedure,
@@ -5012,9 +6151,7 @@ END"#
         assert!(sql.contains("    fID BIGINT default 0;"));
         assert!(sql.contains("    ReceptionUserID BIGINT default 0;"));
         assert!(
-            sql.contains(
-                "    serviceNo VARCHAR(20 CHAR) default DATE_FORMAT(CURDATE(), '%Y%m%d');"
-            )
+            sql.contains("    serviceNo VARCHAR(20 CHAR) default TO_CHAR(CURDATE(), 'YYYYMMDD');")
         );
         assert!(sql.contains("    serviceNo := CONCAT('PBSBX',serviceNo,1);"));
         assert!(sql.contains(
@@ -5411,14 +6548,14 @@ WHERE target.module_id = p_module_id
                 "OperatorDate < DATE_FORMAT( end_date,'%Y-%m-%d') +INTERVAL 1 day",
                 ""
             ),
-            "OperatorDate < DATEADD(DAY, 1, DATE_FORMAT( end_date,'%Y-%m-%d'))"
+            "OperatorDate < DATEADD(DAY, 1, TO_CHAR(end_date, 'YYYY-MM-DD'))"
         );
         assert_eq!(
             convert_mysql_sql_tokens(
                 "OperatorDate < DATE_FORMAT(end_date, '%Y-%m-%d') + INTERVAL 1 DAY",
                 ""
             ),
-            "OperatorDate < DATEADD(DAY, 1, DATE_FORMAT(end_date, '%Y-%m-%d'))"
+            "OperatorDate < DATEADD(DAY, 1, TO_CHAR(end_date, 'YYYY-MM-DD'))"
         );
     }
 
@@ -5429,7 +6566,7 @@ WHERE target.module_id = p_module_id
                 "OperatorDate >= date_format(begin_date,'%Y-%m-%d') - interval 2 day",
                 ""
             ),
-            "OperatorDate >= DATEADD(DAY, -(2), date_format(begin_date,'%Y-%m-%d'))"
+            "OperatorDate >= DATEADD(DAY, -(2), TO_CHAR(begin_date, 'YYYY-MM-DD'))"
         );
     }
 
@@ -5440,21 +6577,21 @@ WHERE target.module_id = p_module_id
                 "LEFT(DATE_FORMAT(searchDate, '%Y-%m-%d') + INTERVAL offsetDate year, 4)",
                 ""
             ),
-            "LEFT(DATEADD(YEAR, offsetDate, DATE_FORMAT(searchDate, '%Y-%m-%d')), 4)"
+            "LEFT(DATEADD(YEAR, offsetDate, TO_CHAR(searchDate, 'YYYY-MM-DD')), 4)"
         );
         assert_eq!(
             convert_mysql_sql_tokens(
                 "LEFT(DATE_FORMAT(searchDate, '%Y-%m-%d') + INTERVAL offsetDate month, 7)",
                 ""
             ),
-            "LEFT(DATEADD(MONTH, offsetDate, DATE_FORMAT(searchDate, '%Y-%m-%d')), 7)"
+            "LEFT(DATEADD(MONTH, offsetDate, TO_CHAR(searchDate, 'YYYY-MM-DD')), 7)"
         );
         assert_eq!(
             convert_mysql_sql_tokens(
                 "DATE_FORMAT(searchDate, '%Y-%m-%d') + INTERVAL offsetDate day",
                 ""
             ),
-            "DATEADD(DAY, offsetDate, DATE_FORMAT(searchDate, '%Y-%m-%d'))"
+            "DATEADD(DAY, offsetDate, TO_CHAR(searchDate, 'YYYY-MM-DD'))"
         );
     }
 
@@ -5473,7 +6610,29 @@ WHERE target.module_id = p_module_id
                 "DATE_FORMAT(DATE_SUB(CURRENT_DATE, INTERVAL 1 DAY), '%Y-%m')",
                 ""
             ),
-            "DATE_FORMAT(DATEADD(DAY, -(1), CURRENT_DATE), '%Y-%m')"
+            "TO_CHAR(DATEADD(DAY, -(1), CURRENT_DATE), 'YYYY-MM')"
+        );
+    }
+
+    #[test]
+    fn converts_mysql_date_format_and_charset_convert_calls() {
+        assert_eq!(
+            convert_mysql_sql_tokens(
+                "SELECT CONVERT(DATE_FORMAT(calcStartTime, '%Y-%m-%d %H:%i:%s') USING utf8mb4)",
+                ""
+            ),
+            "SELECT TO_CHAR(calcStartTime, 'YYYY-MM-DD HH24:MI:SS')"
+        );
+        assert_eq!(
+            convert_mysql_sql_tokens("SELECT DATE_FORMAT(calcStartTime, '%Y-%m-%dT%H:%i:%s')", ""),
+            "SELECT TO_CHAR(calcStartTime, 'YYYY-MM-DD\"T\"HH24:MI:SS')"
+        );
+        assert_eq!(
+            convert_mysql_sql_tokens(
+                "SELECT STR_TO_DATE((DATE_FORMAT(workDate, '%Y-%m-%d') + INTERVAL '23:59:59' HOUR_SECOND), '%Y-%m-%d %H:%i:%s')",
+                ""
+            ),
+            "SELECT TO_DATE((TO_CHAR(workDate, 'YYYY-MM-DD') || ' 23:59:59'), 'YYYY-MM-DD HH24:MI:SS')"
         );
     }
 

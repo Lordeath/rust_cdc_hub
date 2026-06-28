@@ -11,14 +11,18 @@ use common::schema::{
 };
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, ForeignKeyInfo, MySqlRoutineDefinition,
-    MySqlRoutineKind, Operation, Sink, TableInfoVo, Value, database_table_key,
-    fetch_mysql_routines, get_mysql_pool_by_url, mysql_connection_url_from_config,
+    MySqlRoutineKind, MySqlViewDefinition, Operation, Sink, TableInfoVo, Value, database_table_key,
+    fetch_mysql_routines, fetch_mysql_views, get_mysql_pool_by_url,
+    mysql_connection_url_from_config,
 };
 use dameng::Client;
 use dameng::ToDmValue;
 use dameng::row::Column as DamengResultColumn;
 use dameng_types::{DmValue, DmValueType, decode_value};
-use mysql_to_dameng::convert_mysql_routine_to_dameng_with_name;
+use mysql_to_dameng::{
+    convert_mysql_routine_to_dameng_with_name,
+    convert_mysql_view_to_dameng_with_name_and_schema_routes,
+};
 use sqlx::types::BigDecimal;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -296,6 +300,13 @@ impl DamengSink {
                 .unwrap_or_else(|e| panic!("Dameng sync stored routines failed: {}", e));
         } else if config.sync_stored_procedure_enabled() {
             info!("Dameng random data check init mode skips stored routine synchronization");
+        }
+        if config.sync_stored_view_enabled() && !sink.random_check_data_after_init {
+            sink.sync_stored_views(config)
+                .await
+                .unwrap_or_else(|e| panic!("Dameng sync stored views failed: {}", e));
+        } else if config.sync_stored_view_enabled() {
+            info!("Dameng random data check init mode skips view synchronization");
         }
         sink
     }
@@ -3155,6 +3166,168 @@ impl DamengSink {
         Ok(())
     }
 
+    async fn sync_stored_views(&self, config: &CdcConfig) -> Result<(), String> {
+        let source_databases = config.source_databases();
+        let schema_routes = Self::view_schema_routes(config);
+        for (source_index, source_database) in source_databases.iter().enumerate() {
+            if source_database.trim().is_empty() {
+                continue;
+            }
+            let source_config_index = if config.multi_mode_open() {
+                0
+            } else {
+                source_index
+            };
+            let mut target_schema = config.target_database_for_source(source_database);
+            if target_schema.trim().is_empty() {
+                target_schema = self.schema.clone();
+            }
+            let source_url = mysql_connection_url_from_config(
+                &config.source_config[source_config_index],
+                Some(source_database),
+            );
+            let source_pool =
+                get_mysql_pool_by_url(&source_url, "dameng sink 同步视图-读取源库视图").await?;
+            let views = fetch_mysql_views(&source_pool, source_database, config)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "fetch source views failed: {} -> {} {}",
+                        source_database, target_schema, e
+                    )
+                })?;
+            if views.is_empty() {
+                info!("MySQL source view not found: {}", source_database);
+                continue;
+            }
+            self.sync_views_with_retry(
+                source_database,
+                target_schema.as_str(),
+                &schema_routes,
+                views,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn view_schema_routes(config: &CdcConfig) -> Vec<(String, String)> {
+        let mut routes: Vec<(String, String)> = config.multi_mode_route_map().into_iter().collect();
+        let mut extra_routes = Vec::new();
+        for (source, target) in &routes {
+            if let Some(base_source) = strip_trailing_numeric_schema_suffix(source) {
+                if !routes
+                    .iter()
+                    .chain(extra_routes.iter())
+                    .any(|(existing, _)| existing.eq_ignore_ascii_case(base_source.as_str()))
+                {
+                    extra_routes.push((base_source, target.clone()));
+                }
+            }
+        }
+        routes.extend(extra_routes);
+        routes
+    }
+
+    async fn sync_views_with_retry(
+        &self,
+        source_database: &str,
+        target_schema: &str,
+        schema_routes: &[(String, String)],
+        mut pending: Vec<MySqlViewDefinition>,
+    ) -> Result<(), String> {
+        while !pending.is_empty() {
+            let mut next_pending = Vec::new();
+            let mut errors = Vec::new();
+            let mut progress = false;
+            for view in pending {
+                match self
+                    .sync_one_stored_view(source_database, target_schema, schema_routes, &view)
+                    .await
+                {
+                    Ok(created) => {
+                        if created {
+                            progress = true;
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(e);
+                        next_pending.push(view);
+                    }
+                }
+            }
+            if next_pending.is_empty() {
+                return Ok(());
+            }
+            if !progress {
+                return Err(format!(
+                    "create Dameng views failed after dependency retry:\n{}",
+                    errors.join("\n")
+                ));
+            }
+            pending = next_pending;
+        }
+        Ok(())
+    }
+
+    async fn sync_one_stored_view(
+        &self,
+        source_database: &str,
+        target_schema: &str,
+        schema_routes: &[(String, String)],
+        view: &MySqlViewDefinition,
+    ) -> Result<bool, String> {
+        if self
+            .dameng_view_exists(target_schema, view.name.as_str())
+            .await?
+        {
+            info!(
+                "Dameng view exists, skip: {}.{} -> {}.{}",
+                source_database, view.name, target_schema, view.name
+            );
+            return Ok(false);
+        }
+        if self
+            .dameng_object_name_exists(target_schema, view.name.as_str())
+            .await?
+        {
+            return Err(format!(
+                "Dameng object name exists and is not a view: {}.{} source={}.{}",
+                target_schema, view.name, source_database, view.name
+            ));
+        }
+
+        let create_sql = convert_mysql_view_to_dameng_with_name_and_schema_routes(
+            target_schema,
+            source_database,
+            Some(view.name.as_str()),
+            view,
+            schema_routes,
+        )
+        .map_err(|e| {
+            format!(
+                "convert view failed: {}.{} -> {}.{} {}",
+                source_database, view.name, target_schema, view.name, e
+            )
+        })?;
+        self.execute(create_sql.as_str()).await.map_err(|e| {
+            format!(
+                "create Dameng view failed: {}.{} -> {}.{} sql={} error={}",
+                source_database,
+                view.name,
+                target_schema,
+                view.name,
+                Self::sql_preview(create_sql.as_str()),
+                e
+            )
+        })?;
+        info!(
+            "Dameng sync view success: {}.{} -> {}.{}",
+            source_database, view.name, target_schema, view.name
+        );
+        Ok(true)
+    }
+
     async fn sync_one_stored_routine(
         &self,
         source_database: &str,
@@ -3320,6 +3493,16 @@ impl DamengSink {
         Ok(count > 0)
     }
 
+    async fn dameng_view_exists(&self, schema: &str, view_name: &str) -> Result<bool, String> {
+        let sql = Self::dameng_view_exists_sql(schema, view_name);
+        let rows = self.query(sql.as_str(), &[]).await?;
+        let count = rows
+            .first()
+            .and_then(|row| row.get::<i32>(0).ok())
+            .unwrap_or(0);
+        Ok(count > 0)
+    }
+
     async fn dameng_object_name_exists(
         &self,
         schema: &str,
@@ -3352,6 +3535,21 @@ impl DamengSink {
                 Self::eq_original_or_upper_sql("OWNER", schema),
                 Self::quote_literal(object_type),
                 Self::eq_original_or_upper_sql("OBJECT_NAME", routine_name)
+            )
+        }
+    }
+
+    fn dameng_view_exists_sql(schema: &str, view_name: &str) -> String {
+        if schema.is_empty() {
+            format!(
+                "SELECT COUNT(*) FROM USER_OBJECTS WHERE OBJECT_TYPE = 'VIEW' AND {}",
+                Self::eq_original_or_upper_sql("OBJECT_NAME", view_name)
+            )
+        } else {
+            format!(
+                "SELECT COUNT(*) FROM ALL_OBJECTS WHERE {} AND OBJECT_TYPE = 'VIEW' AND {}",
+                Self::eq_original_or_upper_sql("OWNER", schema),
+                Self::eq_original_or_upper_sql("OBJECT_NAME", view_name)
             )
         }
     }
@@ -7958,6 +8156,14 @@ impl DamengSink {
     }
 }
 
+fn strip_trailing_numeric_schema_suffix(value: &str) -> Option<String> {
+    let (base, suffix) = value.rsplit_once('-')?;
+    if base.is_empty() || suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(base.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use common::case_insensitive_hash_map::CaseInsensitiveHashMap;
@@ -7967,6 +8173,18 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use super::{DamengForeignKeyConstraintInfo, DamengParam, DamengSink};
+
+    #[test]
+    fn strips_numeric_schema_suffix_for_view_routes() {
+        assert_eq!(
+            super::strip_trailing_numeric_schema_suffix("newsee-charge-11"),
+            Some("newsee-charge".to_string())
+        );
+        assert_eq!(
+            super::strip_trailing_numeric_schema_suffix("newsee-charge"),
+            None
+        );
+    }
 
     fn table_info(target_schema: &str, column_type: &str) -> TableInfoVo {
         TableInfoVo {
@@ -8063,6 +8281,18 @@ mod tests {
         assert_eq!(
             DamengSink::dameng_object_name_exists_sql("", "sync_demo"),
             "SELECT COUNT(*) FROM USER_OBJECTS WHERE (OBJECT_NAME = 'sync_demo' OR OBJECT_NAME = 'SYNC_DEMO')"
+        );
+    }
+
+    #[test]
+    fn view_exists_sql_checks_view_object_type() {
+        assert_eq!(
+            DamengSink::dameng_view_exists_sql("target_schema", "v_demo"),
+            "SELECT COUNT(*) FROM ALL_OBJECTS WHERE (OWNER = 'target_schema' OR OWNER = 'TARGET_SCHEMA') AND OBJECT_TYPE = 'VIEW' AND (OBJECT_NAME = 'v_demo' OR OBJECT_NAME = 'V_DEMO')"
+        );
+        assert_eq!(
+            DamengSink::dameng_view_exists_sql("", "v_demo"),
+            "SELECT COUNT(*) FROM USER_OBJECTS WHERE OBJECT_TYPE = 'VIEW' AND (OBJECT_NAME = 'v_demo' OR OBJECT_NAME = 'V_DEMO')"
         );
     }
 

@@ -132,6 +132,7 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 | `sync_foreign_key_tables` | No | Include foreign-key-related tables during `table_name: "*"` discovery and add foreign-key constraints after MySQL/Dameng target initialization. Defaults to `true`. For MySQL targets, initial data writes temporarily disable foreign-key checks on the current session so existing target constraints do not block child rows loaded before parent rows. Set to `false` to keep the legacy behavior that excludes tables with foreign-key dependencies or references. |
 | `sync_no_pk_table_schema` | No | Whether to sync table schemas that are not selected for CDC. Defaults to `true`; this includes no-primary-key tables, string primary keys, composite primary keys, and other unsupported primary-key shapes. These tables are schema-only, with primary keys and satisfiable foreign keys created when supported, but no initial data load or CDC writes. StarRocks skips them with a warning. |
 | `sync_stored_procedure` | No | Sync source stored procedures and functions for MySQL → MySQL/Dameng. Defaults to `false`; `sync_stored_procedures` is also accepted. |
+| `sync_stored_view` | No | Sync source views for MySQL → MySQL/Dameng. Defaults to `true`; `sync_stored_views` is also accepted. Existing target views with the same name are skipped. |
 | `overwrite_stored_procedure` | No | When syncing stored procedures/functions, overwrite an existing target object with the same name. Defaults to `false`; `overwrite_stored_procedures` is also accepted. |
 | `random_check_data_after_init` | No | Enable MySQL → Dameng fast sample verification mode. Defaults to `false`. When enabled, initialization only syncs a small sample for each CDC table instead of doing a full load. |
 | `random_check_data_after_init_batch_size_min` | No | Number of sample rows to sync and verify per CDC table in fast sample verification mode. Defaults to `10`; recorded primary keys are queried from both MySQL and Dameng and compared column by column. |
@@ -221,6 +222,7 @@ auto_create_database: true
 auto_create_table: true
 auto_add_column: true
 sync_stored_procedure: false
+sync_stored_view: true
 overwrite_stored_procedure: false
 log_level: info
 enable_ui: true
@@ -228,6 +230,8 @@ ui_port: 8080
 ```
 
 When `sync_stored_procedure` is enabled, the MySQL/Dameng sinks sync `PROCEDURE` and `FUNCTION` definitions during initialization according to the source-to-target database route. If a target object already exists and `overwrite_stored_procedure: false`, it is skipped; when set to `true`, the MySQL sink runs `DROP PROCEDURE/FUNCTION IF EXISTS` and recreates it, while the Dameng sink uses `CREATE OR REPLACE`. The sink removes `DEFINER=\`user\`@\`host\`` from `SHOW CREATE PROCEDURE/FUNCTION` before creating the target object, so the source database user is not copied to the target. MySQL → Dameng performs a basic DMSQL conversion; complex MySQL-specific routine syntax can fail initialization with the object name and error reason.
+
+`sync_stored_view` is enabled by default. The MySQL/Dameng sinks read source `SHOW CREATE VIEW` output after target table schemas are ready, remove `DEFINER`, route the database/schema name, and create the target view. Existing target views with the same name are skipped. MySQL → Dameng performs a basic DMSQL conversion and retries dependent views before returning detailed failures with the view name, target schema, and SQL preview.
 
 ### MySQL → MeiliSearch example
 
@@ -275,6 +279,7 @@ sink_config:
 auto_create_database: true  # Dameng: creates the target schema, not a physical database
 auto_create_table: true
 auto_add_column: true
+sync_stored_view: true
 random_check_data_after_init: false
 random_check_data_after_init_batch_size_min: 10
 ```

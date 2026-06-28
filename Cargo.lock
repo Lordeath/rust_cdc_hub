@@ -722,6 +722,7 @@ dependencies = [
  "lazy_static",
  "md5",
  "prometheus",
+ "regex",
  "serde",
  "serde_json",
  "sqlx",

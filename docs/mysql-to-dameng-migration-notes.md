@@ -36,6 +36,11 @@
 - MySQL routine 中常见需要转换的语法包括：`DATE_FORMAT`、`DATE_ADD/SUB INTERVAL`、`IFNULL`、`LIMIT`、`UPDATE JOIN`、`REGEXP`、临时表/视图 DDL、`DECLARE HANDLER`、`LEAVE/LOOP`、`PREPARE/EXECUTE`、`SIGNAL SQLSTATE` 等。
 - 验证时不能只看进程启动成功；需要确认没有 `sync stored routines failed`、`create Dameng stored routine failed`、`语法分析出错`、`object name exists, skip stored routine` 等日志。
 
+## 视图
+
+- MySQL -> Dameng 独立视图转换也集中在 `mysql_to_dameng` crate。同步前从 `SHOW CREATE VIEW` 去掉 `DEFINER`，目标端已有同名视图时跳过；源库限定名必须按 `database_route` 改成目标 schema。
+- 视图可能依赖其他视图或函数；同步失败时需要保留对象名、目标 schema 和 SQL 摘要，不能只吞错跳过。
+
 ## 验证要求
 
 - 触碰 MySQL -> Dameng DDL、类型映射、routine 转换时，至少跑：

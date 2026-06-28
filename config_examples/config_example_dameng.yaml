@@ -22,6 +22,7 @@ auto_create_database: true  # Dameng: creates target schema when missing
 auto_create_table: true
 auto_add_column: true
 sync_stored_procedure: false  # 基础转换并同步 MySQL 存储过程/函数到 Dameng
+sync_stored_view: true         # 同步 MySQL 视图到 Dameng，目标已存在同名视图时跳过
 overwrite_stored_procedure: false
 random_check_data_after_init: false
 random_check_data_after_init_batch_size_min: 10
