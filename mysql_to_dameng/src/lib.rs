@@ -4275,9 +4275,78 @@ fn convert_mysql_sql_tokens(value: &str, sql_mode: &str) -> String {
     let value = remove_mysql_collate_clauses(value.as_str());
     let value = convert_mysql_now_calls(value.as_str());
     let value = convert_mysql_date_add_sub_interval_calls(value.as_str());
+    let value = convert_mysql_length_calls(value.as_str());
     let value = convert_mysql_date_format_interval_exprs(value.as_str());
     let value = convert_mysql_date_format_calls(value.as_str());
     convert_mysql_str_to_date_calls(value.as_str())
+}
+
+fn convert_mysql_length_calls(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut result = String::with_capacity(value.len());
+    let mut quote = None;
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if let Some(quote_byte) = quote {
+            let ch = value[pos..].chars().next().unwrap();
+            result.push(ch);
+            if byte == b'\\' && quote_byte == b'\'' {
+                pos += ch.len_utf8();
+                if pos < bytes.len() {
+                    let next = value[pos..].chars().next().unwrap();
+                    result.push(next);
+                    pos += next.len_utf8();
+                }
+                continue;
+            }
+            if byte == quote_byte {
+                if bytes.get(pos + 1) == Some(&quote_byte) {
+                    result.push(quote_byte as char);
+                    pos += 2;
+                } else {
+                    quote = None;
+                    pos += ch.len_utf8();
+                }
+            } else {
+                pos += ch.len_utf8();
+            }
+            continue;
+        }
+
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            result.push(byte as char);
+            pos += 1;
+            continue;
+        }
+
+        if let Some((converted, next_pos)) = convert_one_length_call(value, pos) {
+            result.push_str(converted.as_str());
+            pos = next_pos;
+            continue;
+        }
+
+        let ch = value[pos..].chars().next().unwrap();
+        result.push(ch);
+        pos += ch.len_utf8();
+    }
+    result
+}
+
+fn convert_one_length_call(value: &str, pos: usize) -> Option<(String, usize)> {
+    if !starts_with_keyword(value, pos, "LENGTH") {
+        return None;
+    }
+    let open_pos = skip_ascii_whitespace(value, pos + "LENGTH".len());
+    if value.as_bytes().get(open_pos) != Some(&b'(') {
+        return None;
+    }
+    let close_pos = find_matching_paren(value, open_pos)?;
+    Some((
+        format!("LENGTHB({})", &value[open_pos + 1..close_pos]),
+        close_pos + 1,
+    ))
 }
 
 fn convert_mysql_index_hints(value: &str) -> String {
@@ -5975,6 +6044,36 @@ mod tests {
         assert!(sql.contains("FETCH FIRST 10 ROWS ONLY"));
         assert!(sql.contains("'source-db.orders'"));
         assert!(!sql.contains("DEFINER"));
+    }
+
+    #[test]
+    fn converts_mysql_length_calls_to_lengthb() {
+        let sql = convert_mysql_sql_tokens(
+            "SELECT LENGTH(`name`), CHAR_LENGTH(`name`), LENGTHB(`name`), 'LENGTH(`name`)', `LENGTH` FROM `orders`",
+            "",
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT LENGTHB(\"name\"), CHAR_LENGTH(\"name\"), LENGTHB(\"name\"), 'LENGTH(`name`)', \"LENGTH\" FROM \"orders\""
+        );
+    }
+
+    #[test]
+    fn converts_mysql_length_calls_in_views() {
+        let view = MySqlViewDefinition {
+            name: "v_length".to_string(),
+            create_sql:
+                "CREATE VIEW `source-db`.`v_length` AS SELECT LENGTH(`o`.`name`) AS `name_bytes` FROM `source-db`.`orders` `o`"
+                    .to_string(),
+            character_set_client: "utf8mb4".to_string(),
+            collation_connection: "utf8mb4_general_ci".to_string(),
+        };
+
+        let sql = convert_mysql_view_to_dameng("target_schema", "source-db", &view).unwrap();
+
+        assert!(sql.contains("LENGTHB(\"o\".\"name\") AS \"name_bytes\""));
+        assert!(!sql.contains("LENGTH(\"o\".\"name\")"));
     }
 
     #[test]

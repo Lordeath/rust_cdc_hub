@@ -5,8 +5,8 @@ use common::case_insensitive_hash_map::{
 use common::metrics::{SINK_EVENTS_TOTAL, SINK_FLUSH_DURATION_SECONDS, SINK_FLUSH_ERRORS_TOTAL};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::schema::{
-    extract_mysql_create_table_column_definitions, mysql_column_allows_null_from_definition,
-    mysql_column_is_auto_increment_from_definition,
+    extract_mysql_create_table_column_definitions, extract_mysql_generated_column_names,
+    mysql_column_allows_null_from_definition, mysql_column_is_auto_increment_from_definition,
     mysql_primary_key_columns_from_create_table_sql, mysql_type_token_from_column_definition,
 };
 use common::{
@@ -611,7 +611,8 @@ impl DamengSink {
                 pk_value: pk_value.clone(),
                 record: record.clone(),
             });
-        let observed_columns = Self::merge_columns_with_records(&[], std::slice::from_ref(record));
+        let observed_columns =
+            Self::merge_dml_columns_with_records(table_info, &[], std::slice::from_ref(record));
         let mut init_columns = self.random_check_init_columns.lock().await;
         let entry = init_columns.entry(key).or_default();
         let merged_columns = Self::merge_column_lists(entry, &observed_columns);
@@ -865,8 +866,12 @@ impl DamengSink {
         table_info: &TableInfoVo,
         columns: &[String],
     ) -> Vec<RandomCheckColumnPlan> {
+        let generated_columns = Self::generated_source_column_keys(table_info);
         columns
             .iter()
+            .filter(|source_column| {
+                !generated_columns.contains(source_column.to_ascii_lowercase().as_str())
+            })
             .enumerate()
             .map(|(idx, source_column)| {
                 let kind = Self::mysql_compare_kind_for_column(table_info, source_column);
@@ -3694,6 +3699,25 @@ impl DamengSink {
             Self::push_unique_source_column(&mut result, &mut seen, column);
         }
         result
+    }
+
+    fn merge_dml_columns_with_records(
+        table_info: &TableInfoVo,
+        base_columns: &[String],
+        records: &[DataBuffer],
+    ) -> Vec<String> {
+        let generated_columns = Self::generated_source_column_keys(table_info);
+        Self::merge_columns_with_records(base_columns, records)
+            .into_iter()
+            .filter(|column| !generated_columns.contains(column.to_ascii_lowercase().as_str()))
+            .collect()
+    }
+
+    fn generated_source_column_keys(table_info: &TableInfoVo) -> HashSet<String> {
+        extract_mysql_generated_column_names(table_info.create_table_sql.as_str())
+            .into_iter()
+            .map(|column| column.to_ascii_lowercase())
+            .collect()
     }
 
     fn push_unique_source_column(
@@ -6701,7 +6725,11 @@ impl Sink for DamengSink {
                 if !inserted_columns.insert(table_key.to_ascii_lowercase()) {
                     continue;
                 }
+                let generated_columns = Self::generated_source_column_keys(table_info);
                 for col in &table_info.columns {
+                    if generated_columns.contains(col.to_ascii_lowercase().as_str()) {
+                        continue;
+                    }
                     col_info.entry_insert(table_key.as_str(), col.clone());
                 }
             }
@@ -6733,6 +6761,7 @@ impl Sink for DamengSink {
             let table_key = Self::target_table_key(schema.as_str(), table_name.as_str());
             let pk_name = self.get_pk_name_from_cache(table_key.as_str()).await;
             let base_columns = self.columns_cache.lock().await.get(table_key.as_str());
+            let table_info = self.table_info_cache.lock().await.get(table_key.as_str());
 
             if matches!(&record.op, Operation::CREATE(true))
                 && self.init_insert_batch_rows > 1
@@ -6751,7 +6780,8 @@ impl Sink for DamengSink {
                 }
 
                 let records = &batch[index..end];
-                let columns = Self::merge_columns_with_records(&base_columns, records);
+                let columns =
+                    Self::merge_dml_columns_with_records(&table_info, &base_columns, records);
                 for item in records {
                     cache_for_roll_back.push(item.clone());
                     SINK_EVENTS_TOTAL
@@ -6830,8 +6860,11 @@ impl Sink for DamengSink {
                 .with_label_values(&["dameng", table_key.as_str(), op_str])
                 .inc();
 
-            let columns =
-                Self::merge_columns_with_records(&base_columns, std::slice::from_ref(record));
+            let columns = Self::merge_dml_columns_with_records(
+                &table_info,
+                &base_columns,
+                std::slice::from_ref(record),
+            );
             let result = match &record.op {
                 Operation::CREATE(true) => match self
                     .ensure_dml_columns(
@@ -6925,31 +6958,38 @@ impl Sink for DamengSink {
                     }
                 },
                 Operation::UPDATE => {
-                    let update_columns =
-                        Self::merge_columns_with_records(&[], std::slice::from_ref(record));
-                    match self
-                        .ensure_dml_columns(
-                            schema.as_str(),
-                            table_name.as_str(),
-                            table_key.as_str(),
-                            &update_columns,
-                            std::slice::from_ref(record),
-                            false,
-                        )
-                        .await
-                    {
-                        Err(e) => Err(e),
-                        Ok(_) => {
-                            self.cache_dml_columns(table_key.as_str(), &columns).await;
-                            self.upsert_record(
+                    let update_columns = Self::merge_dml_columns_with_records(
+                        &table_info,
+                        &[],
+                        std::slice::from_ref(record),
+                    );
+                    if update_columns.is_empty() {
+                        Ok(())
+                    } else {
+                        match self
+                            .ensure_dml_columns(
                                 schema.as_str(),
                                 table_name.as_str(),
                                 table_key.as_str(),
-                                pk_name.as_str(),
                                 &update_columns,
-                                record,
+                                std::slice::from_ref(record),
+                                false,
                             )
                             .await
+                        {
+                            Err(e) => Err(e),
+                            Ok(_) => {
+                                self.cache_dml_columns(table_key.as_str(), &columns).await;
+                                self.upsert_record(
+                                    schema.as_str(),
+                                    table_name.as_str(),
+                                    table_key.as_str(),
+                                    pk_name.as_str(),
+                                    &update_columns,
+                                    record,
+                                )
+                                .await
+                            }
                         }
                     }
                 }
@@ -8668,6 +8708,53 @@ mod tests {
         assert_eq!(
             columns,
             vec!["id".to_string(), "fullPath".to_string(), "name".to_string()]
+        );
+    }
+
+    #[test]
+    fn dml_columns_skip_mysql_generated_columns() {
+        let table_info = TableInfoVo {
+            source_database: "source_db".to_string(),
+            target_database: "target_schema".to_string(),
+            table_name: "orders".to_string(),
+            pk_column: "id".to_string(),
+            create_table_sql: r#"CREATE TABLE `orders` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `path` varchar(100) DEFAULT NULL,
+  `fullPath` varchar(120) GENERATED ALWAYS AS (concat(`path`,`id`,_utf8mb3'/')) STORED,
+  `name` varchar(20) DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#
+                .to_string(),
+            columns: vec![
+                "id".to_string(),
+                "path".to_string(),
+                "fullPath".to_string(),
+                "name".to_string(),
+            ],
+            foreign_keys: vec![],
+        };
+        let mut after = CaseInsensitiveHashMap::new_with_no_arg();
+        after.insert("id".to_string(), Value::Int64(1));
+        after.insert("path".to_string(), Value::String("/a/".to_string()));
+        after.insert("fullPath".to_string(), Value::String("/a/1/".to_string()));
+        after.insert("name".to_string(), Value::String("n".to_string()));
+        let record = DataBuffer::new(
+            "orders".to_string(),
+            CaseInsensitiveHashMap::new_with_no_arg(),
+            after,
+            Operation::CREATE(true),
+            "".to_string(),
+            0,
+            0,
+        );
+
+        let columns =
+            DamengSink::merge_dml_columns_with_records(&table_info, &table_info.columns, &[record]);
+
+        assert_eq!(
+            columns,
+            vec!["id".to_string(), "path".to_string(), "name".to_string()]
         );
     }
 

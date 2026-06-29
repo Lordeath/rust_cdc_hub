@@ -12,15 +12,22 @@
 - MySQL 5.0.3 以后，`CHAR(n)`、`VARCHAR(n)` 的 `n` 按字符数理解；达梦默认更容易按字节长度踩坑。
 - 达梦 FAQ 提到：MySQL `varchar(1)` 可以存 1 个汉字；达梦按字节计时，GB18030 下一个汉字需要 2 字节，UTF-8 下一个汉字需要 3 字节。
 - 本项目把 MySQL `char(n)`、`varchar(n)` 映射为达梦 `CHAR(n CHAR)`、`VARCHAR(n CHAR)`，不要退回字节语义。
+- 不要默认把 `varchar(n)` 放大为 `varchar(n * factor)`：`VARCHAR(n CHAR)` 对齐的是 MySQL 的字符数语义，`ID_` 这类主键/索引列也不能为了绕过长度怀疑改成 `CLOB`。
 - 已存在的达梦列也要检查：如果目标列是字节语义，或者目标字符长度小于源端字符长度，必须在 `auto_modify_column=true` 时修改。
 - MySQL `text/json/enum/set` 等宽文本应映射为达梦 `CLOB`。如果目标端已有较窄的 `VARCHAR/CHAR`，也必须自动改为 `CLOB`，否则会出现 `-6169: 列[...]长度超出定义`。
 - 不要为了绕过长度错误启用截断容错；同步工具必须保证不丢数据。
+
+## 字符串函数长度语义
+
+- MySQL `LENGTH(str)` 返回字节数；达梦 `LENGTH(str)` 返回字符数。迁移 routine/view 时，MySQL `LENGTH(...)` 必须转成达梦 `LENGTHB(...)`，避免中文等多字节字符场景结果变小。
+- MySQL `CHAR_LENGTH(str)` 和达梦字符数语义一致，保留 `CHAR_LENGTH(...)`。
 
 ## 对象和 schema 映射
 
 - MySQL 是单实例多库，达梦通常用 schema 对应 MySQL database；本项目通过 `multi_mode.database_route` 做 source database 到 target schema 映射。
 - 达梦大小写、引号会影响对象定位。自动建 schema/table/column 时继续使用当前 quote 策略，避免大小写漂移。
 - MySQL 允许某些对象名组合在实际库中共存；达梦对象命名空间更容易冲突。本项目遇到非 routine 对象占用同名 routine 时，使用稳定后缀创建，例如 `_procedure`、`_function`。
+- MySQL `GENERATED ALWAYS` / `VIRTUAL GENERATED` / `STORED GENERATED` 列不在达梦侧自动建普通列；source 侧只用生成列位置做 binlog 列对齐，Dameng sink 的 DDL/DML/随机校验都要跳过这些列。
 
 ## 类型和默认值
 
