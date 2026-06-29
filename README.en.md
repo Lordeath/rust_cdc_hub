@@ -457,6 +457,7 @@ To add a new Source or Sink:
 - [ ] Multi-target fan-out or table-based routing
 - [ ] Failure bypass and replay: DLQ, error classification, exponential backoff
 - [ ] Docker Compose E2E integration tests
+- [ ] File-based logging: write runtime logs to files, with configurable log directory, rotation, and retention
 - [ ] TLS, log redaction, rate limiting/backpressure, hot config reload
 
 ## Notes
