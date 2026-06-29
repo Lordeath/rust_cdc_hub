@@ -3058,6 +3058,7 @@ dependencies = [
  "tracing",
  "tracing-log",
  "tracing-subscriber",
+ "wattle-appender",
 ]
 
 [[package]]
@@ -4463,6 +4464,17 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
+]
+
+[[package]]
+name = "wattle-appender"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc4493ab69ae2c3fc961b3a63f95faa5780ce0e6ab91abb34880bfbcb8ecb17c"
+dependencies = [
+ "chrono",
+ "flate2",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -153,9 +153,79 @@ pub struct CdcConfig {
     pub sink_batch_size: Option<usize>,
     pub checkpoint_file_path: Option<String>,
     pub log_level: Option<String>,
+    pub log_file: Option<LogFileConfig>,
     pub enable_ui: Option<bool>,
     pub ui_bind: Option<String>,
     pub ui_port: Option<u16>,
+}
+
+const DEFAULT_LOG_FILE_DIR: &str = "/app/logs";
+const DEFAULT_LOG_FILE_NAME: &str = "rust_cdc_hub.log";
+const DEFAULT_LOG_FILE_MAX_SIZE_MB: u64 = 100;
+const DEFAULT_LOG_FILE_RETENTION_DAYS: usize = 30;
+const DEFAULT_LOG_FILE_MAX_BACKUP_FILES: usize = 300;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LogFileConfig {
+    pub enabled: Option<bool>,
+    pub dir: Option<String>,
+    pub file_name: Option<String>,
+    pub max_size_mb: Option<u64>,
+    pub retention_days: Option<usize>,
+    pub max_backup_files: Option<usize>,
+    pub compress_gzip: Option<bool>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ResolvedLogFileConfig {
+    pub enabled: bool,
+    pub dir: String,
+    pub file_name: String,
+    pub max_size_mb: u64,
+    pub retention_days: usize,
+    pub max_backup_files: usize,
+    pub compress_gzip: bool,
+}
+
+impl LogFileConfig {
+    pub fn resolved(&self) -> ResolvedLogFileConfig {
+        ResolvedLogFileConfig {
+            enabled: self.enabled.unwrap_or(false),
+            dir: non_empty_or_default(self.dir.as_deref(), DEFAULT_LOG_FILE_DIR),
+            file_name: non_empty_or_default(self.file_name.as_deref(), DEFAULT_LOG_FILE_NAME),
+            max_size_mb: positive_or_default(self.max_size_mb, DEFAULT_LOG_FILE_MAX_SIZE_MB),
+            retention_days: positive_or_default(
+                self.retention_days,
+                DEFAULT_LOG_FILE_RETENTION_DAYS,
+            ),
+            max_backup_files: positive_or_default(
+                self.max_backup_files,
+                DEFAULT_LOG_FILE_MAX_BACKUP_FILES,
+            ),
+            compress_gzip: self.compress_gzip.unwrap_or(true),
+        }
+    }
+}
+
+impl Default for ResolvedLogFileConfig {
+    fn default() -> Self {
+        LogFileConfig::default().resolved()
+    }
+}
+
+fn non_empty_or_default(value: Option<&str>, default: &str) -> String {
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn positive_or_default<T>(value: Option<T>, default: T) -> T
+where
+    T: PartialOrd + From<u8> + Copy,
+{
+    value.filter(|v| *v > T::from(0)).unwrap_or(default)
 }
 
 impl CdcConfig {
@@ -251,6 +321,13 @@ impl CdcConfig {
         self.random_check_data_after_init_batch_size_min
             .unwrap_or(10)
             .max(1)
+    }
+
+    pub fn log_file_config(&self) -> ResolvedLogFileConfig {
+        self.log_file
+            .as_ref()
+            .map(LogFileConfig::resolved)
+            .unwrap_or_default()
     }
 
     pub fn target_database_for_source(&self, source_database: &str) -> String {
@@ -2091,6 +2168,7 @@ mod tests {
             sink_batch_size: None,
             checkpoint_file_path: None,
             log_level: None,
+            log_file: None,
             enable_ui: None,
             ui_bind: None,
             ui_port: None,
@@ -2141,6 +2219,101 @@ mod tests {
 
         assert!(!config.random_check_data_after_init_enabled());
         assert_eq!(config.random_check_data_after_init_batch_size_min(), 1);
+    }
+
+    #[test]
+    fn log_file_config_defaults_are_disabled() {
+        let config: CdcConfig = serde_json::from_str(
+            r#"{
+                "source_type": "MySQL",
+                "sink_type": "Dameng",
+                "source_config": [{}],
+                "sink_config": [{}]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.log_file_config(),
+            ResolvedLogFileConfig {
+                enabled: false,
+                dir: "/app/logs".to_string(),
+                file_name: "rust_cdc_hub.log".to_string(),
+                max_size_mb: 100,
+                retention_days: 30,
+                max_backup_files: 300,
+                compress_gzip: true,
+            }
+        );
+    }
+
+    #[test]
+    fn log_file_config_resolves_custom_values() {
+        let config: CdcConfig = serde_json::from_str(
+            r#"{
+                "source_type": "MySQL",
+                "sink_type": "Dameng",
+                "source_config": [{}],
+                "sink_config": [{}],
+                "log_file": {
+                    "enabled": true,
+                    "dir": "/tmp/rust-cdc-logs",
+                    "file_name": "cdc.log",
+                    "max_size_mb": 50,
+                    "retention_days": 14,
+                    "max_backup_files": 100,
+                    "compress_gzip": false
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.log_file_config(),
+            ResolvedLogFileConfig {
+                enabled: true,
+                dir: "/tmp/rust-cdc-logs".to_string(),
+                file_name: "cdc.log".to_string(),
+                max_size_mb: 50,
+                retention_days: 14,
+                max_backup_files: 100,
+                compress_gzip: false,
+            }
+        );
+    }
+
+    #[test]
+    fn log_file_config_uses_defaults_for_blank_or_zero_values() {
+        let config: CdcConfig = serde_json::from_str(
+            r#"{
+                "source_type": "MySQL",
+                "sink_type": "Dameng",
+                "source_config": [{}],
+                "sink_config": [{}],
+                "log_file": {
+                    "enabled": true,
+                    "dir": " ",
+                    "file_name": "",
+                    "max_size_mb": 0,
+                    "retention_days": 0,
+                    "max_backup_files": 0
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.log_file_config(),
+            ResolvedLogFileConfig {
+                enabled: true,
+                dir: "/app/logs".to_string(),
+                file_name: "rust_cdc_hub.log".to_string(),
+                max_size_mb: 100,
+                retention_days: 30,
+                max_backup_files: 300,
+                compress_gzip: true,
+            }
+        );
     }
 
     #[test]

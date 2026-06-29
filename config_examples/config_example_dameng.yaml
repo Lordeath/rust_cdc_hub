@@ -27,3 +27,11 @@ overwrite_stored_procedure: false
 random_check_data_after_init: false
 random_check_data_after_init_batch_size_min: 10
 log_level: info
+log_file:
+  enabled: false
+  dir: /app/logs
+  file_name: rust_cdc_hub.log
+  max_size_mb: 100
+  retention_days: 30
+  max_backup_files: 300
+  compress_gzip: true

@@ -4,8 +4,8 @@ use actix_web::{App, HttpResponse, HttpServer, Responder, http::header, web};
 use common::metrics::APP_RESTART_COUNT;
 use common::runtime_progress;
 use common::{
-    CdcConfig, FlushByOperation, Plugin, PluginConfig, PluginType, Sink, Source, TableInfoVo,
-    get_mysql_pool_by_url, mysql_connection_url_from_config,
+    CdcConfig, FlushByOperation, Plugin, PluginConfig, PluginType, ResolvedLogFileConfig, Sink,
+    Source, TableInfoVo, get_mysql_pool_by_url, mysql_connection_url_from_config,
 };
 use prometheus::{Encoder, TextEncoder, gather};
 use serde_json::json;
@@ -21,17 +21,20 @@ use tokio::sync::Mutex;
 use chrono::Local;
 use chrono::Utc;
 use plugin::PluginFactory;
+use std::path::PathBuf;
 use std::time::Duration;
 use std::{env, fs, io, process};
 use tokio::time::sleep;
 use tracing::subscriber::set_global_default;
 use tracing::{debug, error, info, trace, warn};
-use tracing_subscriber::FmtSubscriber;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
+use wattle_appender::FileAppender;
 
 const DEFAULT_UI_PORT: u16 = 18088;
 const DAMENG_RANDOM_CHECK_RESULT_FILE: &str = "/opt/fxm/datacheck-resule.log";
+const BYTES_PER_MB: u64 = 1024 * 1024;
 
 #[cfg(target_os = "linux")]
 unsafe extern "C" {
@@ -90,6 +93,102 @@ fn reset_random_check_result_file_on_start(config: &CdcConfig) {
     }
 }
 
+fn log_file_path(config: &ResolvedLogFileConfig) -> PathBuf {
+    PathBuf::from(config.dir.as_str()).join(config.file_name.as_str())
+}
+
+fn log_file_size_limit_bytes(config: &ResolvedLogFileConfig) -> u64 {
+    config.max_size_mb.saturating_mul(BYTES_PER_MB)
+}
+
+fn build_file_appender(config: &ResolvedLogFileConfig) -> io::Result<FileAppender> {
+    let path = log_file_path(config);
+    let mut builder = FileAppender::new()
+        .file_name(&path)
+        .daily_rotation()
+        .size_limit(log_file_size_limit_bytes(config))
+        .max_backup(config.max_backup_files)
+        .max_age_days(config.retention_days);
+
+    if config.compress_gzip {
+        builder = builder.gzip_compression();
+    }
+
+    builder.build().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("初始化日志文件失败: path={}, error={}", path.display(), e),
+        )
+    })
+}
+
+fn init_tracing(config: &CdcConfig) -> Result<(), Box<dyn Error>> {
+    let log_level = config.log_level.clone().unwrap_or("info".to_string());
+    let env_filter = EnvFilter::try_new(log_level.as_str()).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("解析 log_level 失败: log_level={}, error={}", log_level, e),
+        )
+    })?;
+    let log_file = config.log_file_config();
+    let file_appender = if log_file.enabled {
+        Some(build_file_appender(&log_file)?)
+    } else {
+        None
+    };
+
+    tracing_log::LogTracer::init().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("初始化 log bridge 失败: {}", e),
+        )
+    })?;
+    if let Some(file_appender) = file_appender {
+        let subscriber = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_target(true)
+                    .with_thread_names(false)
+                    .with_timer(CustomTime),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(file_appender)
+                    .with_ansi(false)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_target(true)
+                    .with_thread_names(false)
+                    .with_timer(CustomTime),
+            );
+        set_global_default(subscriber).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("设置 tracing subscriber 失败: {}", e),
+            )
+        })?;
+    } else {
+        let subscriber = tracing_subscriber::registry().with(env_filter).with(
+            tracing_subscriber::fmt::layer()
+                .with_file(true)
+                .with_line_number(true)
+                .with_target(true)
+                .with_thread_names(false)
+                .with_timer(CustomTime),
+        );
+        set_global_default(subscriber).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("设置 tracing subscriber 失败: {}", e),
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 struct UiState {
     started_at: i64,
@@ -114,6 +213,7 @@ impl UiState {
     fn new_with_started_at(config: &CdcConfig, started_at: i64) -> Self {
         let database_split = database_split_summary(config);
         let column_in_enabled = plugin_config(config, PluginType::ColumnIn).is_some();
+        let log_file = config.log_file_config();
         let config_summary = json!({
             "source_type": format!("{}", config.source_type),
             "sink_type": format!("{}", config.sink_type),
@@ -132,6 +232,15 @@ impl UiState {
             "overwrite_stored_procedure": config.overwrite_stored_procedure_enabled(),
             "random_check_data_after_init": config.random_check_data_after_init_enabled(),
             "random_check_data_after_init_batch_size_min": config.random_check_data_after_init_batch_size_min(),
+            "log_file": {
+                "enabled": log_file.enabled,
+                "dir": log_file.dir,
+                "file_name": log_file.file_name,
+                "max_size_mb": log_file.max_size_mb,
+                "retention_days": log_file.retention_days,
+                "max_backup_files": log_file.max_backup_files,
+                "compress_gzip": log_file.compress_gzip,
+            },
             "ui_bind": config.ui_bind.clone(),
             "ui_port": config.ui_port,
             "database_split": database_split.clone(),
@@ -1933,20 +2042,7 @@ async fn main() {
             config_path, e
         )
     });
-    let log_level = config.log_level.clone().unwrap_or("info".to_string());
-
-    // 设置 tracing 日志格式，自动输出文件名、行号和函数名
-    let subscriber = FmtSubscriber::builder()
-        .with_env_filter(log_level)
-        .with_file(true)
-        .with_line_number(true)
-        .with_target(true)
-        .with_thread_names(false)
-        .with_timer(CustomTime)
-        .finish();
-
-    tracing_log::LogTracer::init().expect("Failed to set logger");
-    set_global_default(subscriber).expect("setting default subscriber failed");
+    init_tracing(&config).unwrap_or_else(|e| panic!("Failed to initialize tracing: {}", e));
 
     trace!("App 启动");
     debug!("App 启动");
@@ -2321,6 +2417,62 @@ plugins:
                 foreign_keys: vec![],
             },
         ]
+    }
+
+    #[test]
+    fn test_log_file_path_uses_dir_and_file_name() {
+        let config = ResolvedLogFileConfig {
+            enabled: true,
+            dir: "/tmp/rust-cdc-logs".to_string(),
+            file_name: "cdc.log".to_string(),
+            max_size_mb: 100,
+            retention_days: 30,
+            max_backup_files: 300,
+            compress_gzip: true,
+        };
+
+        assert_eq!(
+            log_file_path(&config),
+            PathBuf::from("/tmp/rust-cdc-logs").join("cdc.log")
+        );
+    }
+
+    #[test]
+    fn test_log_file_size_limit_uses_mebibytes() {
+        let config = ResolvedLogFileConfig {
+            enabled: true,
+            dir: "/tmp/rust-cdc-logs".to_string(),
+            file_name: "cdc.log".to_string(),
+            max_size_mb: 100,
+            retention_days: 30,
+            max_backup_files: 300,
+            compress_gzip: true,
+        };
+
+        assert_eq!(log_file_size_limit_bytes(&config), 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_build_file_appender_creates_log_entry_path() {
+        let dir = env::temp_dir().join(format!("rust-cdc-hub-log-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let config = ResolvedLogFileConfig {
+            enabled: true,
+            dir: dir.display().to_string(),
+            file_name: "rust_cdc_hub.log".to_string(),
+            max_size_mb: 100,
+            retention_days: 30,
+            max_backup_files: 300,
+            compress_gzip: true,
+        };
+
+        let mut appender = build_file_appender(&config).unwrap();
+        use std::io::Write;
+        writeln!(appender, "log file smoke test").unwrap();
+        appender.flush().unwrap();
+
+        assert!(log_file_path(&config).exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

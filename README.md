@@ -141,6 +141,7 @@ export CONFIG_PATH=/path/to/config.yaml
 | `sink_batch_size` | 否 | Sink 批量写入大小。 |
 | `checkpoint_file_path` | 否 | checkpoint 文件路径。 |
 | `log_level` | 否 | 日志级别，如 `debug`、`info`。 |
+| `log_file` | 否 | 文件日志配置。默认不启用；启用后会继续打印 console，并按日期或大小滚动写入文件。 |
 | `enable_ui` | 否 | 是否启用监控 UI，默认 `true`。 |
 | `ui_bind` | 否 | UI 监听地址。 |
 | `ui_port` | 否 | UI 监听端口，默认 `18088`。 |
@@ -226,9 +227,19 @@ sync_stored_procedure: false
 sync_stored_view: true
 overwrite_stored_procedure: false
 log_level: info
+log_file:
+  enabled: false
+  dir: /app/logs
+  file_name: rust_cdc_hub.log
+  max_size_mb: 100
+  retention_days: 30
+  max_backup_files: 300
+  compress_gzip: true
 enable_ui: true
 ui_port: 8080
 ```
+
+`log_file.enabled: true` 时，程序会写入 `/app/logs/rust_cdc_hub.log`，并按天或超过 `max_size_mb` 滚动；归档日志默认压缩为 `.gz`，同时受 `retention_days` 和 `max_backup_files` 限制。日志目录无法创建或写入时启动失败。
 
 开启 `sync_stored_procedure` 后，MySQL/Dameng sink 初始化时会按源库到目标库的路由同步 `PROCEDURE` 和 `FUNCTION`。目标库已有同名对象且 `overwrite_stored_procedure: false` 时会跳过；设为 `true` 时，MySQL 目标端会先 `DROP PROCEDURE/FUNCTION IF EXISTS` 再重建，Dameng 目标端会使用 `CREATE OR REPLACE` 覆盖。同步前会从 `SHOW CREATE PROCEDURE/FUNCTION` 结果里去掉 `DEFINER=\`user\`@\`host\``，避免把源库用户带到目标库。MySQL → Dameng 会做基础 DMSQL 转换，复杂 MySQL 专有语法可能导致初始化失败并输出对象名和错误原因。
 
@@ -435,8 +446,11 @@ docker build --network host -t rust_cdc_hub:0.0.1 -f ./debian.dockerfile .
 docker run --name rust_cdc_hub --rm -it \
   -e CONFIG_PATH=/config.yaml \
   -v /path/to/config.yaml:/config.yaml \
+  -v /path/to/logs:/app/logs \
   rust_cdc_hub:0.0.1
 ```
+
+如果未启用 `log_file`，日志仍只输出到 console，`/app/logs` 挂载不是必需的。
 
 也可以直接挂载本地编译产物到基础镜像中运行：
 
@@ -496,7 +510,7 @@ cargo test -p common --verbose
 - [ ] 多目标 fan-out 或按表路由
 - [ ] 失败旁路与重放（DLQ、错误分类、指数退避）
 - [ ] Docker Compose E2E 集成测试
-- [ ] 日志文件化：支持将运行日志写入文件，并配置日志目录、滚动策略和保留周期
+- [x] 日志文件化：支持将运行日志写入文件，并配置日志目录、滚动策略、压缩和保留周期
 - [ ] TLS、日志脱敏、限流/背压、热重载配置
 
 ## 注意事项

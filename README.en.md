@@ -141,6 +141,7 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 | `sink_batch_size` | No | Sink batch size. |
 | `checkpoint_file_path` | No | Checkpoint file path. |
 | `log_level` | No | Log level, for example `debug` or `info`. |
+| `log_file` | No | File logging configuration. Disabled by default; when enabled, console logging is kept and runtime logs rotate by date or size. |
 | `enable_ui` | No | Enable the monitoring UI. Defaults to `true`. |
 | `ui_bind` | No | UI bind address. |
 | `ui_port` | No | UI port. Defaults to `18088`. |
@@ -225,9 +226,19 @@ sync_stored_procedure: false
 sync_stored_view: true
 overwrite_stored_procedure: false
 log_level: info
+log_file:
+  enabled: false
+  dir: /app/logs
+  file_name: rust_cdc_hub.log
+  max_size_mb: 100
+  retention_days: 30
+  max_backup_files: 300
+  compress_gzip: true
 enable_ui: true
 ui_port: 8080
 ```
+
+When `log_file.enabled: true`, the application writes to `/app/logs/rust_cdc_hub.log` and rotates daily or when `max_size_mb` is exceeded. Archived logs are compressed as `.gz` by default and are limited by both `retention_days` and `max_backup_files`. Startup fails if the log directory cannot be created or written.
 
 When `sync_stored_procedure` is enabled, the MySQL/Dameng sinks sync `PROCEDURE` and `FUNCTION` definitions during initialization according to the source-to-target database route. If a target object already exists and `overwrite_stored_procedure: false`, it is skipped; when set to `true`, the MySQL sink runs `DROP PROCEDURE/FUNCTION IF EXISTS` and recreates it, while the Dameng sink uses `CREATE OR REPLACE`. The sink removes `DEFINER=\`user\`@\`host\`` from `SHOW CREATE PROCEDURE/FUNCTION` before creating the target object, so the source database user is not copied to the target. MySQL → Dameng performs a basic DMSQL conversion; complex MySQL-specific routine syntax can fail initialization with the object name and error reason.
 
@@ -396,8 +407,11 @@ Run the image:
 docker run --name rust_cdc_hub --rm -it \
   -e CONFIG_PATH=/config.yaml \
   -v /path/to/config.yaml:/config.yaml \
+  -v /path/to/logs:/app/logs \
   rust_cdc_hub:0.0.1
 ```
+
+If `log_file` is not enabled, logs are still written only to the console and mounting `/app/logs` is optional.
 
 You can also mount a locally built binary into a base image:
 
@@ -457,7 +471,7 @@ To add a new Source or Sink:
 - [ ] Multi-target fan-out or table-based routing
 - [ ] Failure bypass and replay: DLQ, error classification, exponential backoff
 - [ ] Docker Compose E2E integration tests
-- [ ] File-based logging: write runtime logs to files, with configurable log directory, rotation, and retention
+- [x] File-based logging: write runtime logs to files, with configurable log directory, rotation, compression, and retention
 - [ ] TLS, log redaction, rate limiting/backpressure, hot config reload
 
 ## Notes

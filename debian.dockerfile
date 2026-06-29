@@ -54,7 +54,7 @@ RUN sed -i "s|http://deb.debian.org/debian-security|http://${DEBIAN_MIRROR}/debi
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates gosu tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin appuser \
-    && mkdir -p /checkpoint \
+    && mkdir -p /checkpoint /app/logs \
     && chown -R appuser:appuser /app /checkpoint
 
 # 拷贝最终二进制
