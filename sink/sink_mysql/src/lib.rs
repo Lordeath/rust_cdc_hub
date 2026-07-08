@@ -1908,6 +1908,8 @@ mod tests {
                 column_type
             ),
             columns: vec!["id".to_string(), "name".to_string()],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         }
     }

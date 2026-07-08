@@ -35,12 +35,17 @@
 - MySQL `timestamp/datetime` 的 `CURRENT_TIMESTAMP` 可以保留；`ON UPDATE CURRENT_TIMESTAMP` 不能照搬为列定义。
 - MySQL 零日期、非法日期、宽松数值转换等行为与达梦不同，不要依赖达梦兼容参数吞错；同步前后应保留可诊断错误。
 - MySQL `blob/binary` 映射为 `BLOB`，文本类大字段映射为 `CLOB`，运行时参数绑定也要区分文本和字节。
+- 自动建表后的表注释同步为 `COMMENT ON TABLE`，列注释同步为 `COMMENT ON COLUMN`；不要把 MySQL 建表内 `COMMENT` 原样拼进达梦 `CREATE TABLE`。
+- MySQL 普通/唯一 BTREE 二级索引可以同步为达梦 `CREATE [UNIQUE] INDEX`。前缀索引、表达式索引、全文/空间等非 BTREE 索引，以及映射到达梦 `CLOB/BLOB` 的列索引必须跳过并记录日志。
 
 ## 存储过程和函数
 
 - 达梦官方 FAQ 说明 MySQL 到 DM 的语法兼容并不完整，表、视图、游标、系统函数、存储过程都可能需要改写。
 - 本项目的 MySQL -> Dameng routine 转换集中在 `mysql_to_dameng` crate；新增语法兼容时必须补单测，并用真实远端同步日志验证。
 - MySQL routine 中常见需要转换的语法包括：`DATE_FORMAT`、`DATE_ADD/SUB INTERVAL`、`IFNULL`、`LIMIT`、`UPDATE JOIN`、`REGEXP`、临时表/视图 DDL、`DECLARE HANDLER`、`LEAVE/LOOP`、`PREPARE/EXECUTE`、`SIGNAL SQLSTATE` 等。
+- `CONVERT(expr, type)` 要转成 `CAST(expr AS type)`，`CAST(expr AS UNSIGNED)` 要转成达梦可识别的数值类型；`PERIOD_DIFF`、`MAKEDATE` 需要显式改写为达梦表达式。
+- `FORCE/USE/IGNORE INDEX` 在 routine/view 转换中默认移除，不转达梦 hint，避免不同优化器 hint 语义造成误导。
+- `ON DUPLICATE KEY UPDATE`、`REPLACE INTO`、`INSERT IGNORE`、`UPDATE ... ORDER BY ... LIMIT`、一次 `UPDATE JOIN` 同时更新多张表字段等非等价 SQL 不自动近似转换；必须返回带差异编号、对象名和 SQL 摘要的错误。
 - 验证时不能只看进程启动成功；需要确认没有 `sync stored routines failed`、`create Dameng stored routine failed`、`语法分析出错`、`object name exists, skip stored routine` 等日志。
 
 ## 视图

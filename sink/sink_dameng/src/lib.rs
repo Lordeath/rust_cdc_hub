@@ -11,8 +11,8 @@ use common::schema::{
 };
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, ForeignKeyInfo, MySqlRoutineDefinition,
-    MySqlRoutineKind, MySqlViewDefinition, Operation, Sink, TableInfoVo, Value, database_table_key,
-    fetch_mysql_routines, fetch_mysql_views, get_mysql_pool_by_url,
+    MySqlRoutineKind, MySqlViewDefinition, Operation, Sink, TableIndexInfo, TableInfoVo, Value,
+    database_table_key, fetch_mysql_routines, fetch_mysql_views, get_mysql_pool_by_url,
     mysql_connection_url_from_config,
 };
 use dameng::Client;
@@ -2965,7 +2965,8 @@ impl DamengSink {
         }
         for table_info in &self.table_info_list {
             let schema = Self::table_info_target_schema(table_info, self.schema.as_str());
-            self.ensure_table(schema.as_str(), table_info)
+            let table_created = self
+                .ensure_table(schema.as_str(), table_info)
                 .await
                 .map_err(|e| {
                     format!(
@@ -2983,6 +2984,17 @@ impl DamengSink {
                         e
                     )
                 })?;
+            if table_created {
+                self.ensure_table_comment(schema.as_str(), table_info)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "Dameng ensure table comment failed: {} {}",
+                            Self::target_table_key(schema.as_str(), table_info.table_name.as_str()),
+                            e
+                        )
+                    })?;
+            }
             self.ensure_column_comments(schema.as_str(), table_info)
                 .await
                 .map_err(|e| {
@@ -2999,6 +3011,41 @@ impl DamengSink {
     async fn ensure_database(&self) -> Result<(), String> {
         for schema in self.target_schemas() {
             self.ensure_database_schema(schema.as_str()).await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_table_comment(
+        &self,
+        schema: &str,
+        table_info: &TableInfoVo,
+    ) -> Result<(), String> {
+        let expected_comment = table_info.table_comment.trim();
+        if expected_comment.is_empty() {
+            return Ok(());
+        }
+        let existing_comment = self
+            .existing_table_comment(schema, table_info.table_name.as_str())
+            .await?;
+        if existing_comment.as_deref() == Some(expected_comment) {
+            return Ok(());
+        }
+        let sql =
+            Self::comment_on_table_sql(schema, table_info.table_name.as_str(), expected_comment);
+        match self.execute(sql.as_str()).await {
+            Ok(_) => info!(
+                "Dameng auto comment table success: {}",
+                Self::target_table_key(schema, table_info.table_name.as_str())
+            ),
+            Err(e) => {
+                let msg = format!(
+                    "Dameng auto comment table failed: {} {}",
+                    Self::target_table_key(schema, table_info.table_name.as_str()),
+                    e
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
         }
         Ok(())
     }
@@ -3305,19 +3352,28 @@ impl DamengSink {
             ));
         }
 
-        let create_sql = convert_mysql_view_to_dameng_with_name_and_schema_routes(
+        let create_sql = match convert_mysql_view_to_dameng_with_name_and_schema_routes(
             target_schema,
             source_database,
             Some(view.name.as_str()),
             view,
             schema_routes,
-        )
-        .map_err(|e| {
-            format!(
-                "convert view failed: {}.{} -> {}.{} {}",
-                source_database, view.name, target_schema, view.name, e
-            )
-        })?;
+        ) {
+            Ok(sql) => sql,
+            Err(e) if Self::is_unsupported_mysql_syntax_error(e.as_str()) => {
+                warn!(
+                    "Dameng skip unsupported MySQL view: {}.{} -> {}.{} {}",
+                    source_database, view.name, target_schema, view.name, e
+                );
+                return Ok(false);
+            }
+            Err(e) => {
+                return Err(format!(
+                    "convert view failed: {}.{} -> {}.{} {}",
+                    source_database, view.name, target_schema, view.name, e
+                ));
+            }
+        };
         self.execute(create_sql.as_str()).await.map_err(|e| {
             format!(
                 "create Dameng view failed: {}.{} -> {}.{} sql={} error={}",
@@ -3392,22 +3448,36 @@ impl DamengSink {
             target_routine_name = renamed_routine_name;
         }
 
-        let create_sql = convert_mysql_routine_to_dameng_with_name(
+        let create_sql = match convert_mysql_routine_to_dameng_with_name(
             target_schema,
             Some(target_routine_name.as_str()),
             routine,
-        )
-        .map_err(|e| {
-            format!(
-                "convert stored routine failed: {} {}.{} -> {}.{} {}",
-                routine.kind.routine_type(),
-                source_database,
-                routine.name,
-                target_schema,
-                target_routine_name,
-                e
-            )
-        })?;
+        ) {
+            Ok(sql) => sql,
+            Err(e) if Self::is_unsupported_mysql_syntax_error(e.as_str()) => {
+                warn!(
+                    "Dameng skip unsupported MySQL stored routine: {} {}.{} -> {}.{} {}",
+                    routine.kind.routine_type(),
+                    source_database,
+                    routine.name,
+                    target_schema,
+                    target_routine_name,
+                    e
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(format!(
+                    "convert stored routine failed: {} {}.{} -> {}.{} {}",
+                    routine.kind.routine_type(),
+                    source_database,
+                    routine.name,
+                    target_schema,
+                    target_routine_name,
+                    e
+                ));
+            }
+        };
         self.execute(create_sql.as_str()).await.map_err(|e| {
             format!(
                 "create Dameng stored routine failed: {} {}.{} -> {}.{} overwrite={} sql={} error={}",
@@ -3591,15 +3661,19 @@ impl DamengSink {
         compact
     }
 
-    async fn ensure_table(&self, schema: &str, table_info: &TableInfoVo) -> Result<(), String> {
+    fn is_unsupported_mysql_syntax_error(error: &str) -> bool {
+        error.contains("unsupported MySQL syntax")
+    }
+
+    async fn ensure_table(&self, schema: &str, table_info: &TableInfoVo) -> Result<bool, String> {
         if !self.auto_create_table {
-            return Ok(());
+            return Ok(false);
         }
         if self
             .table_exists(schema, table_info.table_name.as_str())
             .await?
         {
-            return Ok(());
+            return Ok(false);
         }
 
         let sql = Self::create_table_sql(schema, table_info)?;
@@ -3608,7 +3682,7 @@ impl DamengSink {
             "Dameng auto create table success: {}",
             Self::target_table_key(schema, table_info.table_name.as_str())
         );
-        Ok(())
+        Ok(true)
     }
 
     fn create_table_sql(schema: &str, table_info: &TableInfoVo) -> Result<String, String> {
@@ -4603,6 +4677,34 @@ impl DamengSink {
         }
     }
 
+    async fn existing_table_comment(
+        &self,
+        schema: &str,
+        table_name: &str,
+    ) -> Result<Option<String>, String> {
+        let sql = Self::table_comment_sql(schema, table_name);
+        let rows = self.query(sql.as_str(), &[]).await?;
+        Ok(rows
+            .first()
+            .and_then(|row| row.get::<String>(0).ok())
+            .map(|comment| comment.trim().to_string()))
+    }
+
+    fn table_comment_sql(schema: &str, table_name: &str) -> String {
+        if schema.is_empty() {
+            format!(
+                "SELECT NVL(COMMENTS, '') FROM USER_TAB_COMMENTS WHERE {}",
+                Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
+            )
+        } else {
+            format!(
+                "SELECT NVL(COMMENTS, '') FROM ALL_TAB_COMMENTS WHERE {} AND {}",
+                Self::eq_original_or_upper_sql("OWNER", schema),
+                Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
+            )
+        }
+    }
+
     async fn existing_column_comments(
         &self,
         schema: &str,
@@ -5332,6 +5434,204 @@ impl DamengSink {
         Ok(())
     }
 
+    async fn ensure_secondary_indexes(&self) -> Result<(), String> {
+        for table_info in &self.table_info_list {
+            if table_info.indexes.is_empty() {
+                continue;
+            }
+            let schema = Self::table_info_target_schema(table_info, self.schema.as_str());
+            for index in &table_info.indexes {
+                let (target_index_name, exists) = self
+                    .dameng_available_index_name(
+                        schema.as_str(),
+                        table_info.table_name.as_str(),
+                        index.index_name.as_str(),
+                    )
+                    .await?;
+                if exists {
+                    continue;
+                }
+                let Some(sql) = Self::secondary_index_sql(
+                    schema.as_str(),
+                    table_info,
+                    index,
+                    target_index_name.as_str(),
+                ) else {
+                    warn!(
+                        "Dameng skip unsupported secondary index: {}.{}",
+                        Self::target_table_key(schema.as_str(), table_info.table_name.as_str()),
+                        index.index_name
+                    );
+                    continue;
+                };
+                match self.try_execute_optional(sql.as_str()).await {
+                    Ok(_) => info!(
+                        "Dameng auto create secondary index success: {}.{} -> {}",
+                        Self::target_table_key(schema.as_str(), table_info.table_name.as_str()),
+                        index.index_name,
+                        target_index_name
+                    ),
+                    Err(e) => {
+                        let msg = format!(
+                            "Dameng auto create secondary index failed: {}.{} target_index={} sql={} error={}",
+                            Self::target_table_key(schema.as_str(), table_info.table_name.as_str()),
+                            index.index_name,
+                            target_index_name,
+                            sql,
+                            e
+                        );
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn dameng_available_index_name(
+        &self,
+        schema: &str,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(String, bool), String> {
+        if self
+            .dameng_table_index_exists(schema, table_name, index_name)
+            .await?
+        {
+            return Ok((index_name.to_string(), true));
+        }
+        if !self.dameng_index_name_exists(schema, index_name).await? {
+            return Ok((index_name.to_string(), false));
+        }
+        for index in 0..100 {
+            let candidate = Self::conflict_index_name(table_name, index_name, index);
+            if self
+                .dameng_table_index_exists(schema, table_name, candidate.as_str())
+                .await?
+            {
+                return Ok((candidate, true));
+            }
+            if !self
+                .dameng_index_name_exists(schema, candidate.as_str())
+                .await?
+            {
+                return Ok((candidate, false));
+            }
+        }
+        Err(format!(
+            "no available Dameng index name for conflict: {}.{} {}",
+            schema, table_name, index_name
+        ))
+    }
+
+    async fn dameng_table_index_exists(
+        &self,
+        schema: &str,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<bool, String> {
+        let sql = Self::dameng_table_index_exists_sql(schema, table_name, index_name);
+        let rows = self.query(sql.as_str(), &[]).await?;
+        let count = rows
+            .first()
+            .and_then(|row| row.get::<i32>(0).ok())
+            .unwrap_or(0);
+        Ok(count > 0)
+    }
+
+    async fn dameng_index_name_exists(
+        &self,
+        schema: &str,
+        index_name: &str,
+    ) -> Result<bool, String> {
+        let sql = Self::dameng_index_name_exists_sql(schema, index_name);
+        let rows = self.query(sql.as_str(), &[]).await?;
+        let count = rows
+            .first()
+            .and_then(|row| row.get::<i32>(0).ok())
+            .unwrap_or(0);
+        Ok(count > 0)
+    }
+
+    fn dameng_table_index_exists_sql(schema: &str, table_name: &str, index_name: &str) -> String {
+        if schema.is_empty() {
+            format!(
+                "SELECT COUNT(*) FROM USER_INDEXES WHERE {} AND {}",
+                Self::eq_original_or_upper_sql("TABLE_NAME", table_name),
+                Self::eq_original_or_upper_sql("INDEX_NAME", index_name)
+            )
+        } else {
+            format!(
+                "SELECT COUNT(*) FROM ALL_INDEXES WHERE {} AND {} AND {}",
+                Self::eq_original_or_upper_sql("OWNER", schema),
+                Self::eq_original_or_upper_sql("TABLE_NAME", table_name),
+                Self::eq_original_or_upper_sql("INDEX_NAME", index_name)
+            )
+        }
+    }
+
+    fn dameng_index_name_exists_sql(schema: &str, index_name: &str) -> String {
+        if schema.is_empty() {
+            format!(
+                "SELECT COUNT(*) FROM USER_INDEXES WHERE {}",
+                Self::eq_original_or_upper_sql("INDEX_NAME", index_name)
+            )
+        } else {
+            format!(
+                "SELECT COUNT(*) FROM ALL_INDEXES WHERE {} AND {}",
+                Self::eq_original_or_upper_sql("OWNER", schema),
+                Self::eq_original_or_upper_sql("INDEX_NAME", index_name)
+            )
+        }
+    }
+
+    fn secondary_index_sql(
+        schema: &str,
+        table_info: &TableInfoVo,
+        index: &TableIndexInfo,
+        target_index_name: &str,
+    ) -> Option<String> {
+        if index.columns.is_empty() {
+            return None;
+        }
+        let defs =
+            extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
+        let mut columns = Vec::with_capacity(index.columns.len());
+        for column in &index.columns {
+            let def = defs.get(column.to_ascii_lowercase().as_str())?;
+            let mysql_type = mysql_type_token_from_column_definition(def.as_str())?;
+            let dameng_type = Self::map_mysql_type_to_dameng(mysql_type.as_str());
+            if dameng_type.eq_ignore_ascii_case("CLOB") || dameng_type.eq_ignore_ascii_case("BLOB")
+            {
+                return None;
+            }
+            columns.push(Self::quote_column_ident(column));
+        }
+        let index_kind = if index.unique {
+            "CREATE UNIQUE INDEX"
+        } else {
+            "CREATE INDEX"
+        };
+        Some(format!(
+            "{} {} ON {} ({})",
+            index_kind,
+            Self::quote_ident(target_index_name),
+            Self::qualified_table(schema, table_info.table_name.as_str()),
+            columns.join(", ")
+        ))
+    }
+
+    fn conflict_index_name(table_name: &str, index_name: &str, index: usize) -> String {
+        let base = format!("{}_{}", table_name, index_name);
+        let suffix = if index == 0 {
+            "_idx".to_string()
+        } else {
+            format!("_idx{}", index + 1)
+        };
+        Self::identifier_with_suffix(base.as_str(), suffix.as_str())
+    }
+
     async fn disable_foreign_key_constraints_for_init(&self) -> Result<(), String> {
         let target_tables = self.random_check_target_tables_by_schema();
         if target_tables.is_empty() {
@@ -5542,6 +5842,14 @@ impl DamengSink {
         format!(
             "COMMENT ON COLUMN {} IS {}",
             Self::qualified_column(schema, table_name, column_name),
+            Self::quote_literal(comment)
+        )
+    }
+
+    fn comment_on_table_sql(schema: &str, table_name: &str, comment: &str) -> String {
+        format!(
+            "COMMENT ON TABLE {} IS {}",
+            Self::qualified_table(schema, table_name),
             Self::quote_literal(comment)
         )
     }
@@ -7058,6 +7366,7 @@ impl Sink for DamengSink {
             );
             self.run_random_check_after_init_now().await;
         } else {
+            self.ensure_secondary_indexes().await?;
             self.ensure_foreign_keys().await?;
             self.enable_foreign_key_constraints_after_init().await;
             self.spawn_random_check_after_init().await;
@@ -8205,7 +8514,9 @@ fn strip_trailing_numeric_schema_suffix(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use common::case_insensitive_hash_map::CaseInsensitiveHashMap;
-    use common::{DataBuffer, ForeignKeyInfo, MySqlRoutineKind, Operation, TableInfoVo, Value};
+    use common::{
+        DataBuffer, ForeignKeyInfo, MySqlRoutineKind, Operation, TableIndexInfo, TableInfoVo, Value,
+    };
     use dameng::ToDmValue;
     use dameng_types::DmValue;
     use std::collections::{HashMap, HashSet};
@@ -8235,6 +8546,8 @@ mod tests {
                 column_type
             ),
             columns: vec!["id".to_string(), "name".to_string()],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         }
     }
@@ -8341,6 +8654,16 @@ mod tests {
 
         assert!(preview.ends_with("..."));
         assert!(preview.is_char_boundary(preview.len()));
+    }
+
+    #[test]
+    fn unsupported_mysql_syntax_error_is_detected() {
+        assert!(DamengSink::is_unsupported_mysql_syntax_error(
+            "PROCEDURE demo conversion failed: unsupported MySQL syntax D12: INSERT IGNORE"
+        ));
+        assert!(!DamengSink::is_unsupported_mysql_syntax_error(
+            "create Dameng stored routine failed: syntax error near SELECT"
+        ));
     }
 
     #[test]
@@ -8452,6 +8775,8 @@ mod tests {
                 "organization_parent_id".to_string(),
                 "organization_path".to_string(),
             ],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
 
@@ -8489,6 +8814,8 @@ mod tests {
                 "BYTES_".to_string(),
                 "GENERATED_".to_string(),
             ],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
 
@@ -8517,6 +8844,8 @@ mod tests {
                 "code".to_string(),
                 "name".to_string(),
             ],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
 
@@ -8548,6 +8877,8 @@ mod tests {
                 "update_time".to_string(),
                 "name".to_string(),
             ],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
 
@@ -8579,6 +8910,8 @@ mod tests {
                 "building_name".to_string(),
                 "remark".to_string(),
             ],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
 
@@ -8609,6 +8942,8 @@ mod tests {
                 "migrate_flag".to_string(),
                 "name".to_string(),
             ],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
 
@@ -8627,6 +8962,73 @@ mod tests {
                 comments.get("migrate_flag").unwrap()
             ),
             "COMMENT ON COLUMN \"newsee-owner\".\"biz_building_info\".\"migrate_flag\" IS '是否迁移业务表标志 0未迁移 1已迁移'"
+        );
+    }
+
+    #[test]
+    fn table_comment_sql_quotes_identifier_and_literal() {
+        assert_eq!(
+            DamengSink::comment_on_table_sql("newsee-owner", "biz_building_info", "业主'表"),
+            "COMMENT ON TABLE \"newsee-owner\".\"biz_building_info\" IS '业主''表'"
+        );
+        assert_eq!(
+            DamengSink::table_comment_sql("newsee-owner", "biz_building_info"),
+            "SELECT NVL(COMMENTS, '') FROM ALL_TAB_COMMENTS WHERE (OWNER = 'newsee-owner' OR OWNER = 'NEWSEE-OWNER') AND (TABLE_NAME = 'biz_building_info' OR TABLE_NAME = 'BIZ_BUILDING_INFO')"
+        );
+    }
+
+    #[test]
+    fn secondary_index_sql_uses_dameng_types_and_target_columns() {
+        let mut table_info = table_info("target_schema", "varchar(64)");
+        table_info.indexes = vec![TableIndexInfo {
+            index_name: "idx_orders_name".to_string(),
+            table_name: "orders".to_string(),
+            columns: vec!["name".to_string()],
+            unique: false,
+        }];
+
+        let sql = DamengSink::secondary_index_sql(
+            "target_schema",
+            &table_info,
+            &table_info.indexes[0],
+            "idx_orders_name",
+        )
+        .unwrap();
+
+        assert_eq!(
+            sql,
+            "CREATE INDEX \"idx_orders_name\" ON \"target_schema\".\"orders\" (\"name\")"
+        );
+    }
+
+    #[test]
+    fn secondary_index_sql_skips_lob_columns() {
+        let table_info = table_info("target_schema", "text");
+        let index = TableIndexInfo {
+            index_name: "idx_orders_name".to_string(),
+            table_name: "orders".to_string(),
+            columns: vec!["name".to_string()],
+            unique: false,
+        };
+
+        assert!(
+            DamengSink::secondary_index_sql("target_schema", &table_info, &index, "idx").is_none()
+        );
+    }
+
+    #[test]
+    fn secondary_index_metadata_sql_checks_schema_table_and_name() {
+        assert_eq!(
+            DamengSink::dameng_table_index_exists_sql("target_schema", "orders", "idx_orders_name"),
+            "SELECT COUNT(*) FROM ALL_INDEXES WHERE (OWNER = 'target_schema' OR OWNER = 'TARGET_SCHEMA') AND (TABLE_NAME = 'orders' OR TABLE_NAME = 'ORDERS') AND (INDEX_NAME = 'idx_orders_name' OR INDEX_NAME = 'IDX_ORDERS_NAME')"
+        );
+        assert_eq!(
+            DamengSink::dameng_index_name_exists_sql("target_schema", "idx_orders_name"),
+            "SELECT COUNT(*) FROM ALL_INDEXES WHERE (OWNER = 'target_schema' OR OWNER = 'TARGET_SCHEMA') AND (INDEX_NAME = 'idx_orders_name' OR INDEX_NAME = 'IDX_ORDERS_NAME')"
+        );
+        assert_eq!(
+            DamengSink::conflict_index_name("orders", "idx_name", 0),
+            "orders_idx_name_idx"
         );
     }
 
@@ -8730,6 +9132,8 @@ mod tests {
                 "fullPath".to_string(),
                 "name".to_string(),
             ],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
         let mut after = CaseInsensitiveHashMap::new_with_no_arg();
@@ -8770,6 +9174,8 @@ mod tests {
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#
                 .to_string(),
             columns: vec!["id".to_string(), "name".to_string()],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
         let mut after = CaseInsensitiveHashMap::new_with_no_arg();
@@ -8809,6 +9215,8 @@ mod tests {
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#
                 .to_string(),
             columns: vec!["id".to_string()],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
         let mut after = CaseInsensitiveHashMap::new_with_no_arg();
@@ -8852,6 +9260,8 @@ mod tests {
                 "content".to_string(),
                 "payload".to_string(),
             ],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
         let mut after = CaseInsensitiveHashMap::new_with_no_arg();
@@ -9059,6 +9469,8 @@ mod tests {
                 "flags".to_string(),
                 "rOWID".to_string(),
             ],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
 
@@ -9271,6 +9683,8 @@ mod tests {
             pk_column: "id".to_string(),
             create_table_sql: "CREATE TABLE `line_item` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `rOWID` varchar(50) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB".to_string(),
             columns: vec!["id".to_string(), "rOWID".to_string()],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
 
@@ -10132,6 +10546,8 @@ mod tests {
                 "opration".to_string(),
                 "operatorLogo".to_string(),
             ],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
 
@@ -10179,6 +10595,8 @@ mod tests {
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3"#
                 .to_string(),
             columns: vec!["id".to_string(), "operatorLogo".to_string()],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
 
@@ -10234,6 +10652,8 @@ mod tests {
                 "name".to_string(),
                 "operatorLogo".to_string(),
             ],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
         let columns = table_info.columns.clone();
@@ -10306,6 +10726,8 @@ mod tests {
                 "name".to_string(),
                 "operatorLogo".to_string(),
             ],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
         let columns = table_info.columns.clone();
@@ -10375,6 +10797,8 @@ mod tests {
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3"#
                 .to_string(),
             columns: vec!["id".to_string(), "content".to_string()],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
 

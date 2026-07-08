@@ -9,9 +9,9 @@ use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::runtime_progress;
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, ForeignKeyInfo, Operation, Plugin, Sink, Source,
-    TableInfoVo, Value, database_table_key, get_mysql_pool_by_url_with_max_connections,
-    mysql_connection_url_from_config, mysql_row_text_value, mysql_row_to_hashmap,
-    redact_connection_url_password,
+    TableIndexInfo, TableInfoVo, Value, database_table_key,
+    get_mysql_pool_by_url_with_max_connections, mysql_connection_url_from_config,
+    mysql_row_text_value, mysql_row_to_hashmap, redact_connection_url_password,
 };
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
@@ -71,6 +71,15 @@ struct BinlogTableColumnInfo {
     table_name: String,
     column_count: usize,
     row_column_names: Option<Vec<Option<String>>>,
+}
+
+#[derive(Debug, Clone)]
+struct MysqlIndexBuilder {
+    table_name: String,
+    index_name: String,
+    columns: Vec<String>,
+    unique: bool,
+    skip_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +245,15 @@ impl MysqlSourceConfig {
                 true
             });
 
+            let selected_table_keys = current_source_tables
+                .iter()
+                .map(|table_name| table_name.to_ascii_lowercase())
+                .collect::<HashSet<_>>();
+            let table_comments =
+                Self::fetch_table_comments(&pool, database.as_str(), &selected_table_keys).await;
+            let secondary_indexes =
+                Self::fetch_secondary_indexes(&pool, database.as_str(), &selected_table_keys).await;
+
             for table_name in current_source_tables.clone() {
                 // fill table_info
                 let show_create_table_sql = format!(
@@ -275,6 +293,14 @@ impl MysqlSourceConfig {
                     pk_column,
                     create_table_sql,
                     columns,
+                    table_comment: table_comments
+                        .get(table_name.to_ascii_lowercase().as_str())
+                        .cloned()
+                        .unwrap_or_default(),
+                    indexes: secondary_indexes
+                        .get(table_name.to_ascii_lowercase().as_str())
+                        .cloned()
+                        .unwrap_or_default(),
                     foreign_keys: Vec::new(),
                 });
             }
@@ -457,6 +483,138 @@ impl MysqlSourceConfig {
             table_name
         );
         None
+    }
+
+    async fn fetch_table_comments(
+        pool: &Pool<MySql>,
+        database: &str,
+        selected_tables: &HashSet<String>,
+    ) -> HashMap<String, String> {
+        if selected_tables.is_empty() {
+            return HashMap::new();
+        }
+        let sql = r#"
+            SELECT
+              TABLE_NAME AS table_name,
+              COALESCE(TABLE_COMMENT, '') AS table_comment
+            FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = ?
+              AND TABLE_TYPE = 'BASE TABLE'
+        "#;
+        let rows = sqlx::query(sql)
+            .bind(database)
+            .fetch_all(pool)
+            .await
+            .expect("query failed");
+
+        rows.into_iter()
+            .filter_map(|row| {
+                let table_name = mysql_row_text_value(&row, "table_name");
+                let table_key = table_name.to_ascii_lowercase();
+                if !selected_tables.contains(table_key.as_str()) {
+                    return None;
+                }
+                Some((table_key, mysql_row_text_value(&row, "table_comment")))
+            })
+            .collect()
+    }
+
+    async fn fetch_secondary_indexes(
+        pool: &Pool<MySql>,
+        database: &str,
+        selected_tables: &HashSet<String>,
+    ) -> HashMap<String, Vec<TableIndexInfo>> {
+        if selected_tables.is_empty() {
+            return HashMap::new();
+        }
+        let sql = r#"
+            SELECT
+              TABLE_NAME AS table_name,
+              INDEX_NAME AS index_name,
+              CAST(NON_UNIQUE AS CHAR) AS non_unique,
+              CAST(SEQ_IN_INDEX AS CHAR) AS seq_in_index,
+              COALESCE(COLUMN_NAME, '') AS column_name,
+              COALESCE(CAST(SUB_PART AS CHAR), '') AS sub_part,
+              COALESCE(INDEX_TYPE, '') AS index_type
+            FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = ?
+              AND INDEX_NAME <> 'PRIMARY'
+            ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX
+        "#;
+        let rows = sqlx::query(sql)
+            .bind(database)
+            .fetch_all(pool)
+            .await
+            .expect("query failed");
+
+        let mut grouped: HashMap<(String, String), MysqlIndexBuilder> = HashMap::new();
+        for row in rows {
+            let table_name = mysql_row_text_value(&row, "table_name");
+            let table_key = table_name.to_ascii_lowercase();
+            if !selected_tables.contains(table_key.as_str()) {
+                continue;
+            }
+
+            let index_name = mysql_row_text_value(&row, "index_name");
+            let index_key = index_name.to_ascii_lowercase();
+            let non_unique = mysql_row_text_value(&row, "non_unique");
+            let column_name = mysql_row_text_value(&row, "column_name");
+            let sub_part = mysql_row_text_value(&row, "sub_part");
+            let index_type = mysql_row_text_value(&row, "index_type");
+            let unique = non_unique.trim() == "0";
+            let entry =
+                grouped
+                    .entry((table_key, index_key))
+                    .or_insert_with(|| MysqlIndexBuilder {
+                        table_name: table_name.clone(),
+                        index_name: index_name.clone(),
+                        columns: Vec::new(),
+                        unique,
+                        skip_reason: None,
+                    });
+
+            if !index_type.eq_ignore_ascii_case("BTREE") {
+                entry.skip_reason = Some(format!("unsupported index_type={}", index_type));
+                continue;
+            }
+            if column_name.trim().is_empty() {
+                entry.skip_reason = Some("expression index has no COLUMN_NAME".to_string());
+                continue;
+            }
+            if !sub_part.trim().is_empty() {
+                entry.skip_reason = Some(format!("prefix index sub_part={}", sub_part));
+                continue;
+            }
+            entry.columns.push(column_name);
+        }
+
+        let mut by_table: HashMap<String, Vec<TableIndexInfo>> = HashMap::new();
+        for ((table_key, _), index) in grouped {
+            if let Some(reason) = index.skip_reason {
+                warn!(
+                    "Skip unsupported MySQL secondary index: {}.{} {}",
+                    index.table_name, index.index_name, reason
+                );
+                continue;
+            }
+            if index.columns.is_empty() {
+                warn!(
+                    "Skip MySQL secondary index without columns: {}.{}",
+                    index.table_name, index.index_name
+                );
+                continue;
+            }
+            by_table.entry(table_key).or_default().push(TableIndexInfo {
+                index_name: index.index_name,
+                table_name: index.table_name,
+                columns: index.columns,
+                unique: index.unique,
+            });
+        }
+        for indexes in by_table.values_mut() {
+            indexes.sort_by(|a, b| a.index_name.cmp(&b.index_name));
+        }
+        by_table
     }
 
     async fn fetch_foreign_keys(
@@ -3492,6 +3650,8 @@ mod tests {
             pk_column: "".to_string(),
             create_table_sql: "CREATE TABLE `no_pk_table` (`name` varchar(64))".to_string(),
             columns: vec!["name".to_string()],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
         let config = MysqlSourceConfigDetail {

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use common::{
     MySqlRoutineDefinition, MySqlRoutineKind, MySqlViewDefinition, strip_create_view_definer,
@@ -63,7 +63,15 @@ pub fn convert_mysql_routine_to_dameng_with_name(
         &routine_param_names,
         &outer_block_labels,
         routine.kind,
-    );
+    )
+    .map_err(|e| {
+        format!(
+            "{} {} conversion failed: {}",
+            routine.kind.routine_type(),
+            routine.name,
+            e
+        )
+    })?;
     let declaration_sql = if body.declarations.is_empty() {
         String::new()
     } else {
@@ -124,7 +132,8 @@ pub fn convert_mysql_view_to_dameng_with_name_and_schema_routes(
         source_database,
         target_schema,
         schema_routes,
-    );
+    )
+    .map_err(|e| format!("VIEW {} conversion failed: {}", view.name, e))?;
     Ok(format!(
         "CREATE VIEW {} AS {}",
         qualified_table(target_schema, target_view_name),
@@ -160,7 +169,8 @@ fn convert_mysql_view_select_sql(
     source_database: &str,
     target_schema: &str,
     schema_routes: &[(String, String)],
-) -> String {
+) -> Result<String, String> {
+    reject_unsupported_mysql_sql(select_sql)?;
     let sql = convert_mysql_sql_tokens(select_sql, "");
     let sql = convert_mysql_regexp_operators(sql.as_str());
     let sql = convert_mysql_single_quoted_aliases(sql.as_str());
@@ -189,7 +199,7 @@ fn convert_mysql_view_select_sql(
             Some(&aliases),
         );
     }
-    convert_mysql_column_equals_to_varchar(sql.as_str())
+    Ok(convert_mysql_column_equals_to_varchar(sql.as_str()))
 }
 
 fn parse_mysql_routine_signature(
@@ -396,8 +406,9 @@ fn convert_mysql_routine_body(
     routine_param_names: &[String],
     outer_block_labels: &[String],
     routine_kind: MySqlRoutineKind,
-) -> DamengRoutineBody {
+) -> Result<DamengRoutineBody, String> {
     let (declarations, body) = extract_mysql_routine_declarations(body.trim());
+    reject_unsupported_mysql_sql(body.as_str())?;
     let not_found_handler_var = mysql_not_found_handler_variable(&declarations)
         .or_else(|| mysql_not_found_handler_variable_in_body(body.as_str()));
     let mut set_assignment_variables = routine_param_names.to_vec();
@@ -405,9 +416,11 @@ fn convert_mysql_routine_body(
     set_assignment_variables.extend(mysql_routine_declaration_variable_names_in_body(
         body.as_str(),
     ));
+    let cursor_name_map = mysql_routine_cursor_name_map(&declarations, body.as_str());
     let declarations = declarations
         .into_iter()
         .filter_map(|declaration| convert_mysql_routine_declaration(declaration.as_str(), sql_mode))
+        .map(|declaration| rename_dameng_cursor_references(declaration.as_str(), &cursor_name_map))
         .map(|declaration| format!("    {}", declaration))
         .collect::<Vec<_>>();
     let body = convert_mysql_sql_tokens(body.as_str(), sql_mode);
@@ -435,6 +448,7 @@ fn convert_mysql_routine_body(
     let body = convert_mysql_set_assignments(body.as_str(), &set_assignment_variables);
     let body =
         convert_mysql_fetch_not_found_checks(body.as_str(), not_found_handler_var.as_deref());
+    let body = rename_dameng_cursor_references(body.as_str(), &cursor_name_map);
     let body = convert_mysql_loop_control(body.as_str(), outer_block_labels, routine_kind);
     let body = convert_mysql_do_statements(body.as_str());
     let body = convert_mysql_prepared_statements(body.as_str());
@@ -449,7 +463,139 @@ fn convert_mysql_routine_body(
     if !body.ends_with(';') {
         body.push(';');
     }
-    DamengRoutineBody { declarations, body }
+    Ok(DamengRoutineBody { declarations, body })
+}
+
+fn reject_unsupported_mysql_sql(value: &str) -> Result<(), String> {
+    let check_sql = strip_mysql_comments(value);
+    if find_mysql_keyword_phrase(check_sql.as_str(), 0, &["ON", "DUPLICATE", "KEY", "UPDATE"])
+        .is_some()
+    {
+        return Err(unsupported_mysql_sql_error(
+            "D10",
+            "ON DUPLICATE KEY UPDATE cannot be safely converted automatically",
+            value,
+        ));
+    }
+    if find_mysql_keyword_phrase(check_sql.as_str(), 0, &["REPLACE", "INTO"]).is_some() {
+        return Err(unsupported_mysql_sql_error(
+            "D11",
+            "REPLACE INTO cannot be safely converted automatically",
+            value,
+        ));
+    }
+    if find_mysql_keyword_phrase(check_sql.as_str(), 0, &["INSERT", "IGNORE"]).is_some() {
+        return Err(unsupported_mysql_sql_error(
+            "D12",
+            "INSERT IGNORE cannot be safely converted automatically",
+            value,
+        ));
+    }
+
+    let mut search_pos = 0usize;
+    while let Some(update_pos) =
+        find_keyword_outside_quotes(check_sql.as_str(), search_pos, "UPDATE")
+    {
+        let statement_end = find_statement_semicolon_outside_quotes(check_sql.as_str(), update_pos)
+            .map(|pos| pos + 1)
+            .unwrap_or(check_sql.len());
+        let statement = &check_sql[update_pos..statement_end];
+        if let Some(parts) = parse_mysql_update_join_statement(trim_statement_semicolon(statement))
+            && mysql_update_join_updates_non_target_alias(&parts)
+        {
+            return Err(unsupported_mysql_sql_error(
+                "D27",
+                "UPDATE JOIN updates more than the target table",
+                value,
+            ));
+        }
+        if mysql_update_has_top_level_order_limit(statement) {
+            return Err(unsupported_mysql_sql_error(
+                "D13",
+                "UPDATE ORDER BY LIMIT cannot be safely converted automatically",
+                value,
+            ));
+        }
+        search_pos = statement_end;
+    }
+
+    Ok(())
+}
+
+fn unsupported_mysql_sql_error(code: &str, reason: &str, sql: &str) -> String {
+    format!(
+        "unsupported MySQL syntax {}: {} sql={}",
+        code,
+        reason,
+        sql_preview(sql)
+    )
+}
+
+fn sql_preview(sql: &str) -> String {
+    let mut compact = sql
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.len() > 500 {
+        compact = compact.chars().take(500).collect();
+        compact.push_str("...");
+    }
+    compact
+}
+
+fn find_mysql_keyword_phrase(value: &str, start: usize, keywords: &[&str]) -> Option<usize> {
+    let first = *keywords.first()?;
+    let mut search_pos = start;
+    while let Some(pos) = find_keyword_outside_quotes(value, search_pos, first) {
+        let mut cursor = pos + first.len();
+        let mut matched = true;
+        for keyword in &keywords[1..] {
+            cursor = skip_ascii_whitespace(value, cursor);
+            if !starts_with_keyword(value, cursor, keyword) {
+                matched = false;
+                break;
+            }
+            cursor += keyword.len();
+        }
+        if matched {
+            return Some(pos);
+        }
+        search_pos = pos + first.len();
+    }
+    None
+}
+
+fn mysql_update_has_top_level_order_limit(statement: &str) -> bool {
+    let Some(order_pos) = find_top_level_keyword_outside_quotes(statement, 0, "ORDER") else {
+        return false;
+    };
+    let by_pos = skip_ascii_whitespace(statement, order_pos + "ORDER".len());
+    starts_with_keyword(statement, by_pos, "BY")
+        && find_top_level_keyword_outside_quotes(statement, by_pos + "BY".len(), "LIMIT").is_some()
+}
+
+fn mysql_update_join_updates_non_target_alias(parts: &MysqlUpdateJoinParts) -> bool {
+    split_top_level_commas(parts.set_clause.as_str())
+        .into_iter()
+        .map(str::trim)
+        .filter(|assignment| !assignment.is_empty())
+        .filter_map(|assignment| {
+            let eq_pos = find_assignment_equal_outside_quotes(assignment)?;
+            mysql_assignment_lhs_alias(assignment[..eq_pos].trim())
+        })
+        .any(|alias| !alias.eq_ignore_ascii_case(parts.target_alias.as_str()))
+}
+
+fn mysql_assignment_lhs_alias(lhs: &str) -> Option<String> {
+    let (alias, next_pos) = take_sql_identifier(lhs, 0)?;
+    let dot_pos = skip_ascii_whitespace(lhs, next_pos);
+    if lhs.as_bytes().get(dot_pos) == Some(&b'.') {
+        Some(alias)
+    } else {
+        None
+    }
 }
 
 fn extract_mysql_routine_declarations(body: &str) -> (Vec<String>, String) {
@@ -662,6 +808,189 @@ fn convert_mysql_cursor_declaration(declaration: &str, sql_mode: &str) -> Option
         dameng_routine_param_name(cursor_name.as_str()),
         convert_mysql_sql_tokens(select_sql, sql_mode)
     ))
+}
+
+fn mysql_routine_cursor_name_map(declarations: &[String], body: &str) -> HashMap<String, String> {
+    let mut cursor_names = Vec::new();
+    let body_declarations = mysql_declarations_in_body(body);
+    for declaration in declarations
+        .iter()
+        .map(|declaration| declaration.as_str())
+        .chain(
+            body_declarations
+                .iter()
+                .map(|declaration| declaration.as_str()),
+        )
+    {
+        if let Some(cursor_name) = mysql_cursor_name_from_declaration(declaration) {
+            cursor_names.push(cursor_name);
+        }
+    }
+
+    let mut used = HashSet::new();
+    let mut mappings = HashMap::new();
+    for cursor_name in cursor_names {
+        let source_key = cursor_name.to_ascii_lowercase();
+        if mappings.contains_key(source_key.as_str()) {
+            continue;
+        }
+        let mut target_name = dameng_safe_cursor_name(cursor_name.as_str());
+        let mut index = 2usize;
+        while used.contains(target_name.to_ascii_lowercase().as_str()) {
+            target_name = format!(
+                "{}_{}",
+                dameng_safe_cursor_name(cursor_name.as_str()),
+                index
+            );
+            index += 1;
+        }
+        used.insert(target_name.to_ascii_lowercase());
+        if !target_name.eq_ignore_ascii_case(cursor_name.as_str()) {
+            mappings.insert(source_key, target_name);
+        }
+    }
+    mappings
+}
+
+fn mysql_cursor_name_from_declaration(declaration: &str) -> Option<String> {
+    let trimmed = declaration.trim();
+    let (cursor_name, next_pos) = take_sql_identifier(trimmed, 0)?;
+    let pos = skip_ascii_whitespace(trimmed, next_pos);
+    if starts_with_keyword(trimmed, pos, "CURSOR") {
+        Some(cursor_name)
+    } else {
+        None
+    }
+}
+
+fn dameng_safe_cursor_name(name: &str) -> String {
+    let mut sanitized = String::with_capacity(name.len() + "_cursor".len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+    while sanitized.contains("__") {
+        sanitized = sanitized.replace("__", "_");
+    }
+    sanitized = sanitized.trim_matches('_').to_string();
+    if sanitized.is_empty() {
+        sanitized = "cursor_value".to_string();
+    }
+    if !sanitized
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+    {
+        sanitized.insert_str(0, "c_");
+    }
+    if is_safe_unquoted_identifier(sanitized.as_str())
+        && !dameng_cursor_reserved_identifier(sanitized.as_str())
+    {
+        sanitized
+    } else {
+        format!("{}_cursor", sanitized)
+    }
+}
+
+fn dameng_cursor_reserved_identifier(name: &str) -> bool {
+    [
+        "ALL", "BEGIN", "BY", "CASE", "CLOSE", "COMMENT", "CONNECT", "CURSOR", "DELETE", "END",
+        "EXISTS", "FETCH", "FROM", "GROUP", "IF", "IN", "INDEX", "INSERT", "LEVEL", "LOOP",
+        "OBJECT", "OPEN", "ORDER", "ROWID", "SELECT", "SET", "TABLE", "TYPE", "UPDATE", "USER",
+        "VALUE", "VIEW", "WHERE", "WHILE",
+    ]
+    .iter()
+    .any(|keyword| name.eq_ignore_ascii_case(keyword))
+}
+
+fn rename_dameng_cursor_references(
+    value: &str,
+    cursor_name_map: &HashMap<String, String>,
+) -> String {
+    if cursor_name_map.is_empty() {
+        return value.to_string();
+    }
+
+    let bytes = value.as_bytes();
+    let mut result = String::with_capacity(value.len());
+    let mut copied_pos = 0usize;
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            pos = skip_sql_quoted_fragment(value, pos);
+            continue;
+        }
+
+        if let Some((identifier_start, identifier_end, replacement)) =
+            cursor_identifier_after_keyword(value, pos, cursor_name_map)
+        {
+            result.push_str(&value[copied_pos..identifier_start]);
+            result.push_str(replacement.as_str());
+            copied_pos = identifier_end;
+            pos = identifier_end;
+            continue;
+        }
+
+        if let Some((identifier_end, replacement)) =
+            cursor_percent_reference(value, pos, cursor_name_map)
+        {
+            result.push_str(&value[copied_pos..pos]);
+            result.push_str(replacement.as_str());
+            copied_pos = identifier_end;
+            pos = identifier_end;
+            continue;
+        }
+
+        let ch = value[pos..].chars().next().unwrap();
+        pos += ch.len_utf8();
+    }
+    result.push_str(&value[copied_pos..]);
+    result
+}
+
+fn cursor_percent_reference(
+    value: &str,
+    pos: usize,
+    cursor_name_map: &HashMap<String, String>,
+) -> Option<(usize, String)> {
+    cursor_name_map
+        .iter()
+        .find_map(|(source_name, target_name)| {
+            if !starts_with_identifier_ignore_case(value, pos, source_name) {
+                return None;
+            }
+            let identifier_end = pos + source_name.len();
+            let percent_pos = skip_ascii_whitespace(value, identifier_end);
+            if value.as_bytes().get(percent_pos) == Some(&b'%') {
+                Some((identifier_end, target_name.clone()))
+            } else {
+                None
+            }
+        })
+}
+
+fn cursor_identifier_after_keyword(
+    value: &str,
+    keyword_pos: usize,
+    cursor_name_map: &HashMap<String, String>,
+) -> Option<(usize, usize, String)> {
+    ["CURSOR", "OPEN", "FETCH", "CLOSE"]
+        .iter()
+        .find_map(|keyword| {
+            if !starts_with_keyword(value, keyword_pos, keyword) {
+                return None;
+            }
+            let identifier_start = skip_ascii_whitespace(value, keyword_pos + keyword.len());
+            let (identifier, identifier_end) = take_sql_identifier(value, identifier_start)?;
+            let replacement = cursor_name_map
+                .get(identifier.to_ascii_lowercase().as_str())?
+                .clone();
+            Some((identifier_start, identifier_end, replacement))
+        })
 }
 
 fn convert_mysql_variable_declaration(declaration: &str, sql_mode: &str) -> Option<String> {
@@ -4269,12 +4598,16 @@ fn convert_mysql_sql_tokens(value: &str, sql_mode: &str) -> String {
     let value = convert_mysql_quotes_to_dameng(value, sql_mode);
     let value = convert_mysql_index_hints(value.as_str());
     let value = convert_mysql_charset_casts(value.as_str());
+    let value = convert_mysql_unsigned_casts(value.as_str());
     let value = convert_mysql_convert_charset_calls(value.as_str());
+    let value = convert_mysql_convert_type_calls(value.as_str());
     let value = remove_mysql_character_set_clauses(value.as_str());
     let value = remove_mysql_collate_clauses(value.as_str());
     let value = convert_mysql_now_calls(value.as_str());
     let value = convert_mysql_date_add_sub_interval_calls(value.as_str());
     let value = convert_mysql_length_calls(value.as_str());
+    let value = convert_mysql_period_diff_calls(value.as_str());
+    let value = convert_mysql_makedate_calls(value.as_str());
     let value = convert_mysql_date_format_interval_exprs(value.as_str());
     let value = convert_mysql_date_format_calls(value.as_str());
     convert_mysql_str_to_date_calls(value.as_str())
@@ -4667,6 +5000,18 @@ fn convert_mysql_charset_cast_args(args: &str) -> Option<String> {
     Some(format!("CAST({} AS VARCHAR(255))", expr))
 }
 
+fn convert_mysql_unsigned_casts(value: &str) -> String {
+    convert_mysql_function_calls(value, "CAST", |args| {
+        let as_pos = last_keyword_outside_quotes_before(args, "AS", args.len())?;
+        let expr = args[..as_pos].trim();
+        let mysql_type = args[as_pos + "AS".len()..].trim();
+        if expr.is_empty() || !mysql_cast_type_is_unsigned(mysql_type) {
+            return None;
+        }
+        Some(format!("CAST({} AS BIGINT)", expr))
+    })
+}
+
 fn convert_mysql_convert_charset_calls(value: &str) -> String {
     let mut result = String::with_capacity(value.len());
     let mut copied_pos = 0usize;
@@ -4709,6 +5054,131 @@ fn convert_mysql_convert_charset_args(args: &str) -> Option<String> {
     Some(expr.to_string())
 }
 
+fn convert_mysql_convert_type_calls(value: &str) -> String {
+    convert_mysql_function_calls(value, "CONVERT", |args| {
+        let parts = split_top_level_commas(args);
+        if parts.len() != 2 {
+            return None;
+        }
+        let expr = parts[0].trim();
+        let mysql_type = parts[1].trim();
+        if expr.is_empty()
+            || mysql_type.is_empty()
+            || find_keyword_outside_quotes(mysql_type, 0, "USING").is_some()
+        {
+            return None;
+        }
+        let dameng_type = mysql_cast_type_to_dameng(mysql_type)?;
+        Some(format!("CAST({} AS {})", expr, dameng_type))
+    })
+}
+
+fn convert_mysql_period_diff_calls(value: &str) -> String {
+    convert_mysql_function_calls(value, "PERIOD_DIFF", |args| {
+        let parts = split_top_level_commas(args);
+        if parts.len() != 2 {
+            return None;
+        }
+        let left = parts[0].trim();
+        let right = parts[1].trim();
+        if left.is_empty() || right.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "({} - {})",
+            mysql_period_to_month_expr(left),
+            mysql_period_to_month_expr(right)
+        ))
+    })
+}
+
+fn mysql_period_to_month_expr(expr: &str) -> String {
+    format!(
+        "(FLOOR(CAST({0} AS INT) / 100) * 12 + MOD(CAST({0} AS INT), 100))",
+        expr
+    )
+}
+
+fn convert_mysql_makedate_calls(value: &str) -> String {
+    convert_mysql_function_calls(value, "MAKEDATE", |args| {
+        let parts = split_top_level_commas(args);
+        if parts.len() != 2 {
+            return None;
+        }
+        let year = parts[0].trim();
+        let day = parts[1].trim();
+        if year.is_empty() || day.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "DATEADD(DAY, ({}) - 1, TO_DATE(CAST({} AS VARCHAR(10)) || '-01-01', 'YYYY-MM-DD'))",
+            day, year
+        ))
+    })
+}
+
+fn convert_mysql_function_calls<F>(value: &str, keyword: &str, convert_args: F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let bytes = value.as_bytes();
+    let mut result = String::with_capacity(value.len());
+    let mut quote = None;
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if let Some(quote_byte) = quote {
+            let ch = value[pos..].chars().next().unwrap();
+            result.push(ch);
+            if byte == b'\\' && quote_byte == b'\'' {
+                pos += ch.len_utf8();
+                if pos < bytes.len() {
+                    let next = value[pos..].chars().next().unwrap();
+                    result.push(next);
+                    pos += next.len_utf8();
+                }
+                continue;
+            }
+            if byte == quote_byte {
+                if bytes.get(pos + 1) == Some(&quote_byte) {
+                    result.push(quote_byte as char);
+                    pos += 2;
+                } else {
+                    quote = None;
+                    pos += ch.len_utf8();
+                }
+            } else {
+                pos += ch.len_utf8();
+            }
+            continue;
+        }
+
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            result.push(byte as char);
+            pos += 1;
+            continue;
+        }
+
+        if starts_with_keyword(value, pos, keyword) {
+            let open_pos = skip_ascii_whitespace(value, pos + keyword.len());
+            if bytes.get(open_pos) == Some(&b'(')
+                && let Some(close_pos) = find_matching_paren(value, open_pos)
+                && let Some(converted) = convert_args(&value[open_pos + 1..close_pos])
+            {
+                result.push_str(converted.as_str());
+                pos = close_pos + 1;
+                continue;
+            }
+        }
+
+        let ch = value[pos..].chars().next().unwrap();
+        result.push(ch);
+        pos += ch.len_utf8();
+    }
+    result
+}
+
 fn mysql_cast_type_is_charset_char(mysql_type: &str) -> bool {
     let mut pos = skip_ascii_whitespace(mysql_type, 0);
     if !starts_with_keyword(mysql_type, pos, "CHAR") {
@@ -4733,6 +5203,26 @@ fn mysql_cast_type_is_charset_char(mysql_type: &str) -> bool {
         return false;
     };
     mysql_type[next_pos..].trim().is_empty()
+}
+
+fn mysql_cast_type_is_unsigned(mysql_type: &str) -> bool {
+    let t = mysql_type.trim().to_ascii_uppercase();
+    t == "UNSIGNED" || t == "UNSIGNED INTEGER" || t == "UNSIGNED INT"
+}
+
+fn mysql_cast_type_to_dameng(mysql_type: &str) -> Option<String> {
+    let mysql_type = mysql_type.trim();
+    if mysql_type.is_empty() {
+        return None;
+    }
+    if mysql_cast_type_is_unsigned(mysql_type) {
+        return Some("BIGINT".to_string());
+    }
+    let (type_token, type_len) = take_mysql_type_token(mysql_type)?;
+    if !mysql_type[type_len..].trim().is_empty() {
+        return None;
+    }
+    Some(map_mysql_type_to_dameng(type_token))
 }
 
 fn remove_mysql_collate_clauses(value: &str) -> String {
@@ -6221,6 +6711,61 @@ END"#.to_string(),
     }
 
     #[test]
+    fn converts_mysql_numeric_cast_and_date_period_functions() {
+        let sql = convert_mysql_sql_tokens(
+            "SELECT CONVERT(amount, DECIMAL(10,2)), CAST(user_id AS UNSIGNED), PERIOD_DIFF(202607, 202601), MAKEDATE(2026, 3), 'PERIOD_DIFF(202607, 202601)'",
+            "",
+        );
+
+        assert!(sql.contains("CAST(amount AS DECIMAL(10,2))"));
+        assert!(sql.contains("CAST(user_id AS BIGINT)"));
+        assert!(
+            sql.contains("(FLOOR(CAST(202607 AS INT) / 100) * 12 + MOD(CAST(202607 AS INT), 100))")
+        );
+        assert!(sql.contains(
+            "DATEADD(DAY, (3) - 1, TO_DATE(CAST(2026 AS VARCHAR(10)) || '-01-01', 'YYYY-MM-DD'))"
+        ));
+        assert!(sql.contains("'PERIOD_DIFF(202607, 202601)'"));
+    }
+
+    #[test]
+    fn rejects_unsupported_mysql_routine_sql() {
+        for (create_sql, code) in [
+            (
+                "CREATE PROCEDURE `p`() BEGIN INSERT IGNORE INTO t(id) VALUES (1); END",
+                "D12",
+            ),
+            (
+                "CREATE PROCEDURE `p`() BEGIN REPLACE INTO t(id) VALUES (1); END",
+                "D11",
+            ),
+            (
+                "CREATE PROCEDURE `p`() BEGIN INSERT INTO t(id) VALUES (1) ON DUPLICATE KEY UPDATE id = VALUES(id); END",
+                "D10",
+            ),
+            (
+                "CREATE PROCEDURE `p`() BEGIN UPDATE t SET flag = 1 ORDER BY id LIMIT 1; END",
+                "D13",
+            ),
+            (
+                "CREATE PROCEDURE `p`() BEGIN UPDATE a ta JOIN b tb ON ta.id = tb.id SET ta.name = tb.name, tb.flag = 1; END",
+                "D27",
+            ),
+        ] {
+            let routine = MySqlRoutineDefinition {
+                kind: MySqlRoutineKind::Procedure,
+                name: "p".to_string(),
+                create_sql: create_sql.to_string(),
+                sql_mode: String::new(),
+            };
+
+            let err = convert_mysql_routine_to_dameng("target_schema", &routine).unwrap_err();
+            assert!(err.contains(code), "error should contain {}: {}", code, err);
+            assert!(err.contains("unsupported MySQL syntax"));
+        }
+    }
+
+    #[test]
     fn converts_mysql_hash_comments_and_multi_variable_declarations() {
         let routine = MySqlRoutineDefinition {
             kind: MySqlRoutineKind::Procedure,
@@ -6488,6 +7033,36 @@ WHERE target.module_id = p_module_id
         assert!(!sql.contains("DECLARE done"));
         assert!(!sql.contains("CONTINUE HANDLER"));
         assert!(sql.contains("      IF cur%NOTFOUND THEN\n          done := 1;"));
+    }
+
+    #[test]
+    fn renames_dameng_reserved_cursor_names() {
+        let routine = MySqlRoutineDefinition {
+            kind: MySqlRoutineKind::Procedure,
+            name: "insertVirtualRoom".to_string(),
+            create_sql: r#"CREATE PROCEDURE `insertVirtualRoom`()
+BEGIN
+    DECLARE house_id1 BIGINT;
+    DECLARE STOP INT DEFAULT 0;
+    DECLARE object CURSOR FOR SELECT house_id FROM `newsee-owner`.`owner_house_precinct_info`;
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET STOP = 1;
+    OPEN object;
+    FETCH object INTO house_id1;
+    CLOSE object;
+END"#
+                .to_string(),
+            sql_mode: String::new(),
+        };
+
+        let sql = convert_mysql_routine_to_dameng("newsee-warehouse", &routine).unwrap();
+
+        assert!(sql.contains("CURSOR object_cursor IS SELECT house_id"));
+        assert!(sql.contains("OPEN object_cursor;"));
+        assert!(sql.contains("FETCH object_cursor INTO house_id1;"));
+        assert!(sql.contains("IF object_cursor%NOTFOUND THEN"));
+        assert!(sql.contains("CLOSE object_cursor;"));
+        assert!(!sql.contains("CURSOR object IS"));
+        assert!(!sql.contains("FETCH object INTO"));
     }
 
     #[test]

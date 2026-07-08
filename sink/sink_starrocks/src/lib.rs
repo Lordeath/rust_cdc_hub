@@ -668,6 +668,8 @@ mod tests {
             pk_column: "".to_string(),
             create_table_sql: "CREATE TABLE `no_pk_table` (`name` varchar(64))".to_string(),
             columns: vec!["name".to_string()],
+            table_comment: String::new(),
+            indexes: vec![],
             foreign_keys: vec![],
         };
 

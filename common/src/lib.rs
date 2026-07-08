@@ -855,7 +855,19 @@ pub struct TableInfoVo {
     pub create_table_sql: String,
     pub columns: Vec<String>,
     #[serde(default)]
+    pub table_comment: String,
+    #[serde(default)]
+    pub indexes: Vec<TableIndexInfo>,
+    #[serde(default)]
     pub foreign_keys: Vec<ForeignKeyInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TableIndexInfo {
+    pub index_name: String,
+    pub table_name: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
