@@ -56,20 +56,20 @@ impl StarrocksSink {
                 .get("status")
                 .or_else(|| v.get("Status"))
                 .and_then(|x| x.as_str());
-            if let Some(status) = status {
-                if status.eq_ignore_ascii_case("FAILED") {
-                    let msg = v
-                        .get("msg")
-                        .or_else(|| v.get("message"))
-                        .or_else(|| v.get("Message"))
-                        .map(|x| {
-                            x.as_str()
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| x.to_string())
-                        })
-                        .unwrap_or_else(|| "unknown starrocks error".to_string());
-                    return Err(msg);
-                }
+            if let Some(status) = status
+                && status.eq_ignore_ascii_case("FAILED")
+            {
+                let msg = v
+                    .get("msg")
+                    .or_else(|| v.get("message"))
+                    .or_else(|| v.get("Message"))
+                    .map(|x| {
+                        x.as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| x.to_string())
+                    })
+                    .unwrap_or_else(|| "unknown starrocks error".to_string());
+                return Err(msg);
             }
             values.push(v);
         }
@@ -177,7 +177,7 @@ impl StarrocksSink {
         let rows = self
             .fetch_rows("information_schema", sql.as_str())
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         if !rows.is_empty() {
             return Ok(());
         }

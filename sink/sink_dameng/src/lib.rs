@@ -459,6 +459,7 @@ impl DamengSink {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_random_check_after_init(
         table_info_list: Vec<TableInfoVo>,
         host: String,
@@ -632,6 +633,7 @@ impl DamengSink {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn random_check_one_table(
         dameng_client: &mut Client,
         host: &str,
@@ -1282,6 +1284,7 @@ impl DamengSink {
         Ok(Some(values))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dameng_target_compare_values_with_fallback(
         dameng_client: &mut Client,
         host: &str,
@@ -1394,6 +1397,7 @@ impl DamengSink {
         error.contains("Dameng target payload")
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dameng_target_compare_values_by_column(
         dameng_client: &mut Client,
         host: &str,
@@ -3220,14 +3224,13 @@ impl DamengSink {
         let mut routes: Vec<(String, String)> = config.multi_mode_route_map().into_iter().collect();
         let mut extra_routes = Vec::new();
         for (source, target) in &routes {
-            if let Some(base_source) = strip_trailing_numeric_schema_suffix(source) {
-                if !routes
+            if let Some(base_source) = strip_trailing_numeric_schema_suffix(source)
+                && !routes
                     .iter()
                     .chain(extra_routes.iter())
                     .any(|(existing, _)| existing.eq_ignore_ascii_case(base_source.as_str()))
-                {
-                    extra_routes.push((base_source, target.clone()));
-                }
+            {
+                extra_routes.push((base_source, target.clone()));
             }
         }
         routes.extend(extra_routes);
@@ -4466,24 +4469,23 @@ impl DamengSink {
     ) -> (String, &'static str) {
         if let Some(def) =
             Self::mysql_column_definition_for_source_column(table_info, source_column)
+            && let Some(mysql_type) = mysql_type_token_from_column_definition(def.as_str())
         {
-            if let Some(mysql_type) = mysql_type_token_from_column_definition(def.as_str()) {
-                let mut nullable = mysql_column_allows_null_from_definition(def.as_str());
-                let primary_key_columns = Self::source_primary_key_columns(table_info);
-                if Self::contains_source_column(&primary_key_columns, source_column) {
-                    nullable = false;
-                }
-                let nullable_sql = if nullable { "NULL" } else { "NOT NULL" };
-                return (
-                    Self::dameng_column_definition(
-                        mysql_type.as_str(),
-                        def.as_str(),
-                        nullable_sql,
-                        false,
-                    ),
-                    "mysql_schema",
-                );
+            let mut nullable = mysql_column_allows_null_from_definition(def.as_str());
+            let primary_key_columns = Self::source_primary_key_columns(table_info);
+            if Self::contains_source_column(&primary_key_columns, source_column) {
+                nullable = false;
             }
+            let nullable_sql = if nullable { "NULL" } else { "NOT NULL" };
+            return (
+                Self::dameng_column_definition(
+                    mysql_type.as_str(),
+                    def.as_str(),
+                    nullable_sql,
+                    false,
+                ),
+                "mysql_schema",
+            );
         }
 
         (
@@ -5675,10 +5677,7 @@ impl DamengSink {
         if !t.starts_with("timestamp") && !t.starts_with("datetime") {
             return None;
         }
-        let Some(default_value) = Self::mysql_default_value_expression(mysql_column_definition)
-        else {
-            return None;
-        };
+        let default_value = Self::mysql_default_value_expression(mysql_column_definition)?;
         if Self::mysql_default_is_current_timestamp(default_value.as_str()) {
             Some("DEFAULT CURRENT_TIMESTAMP")
         } else {
@@ -5687,9 +5686,7 @@ impl DamengSink {
     }
 
     fn mysql_default_value_expression(definition: &str) -> Option<String> {
-        let Some(default_pos) = Self::find_keyword_outside_quotes(definition, 0, "default") else {
-            return None;
-        };
+        let default_pos = Self::find_keyword_outside_quotes(definition, 0, "default")?;
         let rest = definition[default_pos + "default".len()..].trim_start();
         Self::take_mysql_default_expression(rest).map(ToString::to_string)
     }
@@ -5913,7 +5910,7 @@ impl DamengSink {
         {
             1
         } else if bytes.first() == Some(&b'_') {
-            value.find(|c| matches!(c, '\'' | '"')).filter(|idx| {
+            value.find(['\'', '"']).filter(|idx| {
                 value[..*idx]
                     .bytes()
                     .all(|b| b == b'_' || b.is_ascii_alphanumeric())
@@ -5928,9 +5925,7 @@ impl DamengSink {
         while pos < bytes.len() {
             let byte = bytes[pos];
             if byte == b'\\' {
-                let Some(next) = bytes.get(pos + 1) else {
-                    return None;
-                };
+                let next = bytes.get(pos + 1)?;
                 result.push(*next);
                 pos += 2;
                 continue;
@@ -6756,7 +6751,7 @@ impl Sink for DamengSink {
         let mut index = 0;
         while index < batch.len() {
             let record = &batch[index];
-            let schema = self.record_target_schema(&record);
+            let schema = self.record_target_schema(record);
             let table_name = record.table_name.clone();
             let table_key = Self::target_table_key(schema.as_str(), table_name.as_str());
             let pk_name = self.get_pk_name_from_cache(table_key.as_str()).await;
@@ -8015,6 +8010,7 @@ impl DamengSink {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn write_lob_columns(
         &self,
         schema: &str,
@@ -8035,6 +8031,7 @@ impl DamengSink {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn write_blob_columns(
         &self,
         schema: &str,
@@ -8115,6 +8112,7 @@ impl DamengSink {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn write_clob_columns(
         &self,
         schema: &str,

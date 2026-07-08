@@ -543,6 +543,7 @@ impl DataBuffer {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_route(
         source_database: String,
         target_database: String,
@@ -1933,7 +1934,7 @@ pub fn redact_connection_url_password(connection_url: &str) -> String {
     let authority_start = scheme_end + 3;
     let rest = &connection_url[authority_start..];
     let authority_end = rest
-        .find(|c| matches!(c, '/' | '?' | '#'))
+        .find(['/', '?', '#'])
         .map(|idx| authority_start + idx)
         .unwrap_or(connection_url.len());
     let authority = &connection_url[authority_start..authority_end];

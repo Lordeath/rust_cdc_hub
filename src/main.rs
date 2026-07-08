@@ -654,7 +654,7 @@ async fn ui_split(state: web::Data<UiState>) -> impl Responder {
         .body(SPLIT_HTML)
 }
 
-fn plugin_config<'a>(config: &'a CdcConfig, plugin_type: PluginType) -> Option<&'a PluginConfig> {
+fn plugin_config(config: &CdcConfig, plugin_type: PluginType) -> Option<&PluginConfig> {
     config
         .plugins
         .as_ref()?

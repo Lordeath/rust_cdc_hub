@@ -148,14 +148,18 @@ impl MysqlSourceConfig {
             config.source_config.len()
         };
 
-        for i in 0..logical_source_size {
+        for (i, source_database) in source_databases
+            .iter()
+            .enumerate()
+            .take(logical_source_size)
+        {
             let config_index = if config.multi_mode_open() { 0 } else { i };
             let username = config.source("username", config_index);
             let password = config.source("password", config_index);
             let host = config.source("host", config_index);
             let port = config.source("port", config_index);
             let database = if config.multi_mode_open() {
-                source_databases[i].clone()
+                source_database.clone()
             } else {
                 config.source("database", config_index)
             };
@@ -217,17 +221,17 @@ impl MysqlSourceConfig {
                 if Self::judge_is_skip(&except_table_name_prefix, table_name) {
                     return false;
                 }
-                if let Some(re) = &exclude_regex {
-                    if re.is_match(table_name) {
-                        info!("Exclude table by regex: {}", table_name);
-                        return false;
-                    }
+                if let Some(re) = &exclude_regex
+                    && re.is_match(table_name)
+                {
+                    info!("Exclude table by regex: {}", table_name);
+                    return false;
                 }
-                if let Some(re) = &include_regex {
-                    if !re.is_match(table_name) {
-                        info!("Skip table not matching include regex: {}", table_name);
-                        return false;
-                    }
+                if let Some(re) = &include_regex
+                    && !re.is_match(table_name)
+                {
+                    info!("Skip table not matching include regex: {}", table_name);
+                    return false;
                 }
                 true
             });
@@ -734,28 +738,29 @@ impl MysqlSourceConfigDetail {
             .fetch_all(&mut **executor)
             .await
             .expect("query failed");
-        if random_sample && rows.len() < limit {
-            if let Some(start) = random_start.as_deref() {
-                let wrap_sql = format!(
-                    r#"
+        if random_sample
+            && rows.len() < limit
+            && let Some(start) = random_start.as_deref()
+        {
+            let wrap_sql = format!(
+                r#"
                         select *
                         FROM {}
                         where {} < {}
                         order by {}
                         limit {}
                     "#,
-                    table_ref,
-                    pk_ident,
-                    start,
-                    pk_ident,
-                    limit.saturating_sub(rows.len())
-                );
-                let wrap_rows: Vec<MySqlRow> = sqlx::query(&wrap_sql)
-                    .fetch_all(&mut **executor)
-                    .await
-                    .expect("query failed");
-                rows.extend(wrap_rows);
-            }
+                table_ref,
+                pk_ident,
+                start,
+                pk_ident,
+                limit.saturating_sub(rows.len())
+            );
+            let wrap_rows: Vec<MySqlRow> = sqlx::query(&wrap_sql)
+                .fetch_all(&mut **executor)
+                .await
+                .expect("query failed");
+            rows.extend(wrap_rows);
         }
         info!(
             "extract_init_data: [{}.{}] {} {} {} rows random_sample={}",
@@ -1484,7 +1489,7 @@ fn infer_single_hidden_column_position_by_types(
         }
     }
 
-    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
     match candidates.as_slice() {
         [(hidden_ordinal, _)] => Some(*hidden_ordinal),
         [(hidden_ordinal, best_score), (_, second_score), ..] if best_score > second_score => {
@@ -1631,8 +1636,10 @@ fn reconcile_row_column_names(
 
 fn generated_columns_from_create_table_sql(create_table_sql: &str) -> Vec<(usize, String)> {
     let mut result = vec![];
-    let mut ordinal = 0usize;
-    for (column_name, line) in column_lines_from_create_table_sql(create_table_sql) {
+    for (ordinal, (column_name, line)) in column_lines_from_create_table_sql(create_table_sql)
+        .into_iter()
+        .enumerate()
+    {
         let line_lower = line.to_ascii_lowercase();
         if line_lower.contains("generated always")
             || line_lower.contains("stored generated")
@@ -1640,7 +1647,6 @@ fn generated_columns_from_create_table_sql(create_table_sql: &str) -> Vec<(usize
         {
             result.push((ordinal, column_name));
         }
-        ordinal += 1;
     }
     result
 }
@@ -2093,7 +2099,7 @@ impl Source for MySQLSource {
         }
 
         info!("Starting MySQL binlog source");
-        let mut columns: Mutex<CaseInsensitiveHashMapVecString> =
+        let columns: Mutex<CaseInsensitiveHashMapVecString> =
             Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg());
         // 这里获取列名
         let mut table_map = HashMap::new();
@@ -2207,7 +2213,7 @@ impl Source for MySQLSource {
                                         let after: CaseInsensitiveHashMap = parse_row(
                                             row,
                                             table_name.as_str(),
-                                            &mut columns,
+                                            &columns,
                                             config,
                                             pool,
                                             binlog_columns.as_ref(),
@@ -2333,7 +2339,7 @@ impl Source for MySQLSource {
                                         let before: CaseInsensitiveHashMap = parse_row(
                                             row,
                                             table_name.as_str(),
-                                            &mut columns,
+                                            &columns,
                                             config,
                                             pool,
                                             binlog_columns.as_ref(),
@@ -2461,7 +2467,7 @@ impl Source for MySQLSource {
                                         let before: CaseInsensitiveHashMap = parse_row(
                                             b,
                                             table_name.as_str(),
-                                            &mut columns,
+                                            &columns,
                                             config,
                                             pool,
                                             binlog_columns.as_ref(),
@@ -2470,7 +2476,7 @@ impl Source for MySQLSource {
                                         let after: CaseInsensitiveHashMap = parse_row(
                                             a,
                                             table_name.as_str(),
-                                            &mut columns,
+                                            &columns,
                                             config,
                                             pool,
                                             binlog_columns.as_ref(),

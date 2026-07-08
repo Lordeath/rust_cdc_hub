@@ -280,10 +280,10 @@ fn mysql_routine_param_names(params: &str) -> Vec<String> {
         .into_iter()
         .filter_map(|param| {
             let mut pos = skip_ascii_whitespace(param, 0);
-            if let Some((word, next_pos)) = take_ascii_word(param, pos) {
-                if matches!(word.to_ascii_uppercase().as_str(), "IN" | "OUT" | "INOUT") {
-                    pos = skip_ascii_whitespace(param, next_pos);
-                }
+            if let Some((word, next_pos)) = take_ascii_word(param, pos)
+                && matches!(word.to_ascii_uppercase().as_str(), "IN" | "OUT" | "INOUT")
+            {
+                pos = skip_ascii_whitespace(param, next_pos);
             }
             take_mysql_identifier(param, pos).map(|(name, _)| name)
         })
@@ -1125,15 +1125,15 @@ fn convert_mysql_loop_control_line(
             return format!("{}END LOOP;", leading);
         }
     }
-    if starts_with_keyword(trimmed, 0, "WHILE") {
-        if let Some(do_pos) = find_keyword_outside_quotes(trimmed, "WHILE".len(), "DO") {
-            return format!(
-                "{}{}LOOP{}",
-                leading,
-                &trimmed[..do_pos],
-                &trimmed[do_pos + "DO".len()..]
-            );
-        }
+    if starts_with_keyword(trimmed, 0, "WHILE")
+        && let Some(do_pos) = find_keyword_outside_quotes(trimmed, "WHILE".len(), "DO")
+    {
+        return format!(
+            "{}{}LOOP{}",
+            leading,
+            &trimmed[..do_pos],
+            &trimmed[do_pos + "DO".len()..]
+        );
     }
     let Some(colon_pos) = find_char_outside_quotes(trimmed, ':') else {
         return line.to_string();
@@ -1197,15 +1197,14 @@ fn convert_mysql_prepared_statements(body: &str) -> String {
             prepared.push((statement_name.to_ascii_lowercase(), sql_expression));
             continue;
         }
-        if let Some((leading, statement_name)) = parse_mysql_execute_prepared_statement(line) {
-            if let Some((_, sql_expression)) = prepared
+        if let Some((leading, statement_name)) = parse_mysql_execute_prepared_statement(line)
+            && let Some((_, sql_expression)) = prepared
                 .iter()
                 .rev()
                 .find(|(name, _)| name.eq_ignore_ascii_case(statement_name.as_str()))
-            {
-                result.push(format!("{}EXECUTE IMMEDIATE {};", leading, sql_expression));
-                continue;
-            }
+        {
+            result.push(format!("{}EXECUTE IMMEDIATE {};", leading, sql_expression));
+            continue;
         }
         if parse_mysql_deallocate_prepare_statement(line).is_some() {
             continue;
@@ -3136,10 +3135,10 @@ fn take_sql_identifier(value: &str, start: usize) -> Option<(String, usize)> {
 }
 
 fn identifier_name_from_token(token: &str) -> String {
-    if let Some((name, next_pos)) = take_sql_identifier(token, 0) {
-        if token[next_pos..].trim().is_empty() {
-            return name;
-        }
+    if let Some((name, next_pos)) = take_sql_identifier(token, 0)
+        && token[next_pos..].trim().is_empty()
+    {
+        return name;
     }
     token.to_string()
 }
