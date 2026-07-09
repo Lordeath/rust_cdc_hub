@@ -130,7 +130,7 @@ export CONFIG_PATH=/path/to/config.yaml
 | `auto_add_column` | 否 | 是否自动加字段。 |
 | `auto_modify_column` | 否 | 是否自动修改字段。 |
 | `sync_foreign_key_tables` | 否 | 是否在 `table_name: "*"` 自动发现时纳入外键相关表，并在 MySQL/Dameng 目标端初始化后补外键约束，默认 `true`。MySQL 目标端初始化写入期间会临时关闭当前 session 的外键检查，避免目标库已有外键时子表先写入失败。设为 `false` 时保留旧行为：排除有外键依赖或被外键引用的表。 |
-| `sync_no_pk_table_schema` | 否 | 是否同步不参与 CDC 的表结构，默认 `true`；包括无主键、字符串主键、复合主键和其他不支持同步主键的表。这些表只建结构、主键和可满足依赖的外键，不做初始化数据和 CDC 同步；StarRocks 目标端会跳过并告警。 |
+| `sync_no_pk_table_schema` | 否 | 是否同步不参与 CDC 的表结构，默认 `true`；包括无主键、复合主键、超长字符串主键和其他不支持同步主键的表。这些表只建结构、主键和可满足依赖的外键，不做初始化数据和 CDC 同步；StarRocks 目标端会跳过并告警。 |
 | `sync_stored_procedure` | 否 | MySQL → MySQL/Dameng 时是否同步源库存储过程和函数，默认 `false`；也兼容 `sync_stored_procedures`。 |
 | `sync_stored_view` | 否 | MySQL → MySQL/Dameng 时是否同步源库视图，默认 `true`；也兼容 `sync_stored_views`。目标库已有同名视图时跳过。 |
 | `overwrite_stored_procedure` | 否 | 同步存储过程/函数时，目标库已存在同名对象是否覆盖，默认 `false`；也兼容 `overwrite_stored_procedures`。 |
@@ -154,13 +154,13 @@ export CONFIG_PATH=/path/to/config.yaml
 | `host` / `port` | MySQL 地址和端口。 |
 | `username` / `password` | MySQL 账号密码。 |
 | `database` | 源库名。 |
-| `table_name` | 表名；可填单表、逗号分隔多表或 `"*"` 表示按规则自动发现表。`"*"` 默认发现所有 `BASE TABLE`，包括外键相关表；其中单一整数主键表参与数据同步，其他表仅同步表结构。设置顶层 `sync_no_pk_table_schema: false` 时保留旧行为，只纳入单一整数主键表。 |
+| `table_name` | 表名；可填单表、逗号分隔多表或 `"*"` 表示按规则自动发现表。`"*"` 默认发现所有 `BASE TABLE`，包括外键相关表；其中单一整数主键表或单一 `char`/`varchar` 主键表参与数据同步，其他表仅同步表结构。设置顶层 `sync_no_pk_table_schema: false` 时只纳入可数据同步的表。 |
 | `except_table_name_prefix` | 排除指定前缀的表，多个前缀用逗号分隔。 |
 | `server_id` | Binlog replication server id，必须与 MySQL 集群中其他 server id 不重复。 |
 | `ssl_mode` | MySQL SSL模式，透传为SQLx连接参数 `ssl-mode`。可选：`disabled`、`preferred`、`required`、`verify_ca`、`verify_identity`；默认 `disabled`。如果源库/目标库必须使用SSL，请显式设置为 `required` 或证书校验模式。 |
 | `statement_cache_capacity` | MySQL prepared statement 缓存容量，透传为 SQLx 连接参数 `statement-cache-capacity`；设为 `"0"` 可关闭缓存。MySQL 报 `Can't create more than max_prepared_stmt_count statements` 时，可先断开旧连接或临时调大 `max_prepared_stmt_count` 后重启同步进程。 |
 
-主键列会从 MySQL 表结构自动识别；参与数据同步的表需要单一整数主键（`tinyint`、`smallint`、`mediumint`、`int`、`bigint` 及其 unsigned 变体）。不满足该条件的表在 `sync_no_pk_table_schema: true` 时仅同步表结构。配置项 `pk_column` 已弃用，配置文件中出现该字段会在启动解析时报错。MeiliSearch 目标端的 `meili_table_pk` 仍需单独配置为索引主键字段。
+主键列会从 MySQL 表结构自动识别；参与数据同步的表需要单一整数主键（`tinyint`、`smallint`、`mediumint`、`int`、`bigint` 及其 unsigned 变体），或单一 `char(n)` / `varchar(n)` 字符串主键（当前 `n <= 512`）。不满足该条件的表在 `sync_no_pk_table_schema: true` 时仅同步表结构。只要存在数据同步表，启动时会校验 MySQL `binlog_format=ROW` 且 `binlog_row_image=FULL`，否则直接失败，避免 UPDATE/DELETE 缺少旧行数据。配置项 `pk_column` 已弃用，配置文件中出现该字段会在启动解析时报错。MeiliSearch 目标端的 `meili_table_pk` 仍需单独配置为索引主键字段。
 
 外键表默认参与同步。MySQL/Dameng 目标端会先创建基础表并完成初始化数据写入，再补外键约束；如果显式只同步部分表，缺少父表或子表的外键约束会跳过并记录告警，不会自动扩展同步表清单。达梦目标端会尽力补外键约束，单条约束因索引、数据或兼容性原因创建失败时会记录告警并继续同步。
 
@@ -528,7 +528,8 @@ cargo test -p common --verbose
 - [x] 插件系统
 - [x] 内置 UI 与 Prometheus metrics
 - [x] 表/库 include/exclude 能力
-- [ ] MySQL 字符串主键与无主键表数据同步：支持字符串主键，并评估基于 `binlog_row_image=FULL` 的无主键表初始化和增量应用策略
+- [x] MySQL 字符串主键数据同步：支持单列 `char`/`varchar` 主键表参与初始化和 CDC
+- [ ] MySQL 无主键表数据同步：评估基于 `binlog_row_image=FULL` 的初始化和增量应用策略
 - [x] 数据库拆分插件：通过插件进入拆分模式，并在 Actix Web 中加载拆分任务管理页面（V1）
 - [x] 清理 dry-run 与删除 SQL 生成：默认只统计数量，生成可审查 SQL，不默认执行删除
 - [ ] 拆分任务状态与操作记录：记录同步检查、dry-run、SQL 生成、确认信息和人工备注（未持久化）

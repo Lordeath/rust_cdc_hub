@@ -7840,37 +7840,71 @@ impl Sink for DamengSink {
                     }
                 },
                 Operation::UPDATE => {
-                    let update_columns = Self::merge_dml_columns_with_records(
-                        &table_info,
-                        &[],
-                        std::slice::from_ref(record),
-                    );
-                    if update_columns.is_empty() {
-                        Ok(())
-                    } else {
+                    if Self::record_pk_changed(pk_name.as_str(), record) {
                         match self
                             .ensure_dml_columns(
                                 schema.as_str(),
                                 table_name.as_str(),
                                 table_key.as_str(),
-                                &update_columns,
+                                &columns,
                                 std::slice::from_ref(record),
-                                false,
+                                true,
                             )
                             .await
                         {
                             Err(e) => Err(e),
-                            Ok(_) => {
-                                self.cache_dml_columns(table_key.as_str(), &columns).await;
-                                self.upsert_record(
+                            Ok(required_defaults) => {
+                                let (dml_columns, dml_records) = Self::apply_dml_required_defaults(
+                                    &columns,
+                                    std::slice::from_ref(record),
+                                    &required_defaults,
+                                );
+                                self.cache_dml_columns(table_key.as_str(), &dml_columns)
+                                    .await;
+                                self.replace_record_with_changed_pk(
                                     schema.as_str(),
                                     table_name.as_str(),
                                     table_key.as_str(),
                                     pk_name.as_str(),
-                                    &update_columns,
-                                    record,
+                                    &dml_columns,
+                                    &dml_records[0],
                                 )
                                 .await
+                            }
+                        }
+                    } else {
+                        let update_columns = Self::merge_dml_columns_with_records(
+                            &table_info,
+                            &[],
+                            std::slice::from_ref(record),
+                        );
+                        if update_columns.is_empty() {
+                            Ok(())
+                        } else {
+                            match self
+                                .ensure_dml_columns(
+                                    schema.as_str(),
+                                    table_name.as_str(),
+                                    table_key.as_str(),
+                                    &update_columns,
+                                    std::slice::from_ref(record),
+                                    false,
+                                )
+                                .await
+                            {
+                                Err(e) => Err(e),
+                                Ok(_) => {
+                                    self.cache_dml_columns(table_key.as_str(), &columns).await;
+                                    self.upsert_record(
+                                        schema.as_str(),
+                                        table_name.as_str(),
+                                        table_key.as_str(),
+                                        pk_name.as_str(),
+                                        &update_columns,
+                                        record,
+                                    )
+                                    .await
+                                }
                             }
                         }
                     }
@@ -8094,6 +8128,35 @@ impl DamengSink {
             }
         }
         Ok(())
+    }
+
+    async fn replace_record_with_changed_pk(
+        &self,
+        schema: &str,
+        table_name: &str,
+        table_key: &str,
+        pk_name: &str,
+        columns: &[String],
+        record: &DataBuffer,
+    ) -> Result<(), String> {
+        let old_pk = record.before.get(pk_name);
+        if old_pk.is_none() {
+            return Err(format!(
+                "Dameng update primary key changed but old pk is empty: {}.{}",
+                table_key, pk_name
+            ));
+        }
+        let new_pk = record.after.get(pk_name);
+        if new_pk.is_none() {
+            return Err(format!(
+                "Dameng update primary key changed but new pk is empty: {}.{}",
+                table_key, pk_name
+            ));
+        }
+        self.delete_record_by_pk_value(schema, table_name, table_key, pk_name, old_pk)
+            .await?;
+        self.insert_record(schema, table_name, table_key, pk_name, columns, record)
+            .await
     }
 
     async fn ensure_random_check_target_row_exists(
@@ -8320,6 +8383,24 @@ impl DamengSink {
 
     fn has_non_pk_columns(columns: &[String], pk_name: &str) -> bool {
         columns.iter().any(|c| !c.eq_ignore_ascii_case(pk_name))
+    }
+
+    fn value_identity_equal(left: &Value, right: &Value) -> bool {
+        match (left, right) {
+            (Value::None, Value::None) => true,
+            (Value::None, _) | (_, Value::None) => false,
+            (Value::Blob(left), Value::Blob(right)) => left == right,
+            _ => left.resolve_string() == right.resolve_string(),
+        }
+    }
+
+    fn record_pk_changed(pk_name: &str, record: &DataBuffer) -> bool {
+        let before = record.before.get(pk_name);
+        let after = record.after.get(pk_name);
+        if before.is_none() || after.is_none() {
+            return false;
+        }
+        !Self::value_identity_equal(before, after)
     }
 
     async fn merge_records_batch(
@@ -8921,11 +9002,23 @@ impl DamengSink {
         &self,
         schema: &str,
         table_name: &str,
-        _table_key: &str,
+        table_key: &str,
         pk_name: &str,
         record: &DataBuffer,
     ) -> Result<(), String> {
         let pk = record.get_pk(pk_name);
+        self.delete_record_by_pk_value(schema, table_name, table_key, pk_name, pk)
+            .await
+    }
+
+    async fn delete_record_by_pk_value(
+        &self,
+        schema: &str,
+        table_name: &str,
+        table_key: &str,
+        pk_name: &str,
+        pk: &Value,
+    ) -> Result<(), String> {
         if pk.is_none() {
             return Ok(());
         }
@@ -8936,7 +9029,17 @@ impl DamengSink {
         );
         let params = vec![Self::value_to_param(pk)];
         debug!("Dameng DELETE: {}", sql);
-        self.execute_with_params(sql.as_str(), &params).await?;
+        self.execute_with_params(sql.as_str(), &params)
+            .await
+            .map_err(|e| {
+                format!(
+                    "Dameng DELETE failed: table={} pk={} value={} error={}",
+                    table_key,
+                    pk_name,
+                    pk.resolve_string(),
+                    e
+                )
+            })?;
         Ok(())
     }
 
@@ -10480,6 +10583,50 @@ mod tests {
             DamengSink::value_to_param(&Value::Bit(0)).to_dm_value(),
             DmValue::BigInt(0)
         );
+    }
+
+    fn update_record_with_pk(before_pk: Option<Value>, after_pk: Option<Value>) -> DataBuffer {
+        let mut before = CaseInsensitiveHashMap::new_with_no_arg();
+        if let Some(value) = before_pk {
+            before.insert("id".to_string(), value);
+        }
+        let mut after = CaseInsensitiveHashMap::new_with_no_arg();
+        if let Some(value) = after_pk {
+            after.insert("id".to_string(), value);
+        }
+        DataBuffer::new(
+            "orders".to_string(),
+            before,
+            after,
+            Operation::UPDATE,
+            "".to_string(),
+            0,
+            0,
+        )
+    }
+
+    #[test]
+    fn record_pk_changed_detects_changed_integer_and_string_pk() {
+        let integer_record = update_record_with_pk(Some(Value::Int64(1)), Some(Value::Int64(2)));
+        let string_record = update_record_with_pk(
+            Some(Value::String("old".to_string())),
+            Some(Value::String("new".to_string())),
+        );
+
+        assert!(DamengSink::record_pk_changed("id", &integer_record));
+        assert!(DamengSink::record_pk_changed("id", &string_record));
+    }
+
+    #[test]
+    fn record_pk_changed_ignores_same_or_missing_before_pk() {
+        let same_record = update_record_with_pk(
+            Some(Value::String("same".to_string())),
+            Some(Value::String("same".to_string())),
+        );
+        let missing_before = update_record_with_pk(None, Some(Value::String("new".to_string())));
+
+        assert!(!DamengSink::record_pk_changed("id", &same_record));
+        assert!(!DamengSink::record_pk_changed("id", &missing_before));
     }
 
     #[test]

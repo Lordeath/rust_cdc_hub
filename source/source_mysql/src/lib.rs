@@ -7,11 +7,15 @@ use common::custom_error::{CustomError, CustomErrorType};
 use common::metrics::{SOURCE_EVENTS_TOTAL, SOURCE_LAG_POSITION};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::runtime_progress;
+use common::schema::{
+    extract_mysql_create_table_column_definitions, mysql_type_token_from_column_definition,
+};
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, ForeignKeyInfo, Operation, Plugin, Sink, Source,
     TableIndexInfo, TableInfoVo, Value, database_table_key,
     get_mysql_pool_by_url_with_max_connections, mysql_connection_url_from_config,
-    mysql_row_text_value, mysql_row_to_hashmap, redact_connection_url_password,
+    mysql_row_text_value, mysql_row_to_hashmap, mysql_utf8mb4_string_expr,
+    redact_connection_url_password,
 };
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
@@ -35,6 +39,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, trace, warn};
+
+const MYSQL_CDC_STRING_PK_CHAR_LIMIT: u32 = 512;
 
 pub struct MySQLSource {
     streams: Vec<Option<BinlogStream>>,
@@ -64,6 +70,12 @@ struct MysqlStreamGroup {
     source_indices: Vec<usize>,
     start_binlog_filename: Option<String>,
     start_binlog_position: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MysqlBinlogSettings {
+    binlog_format: String,
+    binlog_row_image: String,
 }
 
 fn stream_checkpoint_key(group: &MysqlStreamGroup) -> String {
@@ -365,7 +377,7 @@ impl MysqlSourceConfig {
                             panic!("query failed: {}", e);
                         }
                     };
-                let create_table_sql = show_create_table_result.get(1);
+                let create_table_sql: String = show_create_table_result.get(1);
                 let pk_column_sql = r#"
                     select COLUMN_NAME as column_name, COLUMN_KEY as column_key, DATA_TYPE as data_type
                     from information_schema.`COLUMNS`
@@ -397,6 +409,7 @@ impl MysqlSourceConfig {
                 let Some(pk_column) = Self::table_cdc_pk_column(
                     table_name.as_str(),
                     &col_list,
+                    create_table_sql.as_str(),
                     sync_schema_only_tables,
                 ) else {
                     continue;
@@ -533,7 +546,8 @@ impl MysqlSourceConfig {
             return sql;
         }
 
-        let mut sql = r#"
+        let mut sql = format!(
+            r#"
             SELECT DISTINCT c.TABLE_NAME AS table_name
             FROM information_schema.COLUMNS c
             JOIN information_schema.TABLES t
@@ -542,9 +556,15 @@ impl MysqlSourceConfig {
             WHERE c.TABLE_SCHEMA = (SELECT DATABASE())
               AND t.TABLE_TYPE = 'BASE TABLE'
               AND c.COLUMN_KEY = 'PRI'
-              AND c.DATA_TYPE IN ('tinyint', 'smallint', 'mediumint', 'int', 'bigint')
+              AND (
+                    c.DATA_TYPE IN ('tinyint', 'smallint', 'mediumint', 'int', 'bigint')
+                    OR (
+                        c.DATA_TYPE IN ('char', 'varchar')
+                        AND COALESCE(c.CHARACTER_MAXIMUM_LENGTH, 0) BETWEEN 1 AND {MYSQL_CDC_STRING_PK_CHAR_LIMIT}
+                    )
+              )
         "#
-        .to_string();
+        );
         if !sync_foreign_key_tables {
             Self::push_foreign_key_table_exclusion(&mut sql, "c.TABLE_NAME");
         }
@@ -586,6 +606,7 @@ impl MysqlSourceConfig {
     fn table_cdc_pk_column(
         table_name: &str,
         col_list: &[ColumnInfoFromMysql],
+        create_table_sql: &str,
         sync_schema_only_tables: bool,
     ) -> Option<String> {
         let primary_key_columns: Vec<&ColumnInfoFromMysql> = col_list
@@ -594,7 +615,7 @@ impl MysqlSourceConfig {
             .collect();
         let supported_pk_columns: Vec<String> = primary_key_columns
             .iter()
-            .filter(|c| is_supported_mysql_pk_data_type(c.data_type.as_str()))
+            .filter(|c| is_supported_mysql_cdc_pk_column(c, create_table_sql))
             .map(|c| c.column_name.clone())
             .collect();
         if primary_key_columns.len() == 1 && supported_pk_columns.len() == 1 {
@@ -856,18 +877,67 @@ pub struct ColumnInfoFromMysql {
     pub data_type: String,
 }
 
-fn is_supported_mysql_pk_data_type(data_type: &str) -> bool {
+fn is_supported_mysql_integer_pk_data_type(data_type: &str) -> bool {
     matches!(
         data_type.to_ascii_lowercase().as_str(),
         "tinyint" | "smallint" | "mediumint" | "int" | "bigint"
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+fn is_supported_mysql_integer_pk_type_token(type_token: &str) -> bool {
+    let normalized = type_token.trim().to_ascii_lowercase();
+    let type_name = normalized
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or_default();
+    matches!(
+        type_name,
+        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint"
+    )
+}
+
+fn is_supported_mysql_cdc_pk_column(column: &ColumnInfoFromMysql, create_table_sql: &str) -> bool {
+    if is_supported_mysql_integer_pk_data_type(column.data_type.as_str()) {
+        return true;
+    }
+    if !matches!(
+        column.data_type.to_ascii_lowercase().as_str(),
+        "char" | "varchar"
+    ) {
+        return false;
+    }
+
+    let defs = extract_mysql_create_table_column_definitions(create_table_sql);
+    let Some(definition) = defs.get(column.column_name.to_ascii_lowercase().as_str()) else {
+        return false;
+    };
+    let Some(type_token) = mysql_type_token_from_column_definition(definition.as_str()) else {
+        return false;
+    };
+    is_supported_mysql_string_pk_type(type_token.as_str())
+}
+
+fn is_supported_mysql_string_pk_type(type_token: &str) -> bool {
+    let normalized = type_token.trim().to_ascii_lowercase();
+    if !(normalized.starts_with("char(") || normalized.starts_with("varchar(")) {
+        return false;
+    }
+    mysql_char_type_length(normalized.as_str())
+        .is_some_and(|len| len > 0 && len <= MYSQL_CDC_STRING_PK_CHAR_LIMIT)
+}
+
+fn mysql_char_type_length(type_token: &str) -> Option<u32> {
+    let start = type_token.find('(')? + 1;
+    let end = type_token[start..].find(')')? + start;
+    type_token[start..end].trim().parse::<u32>().ok()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum InitPkCursor {
     Start,
     Signed(i64),
     Unsigned(u64),
+    Text(String),
 }
 
 impl InitPkCursor {
@@ -881,6 +951,7 @@ impl InitPkCursor {
             Value::UnsignedInt16(v) => Some(Self::Unsigned(*v as u64)),
             Value::UnsignedInt32(v) => Some(Self::Unsigned(*v as u64)),
             Value::UnsignedInt64(v) => Some(Self::Unsigned(*v)),
+            Value::String(v) => Some(Self::Text(v.clone())),
             _ => None,
         }
     }
@@ -890,33 +961,39 @@ impl InitPkCursor {
             Self::Start => None,
             Self::Signed(v) => Some(v.to_string()),
             Self::Unsigned(v) => Some(v.to_string()),
+            Self::Text(v) => Some(mysql_utf8mb4_string_expr(v)),
         }
     }
 
     fn display_value(&self) -> String {
-        self.sql_literal().unwrap_or_else(|| "START".to_string())
+        match self {
+            Self::Start => "START".to_string(),
+            Self::Signed(v) => v.to_string(),
+            Self::Unsigned(v) => v.to_string(),
+            Self::Text(v) => v.clone(),
+        }
     }
 
     fn advance(&mut self, next: Self) {
-        match (*self, next) {
-            (Self::Start, _) => *self = next,
-            (Self::Signed(current), Self::Signed(next_value)) if next_value > current => {
-                *self = next
-            }
-            (Self::Unsigned(current), Self::Unsigned(next_value)) if next_value > current => {
-                *self = next
-            }
+        let should_update = match (&*self, &next) {
+            (Self::Start, _) => true,
+            (Self::Signed(current), Self::Signed(next_value)) => next_value > current,
+            (Self::Unsigned(current), Self::Unsigned(next_value)) => next_value > current,
             (Self::Signed(current), Self::Unsigned(next_value))
-                if current < 0 || next_value > current as u64 =>
+                if *current < 0 || *next_value > *current as u64 =>
             {
-                *self = next
+                true
             }
             (Self::Unsigned(current), Self::Signed(next_value))
-                if next_value >= 0 && (next_value as u64) > current =>
+                if *next_value >= 0 && (*next_value as u64) > *current =>
             {
-                *self = next
+                true
             }
-            _ => {}
+            (Self::Text(_), Self::Text(_)) => true,
+            _ => false,
+        };
+        if should_update {
+            *self = next;
         }
     }
 }
@@ -979,10 +1056,18 @@ impl MysqlSourceConfigDetail {
         executor: &mut Transaction<'_, MySql>,
     ) -> Vec<DataBuffer> {
         let limit = limit.max(1);
+        let use_random_sample =
+            random_sample && self.pk_column_supports_random_init(table_name, pk_column);
+        if random_sample && !use_random_sample {
+            info!(
+                "MySQL数据源初始化验证模式非数值主键按主键顺序取样: {}.{} pk={}",
+                self.database, table_name, pk_column
+            );
+        }
         let table_ref = qualified_mysql_table_name(&self.database, table_name);
         let pk_ident = quote_mysql_identifier(pk_column);
         let mut random_start = None;
-        let sql = if random_sample {
+        let sql = if use_random_sample {
             let start = self
                 .random_init_pk_start(table_name, pk_column, executor)
                 .await
@@ -1020,14 +1105,14 @@ impl MysqlSourceConfigDetail {
             table_name,
             pk_column,
             cursor.display_value(),
-            random_sample
+            use_random_sample
         );
         // 查询 Row，而不是 HashMap
         let mut rows: Vec<MySqlRow> = sqlx::query(&sql)
             .fetch_all(&mut **executor)
             .await
             .expect("query failed");
-        if random_sample
+        if use_random_sample
             && rows.len() < limit
             && let Some(start) = random_start.as_deref()
         {
@@ -1058,7 +1143,7 @@ impl MysqlSourceConfigDetail {
             pk_column,
             cursor.display_value(),
             rows.len(),
-            random_sample
+            use_random_sample
         );
         let mut result: Vec<DataBuffer> = vec![];
         for row in rows {
@@ -1110,6 +1195,25 @@ impl MysqlSourceConfigDetail {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     }
+
+    fn pk_column_supports_random_init(&self, table_name: &str, pk_column: &str) -> bool {
+        let Some(table_info) = self
+            .table_info_list
+            .iter()
+            .find(|table_info| table_info.table_name.eq_ignore_ascii_case(table_name))
+        else {
+            return false;
+        };
+        let defs =
+            extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
+        let Some(definition) = defs.get(pk_column.to_ascii_lowercase().as_str()) else {
+            return false;
+        };
+        let Some(type_token) = mysql_type_token_from_column_definition(definition.as_str()) else {
+            return false;
+        };
+        is_supported_mysql_integer_pk_type_token(type_token.as_str())
+    }
 }
 
 impl MySQLSource {
@@ -1126,6 +1230,10 @@ impl MySQLSource {
             vec![];
         for i in 0..size {
             let connection_url = cfg.mysql_source[i].connection_url.clone();
+            let pool: Pool<MySql> = cfg.pools[i].clone();
+            Self::ensure_binlog_settings_for_data_sync(&cfg.mysql_source[i], &pool)
+                .await
+                .unwrap_or_else(|e| panic!("{}", e.message));
             let tables: Vec<String> = cfg.mysql_source[i]
                 .table_info_list
                 .clone()
@@ -1168,7 +1276,6 @@ impl MySQLSource {
             checkpoint_entities.push(Mutex::new(mysql_checkpoint_detail_entity_map.clone()));
 
             mysql_source.push(cfg.mysql_source[i].clone());
-            let pool: Pool<MySql> = cfg.pools[i].clone();
             pools.push(pool);
         }
         let mut stream_checkpoints = Vec::new();
@@ -1321,6 +1428,85 @@ impl MySQLSource {
             error_type: CustomErrorType::Restart,
         })?;
         Ok((file, pos))
+    }
+
+    async fn fetch_binlog_settings(pool: &Pool<MySql>) -> Result<MysqlBinlogSettings, CustomError> {
+        let rows = sqlx::query(
+            "SHOW VARIABLES WHERE Variable_name IN ('binlog_format', 'binlog_row_image')",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| CustomError {
+            message: format!("读取 MySQL binlog 配置失败: {}", e),
+            error_type: CustomErrorType::Restart,
+        })?;
+
+        let mut settings = MysqlBinlogSettings {
+            binlog_format: String::new(),
+            binlog_row_image: String::new(),
+        };
+        for row in rows {
+            let name = mysql_row_text_value(&row, "Variable_name");
+            let value = mysql_row_text_value(&row, "Value");
+            match name.to_ascii_lowercase().as_str() {
+                "binlog_format" => settings.binlog_format = value,
+                "binlog_row_image" => settings.binlog_row_image = value,
+                _ => {}
+            }
+        }
+        Ok(settings)
+    }
+
+    async fn ensure_binlog_settings_for_data_sync(
+        config: &MysqlSourceConfigDetail,
+        pool: &Pool<MySql>,
+    ) -> Result<(), CustomError> {
+        let settings = Self::fetch_binlog_settings(pool).await?;
+        Self::validate_binlog_settings_for_data_sync(config, &settings).map_err(|message| {
+            CustomError {
+                message,
+                error_type: CustomErrorType::Restart,
+            }
+        })
+    }
+
+    fn validate_binlog_settings_for_data_sync(
+        config: &MysqlSourceConfigDetail,
+        settings: &MysqlBinlogSettings,
+    ) -> Result<(), String> {
+        let cdc_tables = config
+            .table_info_list
+            .iter()
+            .filter(|table_info| MysqlSourceConfigDetail::is_cdc_table(table_info))
+            .map(|table_info| table_info.table_name.as_str())
+            .collect::<Vec<_>>();
+        if cdc_tables.is_empty() {
+            return Ok(());
+        }
+
+        let binlog_format = settings.binlog_format.trim();
+        let binlog_row_image = settings.binlog_row_image.trim();
+        if binlog_format.eq_ignore_ascii_case("ROW")
+            && binlog_row_image.eq_ignore_ascii_case("FULL")
+        {
+            return Ok(());
+        }
+
+        Err(format!(
+            "MySQL source {} 存在数据同步表，必须设置 binlog_format=ROW 且 binlog_row_image=FULL；当前 binlog_format='{}', binlog_row_image='{}', tables={}",
+            config.database,
+            if binlog_format.is_empty() {
+                "<empty>"
+            } else {
+                binlog_format
+            },
+            if binlog_row_image.is_empty() {
+                "<empty>"
+            } else {
+                binlog_row_image
+            },
+            cdc_tables.join(",")
+        ))
     }
 
     async fn initialize_source_index(
@@ -3782,13 +3968,38 @@ mod tests {
     }
 
     #[test]
+    fn init_pk_cursor_supports_string_pk() {
+        let cursor = InitPkCursor::from_value(&Value::String("A'中".to_string())).unwrap();
+
+        assert_eq!(cursor, InitPkCursor::Text("A'中".to_string()));
+        let sql_literal = cursor.sql_literal().unwrap();
+        assert!(sql_literal.starts_with("CONVERT(0x"));
+        assert!(sql_literal.ends_with(" USING utf8mb4)"));
+        assert!(!sql_literal.contains("'"));
+    }
+
+    #[test]
     fn supported_pk_data_types_include_mysql_integer_types() {
         for data_type in ["tinyint", "smallint", "mediumint", "int", "bigint"] {
-            assert!(is_supported_mysql_pk_data_type(data_type));
+            assert!(is_supported_mysql_integer_pk_data_type(data_type));
         }
-        assert!(is_supported_mysql_pk_data_type("INT"));
-        assert!(!is_supported_mysql_pk_data_type("varchar"));
-        assert!(!is_supported_mysql_pk_data_type("decimal"));
+        assert!(is_supported_mysql_integer_pk_data_type("INT"));
+        assert!(!is_supported_mysql_integer_pk_data_type("varchar"));
+        assert!(!is_supported_mysql_integer_pk_data_type("decimal"));
+    }
+
+    #[test]
+    fn supported_pk_type_tokens_include_integer_and_bounded_strings() {
+        assert!(is_supported_mysql_integer_pk_type_token("int(11) unsigned"));
+        assert!(is_supported_mysql_integer_pk_type_token("INTEGER"));
+        assert!(is_supported_mysql_string_pk_type("varchar(64)"));
+        assert!(is_supported_mysql_string_pk_type(
+            "VARCHAR(512) CHARACTER SET utf8mb4"
+        ));
+        assert!(is_supported_mysql_string_pk_type("char(32)"));
+        assert!(!is_supported_mysql_string_pk_type("varchar(0)"));
+        assert!(!is_supported_mysql_string_pk_type("varchar(513)"));
+        assert!(!is_supported_mysql_string_pk_type("text"));
     }
 
     #[test]
@@ -3807,6 +4018,8 @@ mod tests {
 
         assert!(sql.contains("c.COLUMN_KEY = 'PRI'"));
         assert!(sql.contains("c.DATA_TYPE IN"));
+        assert!(sql.contains("'char', 'varchar'"));
+        assert!(sql.contains("CHARACTER_MAXIMUM_LENGTH"));
         assert!(sql.contains("HAVING COUNT(*) > 1"));
     }
 
@@ -3827,42 +4040,130 @@ mod tests {
         }
     }
 
+    fn create_table_with_pk(table_name: &str, pk_definition: &str) -> String {
+        format!(
+            "CREATE TABLE `{}` (\n  {}\n) ENGINE=InnoDB",
+            table_name, pk_definition
+        )
+    }
+
+    fn test_table_info(table_name: &str, pk_column: &str, create_table_sql: &str) -> TableInfoVo {
+        let columns = if pk_column.trim().is_empty() {
+            vec![]
+        } else {
+            vec![pk_column.to_string()]
+        };
+        TableInfoVo {
+            source_database: "source_db".to_string(),
+            target_database: "target_db".to_string(),
+            table_name: table_name.to_string(),
+            pk_column: pk_column.to_string(),
+            create_table_sql: create_table_sql.to_string(),
+            columns,
+            table_comment: String::new(),
+            indexes: vec![],
+            foreign_keys: vec![],
+        }
+    }
+
+    fn test_mysql_source_detail(table_info_list: Vec<TableInfoVo>) -> MysqlSourceConfigDetail {
+        MysqlSourceConfigDetail {
+            username: "".to_string(),
+            password: "".to_string(),
+            host: "".to_string(),
+            port: "".to_string(),
+            database: "source_db".to_string(),
+            target_database: "target_db".to_string(),
+            server_id: 1,
+            connection_url: "".to_string(),
+            table_info_list,
+            batchsize: 100,
+            random_check_data_after_init: false,
+            random_check_data_after_init_batch_size_min: 10,
+            start_binlog_filename: None,
+            start_binlog_position: None,
+        }
+    }
+
     #[test]
-    fn table_cdc_pk_column_keeps_only_single_integer_primary_key_for_cdc() {
+    fn table_cdc_pk_column_keeps_single_integer_or_string_primary_key_for_cdc() {
         let cols = vec![
             column_info("id", "PRI", "bigint"),
             column_info("name", "", "varchar"),
         ];
+        let create_sql = create_table_with_pk(
+            "orders",
+            "`id` bigint unsigned NOT NULL,\n  `name` varchar(64),\n  PRIMARY KEY (`id`)",
+        );
 
         assert_eq!(
-            MysqlSourceConfig::table_cdc_pk_column("orders", &cols, true),
+            MysqlSourceConfig::table_cdc_pk_column("orders", &cols, create_sql.as_str(), true),
             Some("id".to_string())
+        );
+
+        let string_pk_cols = vec![column_info("ID_", "PRI", "varchar")];
+        let string_pk_sql = create_table_with_pk(
+            "act_ge_bytearray",
+            "`ID_` varchar(64) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci NOT NULL,\n  PRIMARY KEY (`ID_`)",
+        );
+        assert_eq!(
+            MysqlSourceConfig::table_cdc_pk_column(
+                "act_ge_bytearray",
+                &string_pk_cols,
+                string_pk_sql.as_str(),
+                true,
+            ),
+            Some("ID_".to_string())
         );
     }
 
     #[test]
     fn table_cdc_pk_column_marks_unsupported_tables_as_schema_only() {
-        let string_pk_cols = vec![column_info("ID_", "PRI", "varchar")];
+        let long_string_pk_cols = vec![column_info("ID_", "PRI", "varchar")];
+        let long_string_pk_sql = create_table_with_pk(
+            "string_pk",
+            "`ID_` varchar(1024) NOT NULL,\n  PRIMARY KEY (`ID_`)",
+        );
         let composite_pk_cols = vec![
             column_info("tenant_id", "PRI", "bigint"),
             column_info("code", "PRI", "varchar"),
         ];
+        let composite_pk_sql = create_table_with_pk(
+            "composite_pk",
+            "`tenant_id` bigint NOT NULL,\n  `code` varchar(64) NOT NULL,\n  PRIMARY KEY (`tenant_id`, `code`)",
+        );
         let no_pk_cols = vec![column_info("name", "", "varchar")];
+        let no_pk_sql = create_table_with_pk("no_pk", "`name` varchar(64)");
 
         assert_eq!(
-            MysqlSourceConfig::table_cdc_pk_column("string_pk", &string_pk_cols, true),
+            MysqlSourceConfig::table_cdc_pk_column(
+                "string_pk",
+                &long_string_pk_cols,
+                long_string_pk_sql.as_str(),
+                true,
+            ),
             Some(String::new())
         );
         assert_eq!(
-            MysqlSourceConfig::table_cdc_pk_column("composite_pk", &composite_pk_cols, true),
+            MysqlSourceConfig::table_cdc_pk_column(
+                "composite_pk",
+                &composite_pk_cols,
+                composite_pk_sql.as_str(),
+                true,
+            ),
             Some(String::new())
         );
         assert_eq!(
-            MysqlSourceConfig::table_cdc_pk_column("no_pk", &no_pk_cols, true),
+            MysqlSourceConfig::table_cdc_pk_column("no_pk", &no_pk_cols, no_pk_sql.as_str(), true),
             Some(String::new())
         );
         assert_eq!(
-            MysqlSourceConfig::table_cdc_pk_column("string_pk", &string_pk_cols, false),
+            MysqlSourceConfig::table_cdc_pk_column(
+                "string_pk",
+                &long_string_pk_cols,
+                long_string_pk_sql.as_str(),
+                false,
+            ),
             None
         );
     }
@@ -3879,6 +4180,82 @@ mod tests {
     }
 
     #[test]
+    fn init_pk_cursor_advances_text_to_latest_seen_value() {
+        let mut cursor = InitPkCursor::Start;
+
+        cursor.advance(InitPkCursor::Text("b".to_string()));
+        cursor.advance(InitPkCursor::Text("a".to_string()));
+
+        assert_eq!(cursor, InitPkCursor::Text("a".to_string()));
+    }
+
+    #[test]
+    fn string_pk_does_not_support_random_init_start() {
+        let create_sql = create_table_with_pk(
+            "orders",
+            "`ID_` varchar(64) NOT NULL,\n  PRIMARY KEY (`ID_`)",
+        );
+        let config =
+            test_mysql_source_detail(vec![test_table_info("orders", "ID_", create_sql.as_str())]);
+
+        assert!(!config.pk_column_supports_random_init("orders", "ID_"));
+    }
+
+    #[test]
+    fn integer_pk_supports_random_init_start() {
+        let create_sql = create_table_with_pk(
+            "orders",
+            "`id` bigint unsigned NOT NULL,\n  PRIMARY KEY (`id`)",
+        );
+        let config =
+            test_mysql_source_detail(vec![test_table_info("orders", "id", create_sql.as_str())]);
+
+        assert!(config.pk_column_supports_random_init("orders", "id"));
+    }
+
+    #[test]
+    fn binlog_settings_allow_schema_only_without_full_row_image() {
+        let table_info = test_table_info(
+            "no_pk_table",
+            "",
+            "CREATE TABLE `no_pk_table` (`name` varchar(64))",
+        );
+        let config = test_mysql_source_detail(vec![table_info]);
+        let settings = MysqlBinlogSettings {
+            binlog_format: "STATEMENT".to_string(),
+            binlog_row_image: "MINIMAL".to_string(),
+        };
+
+        assert!(MySQLSource::validate_binlog_settings_for_data_sync(&config, &settings).is_ok());
+    }
+
+    #[test]
+    fn binlog_settings_require_row_full_for_data_sync_tables() {
+        let table_info = test_table_info(
+            "orders",
+            "id",
+            "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))",
+        );
+        let config = test_mysql_source_detail(vec![table_info]);
+        let settings = MysqlBinlogSettings {
+            binlog_format: "ROW".to_string(),
+            binlog_row_image: "FULL".to_string(),
+        };
+
+        assert!(MySQLSource::validate_binlog_settings_for_data_sync(&config, &settings).is_ok());
+
+        let bad_settings = MysqlBinlogSettings {
+            binlog_format: "ROW".to_string(),
+            binlog_row_image: "MINIMAL".to_string(),
+        };
+        let error = MySQLSource::validate_binlog_settings_for_data_sync(&config, &bad_settings)
+            .unwrap_err();
+        assert!(error.contains("binlog_format=ROW"));
+        assert!(error.contains("binlog_row_image=FULL"));
+        assert!(error.contains("orders"));
+    }
+
+    #[test]
     fn schema_only_tables_are_not_cdc_tables() {
         let table_info = TableInfoVo {
             source_database: "source_db".to_string(),
@@ -3891,22 +4268,7 @@ mod tests {
             indexes: vec![],
             foreign_keys: vec![],
         };
-        let config = MysqlSourceConfigDetail {
-            username: "".to_string(),
-            password: "".to_string(),
-            host: "".to_string(),
-            port: "".to_string(),
-            database: "source_db".to_string(),
-            target_database: "target_db".to_string(),
-            server_id: 1,
-            connection_url: "".to_string(),
-            table_info_list: vec![table_info],
-            batchsize: 100,
-            random_check_data_after_init: false,
-            random_check_data_after_init_batch_size_min: 10,
-            start_binlog_filename: None,
-            start_binlog_position: None,
-        };
+        let config = test_mysql_source_detail(vec![table_info]);
 
         assert!(!config.is_target_database_and_table("source_db", "no_pk_table"));
         assert_eq!(table_pk_column(&config, "no_pk_table"), None);
