@@ -1,9 +1,11 @@
 use async_trait::async_trait;
+use common::checkpoint_manager::{CheckpointManager, checkpoint_manager_from_config};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo};
 use meilisearch_sdk::client::Client;
 use std::collections::HashMap;
 use std::error::Error;
+use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
 
@@ -19,10 +21,11 @@ pub struct MeiliSearchSink {
     buffer: Mutex<Vec<DataBuffer>>,
     initialized: RwLock<bool>,
     checkpoint: Mutex<HashMap<String, MysqlCheckPointDetailEntity>>,
+    checkpoint_manager: Arc<dyn CheckpointManager>,
 }
 
 impl MeiliSearchSink {
-    pub fn new(config: &CdcConfig, _table_info_list: Vec<TableInfoVo>) -> Self {
+    pub async fn new(config: &CdcConfig, _table_info_list: Vec<TableInfoVo>) -> Self {
         let meili_url = config.first_sink("meili_url");
         let meili_master_key = config.first_sink("meili_master_key");
         let meili_table_name = config.first_sink("table_name");
@@ -39,6 +42,7 @@ impl MeiliSearchSink {
             buffer: Mutex::new(Vec::with_capacity(BATCH_SIZE)),
             initialized: RwLock::new(false),
             checkpoint: Mutex::new(HashMap::new()),
+            checkpoint_manager: checkpoint_manager_from_config(config).await,
         }
     }
 }
@@ -172,27 +176,18 @@ impl Sink for MeiliSearchSink {
     }
 
     async fn alter_flush(&mut self) -> Result<(), String> {
-        let err_messages: Vec<String> = self
-            .checkpoint
-            .lock()
-            .await
-            .values()
-            .map(|s| {
-                match s.save() {
-                    Ok(_) => "".to_string(),
-                    Err(msg) => {
-                        error!("{}", msg);
-                        // Err(msg);
-                        msg
-                    }
-                }
-            })
-            .find(|x| !x.is_empty())
-            .into_iter()
-            .collect();
-        if !err_messages.is_empty() {
-            return Err(err_messages.join("\n").to_string());
+        let entries = {
+            let checkpoint = self.checkpoint.lock().await;
+            checkpoint
+                .iter()
+                .map(|(key, cp)| (key.clone(), cp.clone()))
+                .collect::<Vec<_>>()
+        };
+        if entries.is_empty() {
+            return Ok(());
         }
+        self.checkpoint_manager.save_many(&entries).await?;
+        self.checkpoint.lock().await.clear();
         Ok(())
     }
 }

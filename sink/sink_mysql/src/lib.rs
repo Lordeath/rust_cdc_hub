@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use common::case_insensitive_hash_map::{
     CaseInsensitiveHashMapTableInfoVo, CaseInsensitiveHashMapVecString,
 };
+use common::checkpoint_manager::{CheckpointManager, checkpoint_manager_from_config};
 use common::metrics::{SINK_EVENTS_TOTAL, SINK_FLUSH_DURATION_SECONDS, SINK_FLUSH_ERRORS_TOTAL};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::schema::{
@@ -23,6 +24,7 @@ use sqlx::{Executor, MySql, Pool, Row};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
+use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tracing::log::trace;
@@ -44,6 +46,7 @@ pub struct MySqlSink {
     columns_cache: Mutex<CaseInsensitiveHashMapVecString>,
     // pk_cache: Mutex<CaseInsensitiveHashMapVecString>,
     checkpoint: Mutex<HashMap<String, MysqlCheckPointDetailEntity>>,
+    checkpoint_manager: Arc<dyn CheckpointManager>,
 }
 
 impl MySqlSink {
@@ -277,6 +280,7 @@ impl MySqlSink {
             columns_cache: Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg()),
             // pk_cache: Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg()),
             checkpoint: Mutex::new(HashMap::new()),
+            checkpoint_manager: checkpoint_manager_from_config(config).await,
         }
     }
 
@@ -1853,27 +1857,18 @@ impl Sink for MySqlSink {
     }
 
     async fn alter_flush(&mut self) -> Result<(), String> {
-        let err_messages: Vec<String> = self
-            .checkpoint
-            .lock()
-            .await
-            .values()
-            .map(|s| {
-                match s.save() {
-                    Ok(_) => "".to_string(),
-                    Err(msg) => {
-                        error!("{}", msg);
-                        // Err(msg);
-                        msg
-                    }
-                }
-            })
-            .find(|x| !x.is_empty())
-            .into_iter()
-            .collect();
-        if !err_messages.is_empty() {
-            return Err(err_messages.join("\n").to_string());
+        let entries = {
+            let checkpoint = self.checkpoint.lock().await;
+            checkpoint
+                .iter()
+                .map(|(key, cp)| (key.clone(), cp.clone()))
+                .collect::<Vec<_>>()
+        };
+        if entries.is_empty() {
+            return Ok(());
         }
+        self.checkpoint_manager.save_many(&entries).await?;
+        self.checkpoint.lock().await.clear();
         trace!("alter flush done");
         Ok(())
     }

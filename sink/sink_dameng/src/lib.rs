@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use common::case_insensitive_hash_map::{
     CaseInsensitiveHashMapTableInfoVo, CaseInsensitiveHashMapVecString,
 };
+use common::checkpoint_manager::{CheckpointManager, checkpoint_manager_from_config};
 use common::metrics::{SINK_EVENTS_TOTAL, SINK_FLUSH_DURATION_SECONDS, SINK_FLUSH_ERRORS_TOTAL};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::schema::{
@@ -29,6 +30,7 @@ use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, trace, warn};
 
@@ -170,6 +172,7 @@ pub struct DamengSink {
     table_info_cache: Mutex<CaseInsensitiveHashMapTableInfoVo>,
     columns_cache: Mutex<CaseInsensitiveHashMapVecString>,
     checkpoint: Mutex<HashMap<String, MysqlCheckPointDetailEntity>>,
+    checkpoint_manager: Arc<dyn CheckpointManager>,
     identity_insert_tables: Mutex<HashSet<String>>,
     init_upsert_first_tables: Mutex<HashSet<String>>,
     active_identity_insert_table: Mutex<Option<(String, String)>>,
@@ -259,6 +262,7 @@ impl DamengSink {
             table_info_cache: Mutex::new(CaseInsensitiveHashMapTableInfoVo::new_with_no_arg()),
             columns_cache: Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg()),
             checkpoint: Mutex::new(HashMap::new()),
+            checkpoint_manager: checkpoint_manager_from_config(config).await,
             identity_insert_tables: Mutex::new(HashSet::new()),
             init_upsert_first_tables: Mutex::new(HashSet::new()),
             active_identity_insert_table: Mutex::new(None),
@@ -7336,24 +7340,18 @@ impl Sink for DamengSink {
     }
 
     async fn alter_flush(&mut self) -> Result<(), String> {
-        let err_messages: Vec<String> = self
-            .checkpoint
-            .lock()
-            .await
-            .values()
-            .map(|s| match s.save() {
-                Ok(_) => "".to_string(),
-                Err(msg) => {
-                    error!("{}", msg);
-                    msg
-                }
-            })
-            .find(|x| !x.is_empty())
-            .into_iter()
-            .collect();
-        if !err_messages.is_empty() {
-            return Err(err_messages.join("\n").to_string());
+        let entries = {
+            let checkpoint = self.checkpoint.lock().await;
+            checkpoint
+                .iter()
+                .map(|(key, cp)| (key.clone(), cp.clone()))
+                .collect::<Vec<_>>()
+        };
+        if entries.is_empty() {
+            return Ok(());
         }
+        self.checkpoint_manager.save_many(&entries).await?;
+        self.checkpoint.lock().await.clear();
         trace!("Dameng alter flush done");
         Ok(())
     }

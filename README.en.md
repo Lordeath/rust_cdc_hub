@@ -139,7 +139,7 @@ The application loads a YAML or JSON configuration file from the `CONFIG_PATH` e
 | `plugins` | No | Plugin configuration list. |
 | `source_batch_size` | No | Source batch size. |
 | `sink_batch_size` | No | Sink batch size. |
-| `checkpoint_file_path` | No | Checkpoint file path. |
+| `checkpoint_file_path` | No | Checkpoint path. Defaults to `/checkpoint/checkpoints.sqlite`; when set to a directory, `checkpoints.sqlite` is created under it; when set to a `.db`/`.sqlite`/`.sqlite3` file, that file is used directly. |
 | `log_level` | No | Log level, for example `debug` or `info`. |
 | `log_file` | No | File logging configuration. Disabled by default; when enabled, console logging is kept and runtime logs rotate by date or size. |
 | `enable_ui` | No | Enable the monitoring UI. Defaults to `true`. |
@@ -239,6 +239,8 @@ ui_port: 8080
 ```
 
 When `log_file.enabled: true`, the application writes to `/app/logs/rust_cdc_hub.log` and rotates daily or when `max_size_mb` is exceeded. Archived logs are compressed as `.gz` by default and are limited by both `retention_days` and `max_backup_files`. Startup fails if the log directory cannot be created or written.
+
+Checkpoints are persisted with SQLite + WAL. On the first SQLite checkpoint startup, legacy `checkpoint_*.json` files in the same directory are imported automatically and kept as rollback backups. Runtime checkpoint writes are batched after successful sink flushes and only changed positions are persisted, so empty flushes do not rewrite every checkpoint. SQLite WAL mode creates `-wal` and `-shm` files next to the checkpoint database.
 
 When `sync_stored_procedure` is enabled, the MySQL/Dameng sinks sync `PROCEDURE` and `FUNCTION` definitions during initialization according to the source-to-target database route. If a target object already exists and `overwrite_stored_procedure: false`, it is skipped; when set to `true`, the MySQL sink runs `DROP PROCEDURE/FUNCTION IF EXISTS` and recreates it, while the Dameng sink uses `CREATE OR REPLACE`. The sink removes `DEFINER=\`user\`@\`host\`` from `SHOW CREATE PROCEDURE/FUNCTION` before creating the target object, so the source database user is not copied to the target. MySQL → Dameng performs a basic DMSQL conversion; complex MySQL-specific routine syntax can fail initialization with the object name and error reason.
 

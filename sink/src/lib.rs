@@ -17,10 +17,10 @@ impl SinkFactory {
     ) -> Arc<Mutex<dyn Sink + Send + Sync>> {
         info!("create sink: {:?}", config.sink_type);
         match config.sink_type {
-            SinkType::Print => Arc::new(Mutex::new(PrintSink::new(config, table_info_list))),
-            SinkType::MeiliSearch => {
-                Arc::new(Mutex::new(MeiliSearchSink::new(config, table_info_list)))
-            }
+            SinkType::Print => Arc::new(Mutex::new(PrintSink::new(config, table_info_list).await)),
+            SinkType::MeiliSearch => Arc::new(Mutex::new(
+                MeiliSearchSink::new(config, table_info_list).await,
+            )),
             SinkType::MySQL => Arc::new(Mutex::new(MySqlSink::new(config, table_info_list).await)),
             SinkType::Starrocks => Arc::new(Mutex::new(
                 StarrocksSink::new(config, table_info_list).await,

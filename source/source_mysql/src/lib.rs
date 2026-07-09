@@ -2,7 +2,7 @@ extern crate core;
 
 use async_trait::async_trait;
 use common::case_insensitive_hash_map::{CaseInsensitiveHashMap, CaseInsensitiveHashMapVecString};
-use common::checkpoint_manager::{CheckpointManager, FileCheckpointManager};
+use common::checkpoint_manager::{CheckpointManager, checkpoint_manager_from_config};
 use common::custom_error::{CustomError, CustomErrorType};
 use common::metrics::{SOURCE_EVENTS_TOTAL, SOURCE_LAG_POSITION};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
@@ -993,6 +993,7 @@ impl MySQLSource {
         let binlog_position_list: Mutex<Vec<Mutex<u32>>> = Mutex::new(Vec::new());
         let mut checkpoint_entities: Vec<Mutex<HashMap<String, MysqlCheckPointDetailEntity>>> =
             vec![];
+        let checkpoint_manager = checkpoint_manager_from_config(config).await;
         for i in 0..size {
             let connection_url = cfg.mysql_source[i].connection_url.clone();
             let tables: Vec<String> = cfg.mysql_source[i]
@@ -1008,13 +1009,14 @@ impl MySQLSource {
                     if config.random_check_data_after_init_enabled() {
                         Self::random_check_checkpoint_entity(table.clone())
                     } else {
-                        MysqlCheckPointDetailEntity::from_config(
+                        MysqlCheckPointDetailEntity::from_config_with_manager(
                             config
                                 .checkpoint_file_path
                                 .clone()
                                 .unwrap_or("/checkpoint".to_string()),
                             &connection_url,
                             table.clone(),
+                            checkpoint_manager.as_ref(),
                         )
                         .await
                     };
@@ -1048,14 +1050,6 @@ impl MySQLSource {
                 .push(Mutex::new("".to_string()));
             binlog_position_list.lock().await.push(Mutex::new(0));
         }
-
-        let checkpoint_manager = Arc::new(FileCheckpointManager::new(
-            config
-                .checkpoint_file_path
-                .clone()
-                .unwrap_or("/checkpoint".to_string()),
-        ));
-
         Self {
             streams,
             stream_groups: cfg.stream_groups,
@@ -1081,15 +1075,24 @@ impl MySQLSource {
         }
     }
 
-    async fn save_checkpoints(&self) {
-        let max = self.pools.len();
-        for i in 0..max {
-            let checkpoints_guard = self.checkpoint_entities.lock().await;
-            let checkpoints = checkpoints_guard[i].lock().await;
-            for (table_name, cp) in checkpoints.iter() {
-                if let Err(e) = self.checkpoint_manager.save(table_name, cp).await {
-                    error!("Failed to save checkpoint for {}: {}", table_name, e);
-                }
+    async fn save_pending_checkpoints(
+        &self,
+        checkpoints: &mut HashMap<String, MysqlCheckPointDetailEntity>,
+    ) {
+        if checkpoints.is_empty() {
+            return;
+        }
+        let entries = checkpoints
+            .iter()
+            .map(|(key, cp)| (key.clone(), cp.clone()))
+            .collect::<Vec<_>>();
+        match self.checkpoint_manager.save_many(&entries).await {
+            Ok(_) => {
+                trace!("saved pending filtered checkpoints: {}", entries.len());
+                checkpoints.clear();
+            }
+            Err(e) => {
+                error!("Failed to save pending filtered checkpoints: {}", e);
             }
         }
     }
@@ -2265,9 +2268,16 @@ impl Source for MySQLSource {
         let mut table_column_info_map: HashMap<(usize, u64), BinlogTableColumnInfo> =
             HashMap::new();
         let mut last_checkpoint_save = Instant::now();
+        let mut pending_filtered_checkpoints: HashMap<String, MysqlCheckPointDetailEntity> =
+            HashMap::new();
         loop {
             if last_checkpoint_save.elapsed().as_secs() >= 5 {
-                self.save_checkpoints().await;
+                sink.lock()
+                    .await
+                    .flush_with_retry(&FlushByOperation::Cdc)
+                    .await;
+                self.save_pending_checkpoints(&mut pending_filtered_checkpoints)
+                    .await;
                 last_checkpoint_save = Instant::now();
             }
             let max = self.streams.len();
@@ -2364,7 +2374,15 @@ impl Source for MySQLSource {
                                         .clone();
                                     let timestamp = header.timestamp;
                                     let next_event_position = header.next_event_position;
+                                    let event_checkpoint_entity = if binlog_filename.is_empty() {
+                                        checkpoint_entity.clone()
+                                    } else {
+                                        checkpoint_entity
+                                            .clone()
+                                            .update(binlog_filename.clone(), next_event_position)
+                                    };
                                     let pk_column = table_pk_column(config, table_name.as_str());
+                                    let mut wrote_any = false;
                                     for row in event.rows {
                                         let before: CaseInsensitiveHashMap =
                                             CaseInsensitiveHashMap::new_with_no_arg();
@@ -2410,9 +2428,10 @@ impl Source for MySQLSource {
                                             Self::write_record_with_retry(
                                                 &mut sink,
                                                 &item,
-                                                Some(checkpoint_entity.clone()),
+                                                Some(event_checkpoint_entity.clone()),
                                             )
                                             .await;
+                                            wrote_any = true;
                                             runtime_progress::record_synced(&progress_label).await;
                                         } else {
                                             runtime_progress::record_filtered(&progress_label)
@@ -2423,12 +2442,17 @@ impl Source for MySQLSource {
                                         SOURCE_LAG_POSITION
                                             .with_label_values(&["mysql", progress_label.as_str()])
                                             .set(next_event_position as i64);
-                                        checkpoint_entity = checkpoint_entity
-                                            .update(binlog_filename, next_event_position);
+                                        checkpoint_entity = event_checkpoint_entity.clone();
                                         to_modify.insert(
                                             checkpoint_entity.table.clone(),
-                                            checkpoint_entity,
+                                            checkpoint_entity.clone(),
                                         );
+                                        if !wrote_any {
+                                            pending_filtered_checkpoints.insert(
+                                                checkpoint_entity.table.clone(),
+                                                checkpoint_entity,
+                                            );
+                                        }
                                     }
                                 }
                                 trace!("Checkpoint: {:?}", to_modify);
@@ -2492,7 +2516,15 @@ impl Source for MySQLSource {
                                         .clone();
                                     let timestamp = header.timestamp;
                                     let next_event_position = header.next_event_position;
+                                    let event_checkpoint_entity = if binlog_filename.is_empty() {
+                                        checkpoint_entity.clone()
+                                    } else {
+                                        checkpoint_entity
+                                            .clone()
+                                            .update(binlog_filename.clone(), next_event_position)
+                                    };
                                     let pk_column = table_pk_column(config, table_name.as_str());
+                                    let mut wrote_any = false;
                                     for row in event.rows {
                                         let before: CaseInsensitiveHashMap = parse_row(
                                             row,
@@ -2538,9 +2570,10 @@ impl Source for MySQLSource {
                                             Self::write_record_with_retry(
                                                 &mut sink,
                                                 &item,
-                                                Some(checkpoint_entity.clone()),
+                                                Some(event_checkpoint_entity.clone()),
                                             )
                                             .await;
+                                            wrote_any = true;
                                             runtime_progress::record_synced(&progress_label).await;
                                         } else {
                                             runtime_progress::record_filtered(&progress_label)
@@ -2551,12 +2584,17 @@ impl Source for MySQLSource {
                                         SOURCE_LAG_POSITION
                                             .with_label_values(&["mysql", progress_label.as_str()])
                                             .set(next_event_position as i64);
-                                        checkpoint_entity = checkpoint_entity
-                                            .update(binlog_filename, next_event_position);
+                                        checkpoint_entity = event_checkpoint_entity.clone();
                                         to_modify.insert(
                                             checkpoint_entity.table.clone(),
-                                            checkpoint_entity,
+                                            checkpoint_entity.clone(),
                                         );
+                                        if !wrote_any {
+                                            pending_filtered_checkpoints.insert(
+                                                checkpoint_entity.table.clone(),
+                                                checkpoint_entity,
+                                            );
+                                        }
                                     }
                                 }
                                 trace!("Checkpoint: {:?}", to_modify);
@@ -2620,7 +2658,15 @@ impl Source for MySQLSource {
                                         .clone();
                                     let timestamp = header.timestamp;
                                     let next_event_position = header.next_event_position;
+                                    let event_checkpoint_entity = if binlog_filename.is_empty() {
+                                        checkpoint_entity.clone()
+                                    } else {
+                                        checkpoint_entity
+                                            .clone()
+                                            .update(binlog_filename.clone(), next_event_position)
+                                    };
                                     let pk_column = table_pk_column(config, table_name.as_str());
+                                    let mut wrote_any = false;
                                     for (b, a) in event.rows {
                                         let before: CaseInsensitiveHashMap = parse_row(
                                             b,
@@ -2673,9 +2719,10 @@ impl Source for MySQLSource {
                                             Self::write_record_with_retry(
                                                 &mut sink,
                                                 &item,
-                                                Some(checkpoint_entity.clone()),
+                                                Some(event_checkpoint_entity.clone()),
                                             )
                                             .await;
+                                            wrote_any = true;
                                             runtime_progress::record_synced(&progress_label).await;
                                         } else {
                                             runtime_progress::record_filtered(&progress_label)
@@ -2687,12 +2734,17 @@ impl Source for MySQLSource {
                                         SOURCE_LAG_POSITION
                                             .with_label_values(&["mysql", progress_label.as_str()])
                                             .set(next_event_position as i64);
-                                        checkpoint_entity = checkpoint_entity
-                                            .update(binlog_filename, next_event_position);
+                                        checkpoint_entity = event_checkpoint_entity.clone();
                                         to_modify.insert(
                                             checkpoint_entity.table.clone(),
-                                            checkpoint_entity,
+                                            checkpoint_entity.clone(),
                                         );
+                                        if !wrote_any {
+                                            pending_filtered_checkpoints.insert(
+                                                checkpoint_entity.table.clone(),
+                                                checkpoint_entity,
+                                            );
+                                        }
                                     }
                                 }
                                 trace!("Checkpoint: {:?}", to_modify);
