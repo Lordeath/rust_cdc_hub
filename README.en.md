@@ -489,6 +489,7 @@ To add a new Source or Sink:
 - [x] plugin system
 - [x] built-in UI and Prometheus metrics
 - [x] table/database include and exclude support
+- [ ] MySQL string-primary-key and no-primary-key table data sync: support string primary keys and evaluate no-primary-key initialization and incremental apply based on `binlog_row_image=FULL`
 - [x] Database split plugin: enable split mode through a plugin and provide split-task management pages in Actix Web (V1)
 - [x] Cleanup dry-run and reviewable SQL generation: count by default, generate reviewable SQL by download, do not delete by default
 - [ ] Split task operation records: persist sync checks, dry-runs, SQL generation events, confirmations, and operator notes

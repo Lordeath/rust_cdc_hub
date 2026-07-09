@@ -528,6 +528,7 @@ cargo test -p common --verbose
 - [x] 插件系统
 - [x] 内置 UI 与 Prometheus metrics
 - [x] 表/库 include/exclude 能力
+- [ ] MySQL 字符串主键与无主键表数据同步：支持字符串主键，并评估基于 `binlog_row_image=FULL` 的无主键表初始化和增量应用策略
 - [x] 数据库拆分插件：通过插件进入拆分模式，并在 Actix Web 中加载拆分任务管理页面（V1）
 - [x] 清理 dry-run 与删除 SQL 生成：默认只统计数量，生成可审查 SQL，不默认执行删除
 - [ ] 拆分任务状态与操作记录：记录同步检查、dry-run、SQL 生成、确认信息和人工备注（未持久化）
