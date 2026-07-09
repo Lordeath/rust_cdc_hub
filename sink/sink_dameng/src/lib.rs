@@ -5,6 +5,7 @@ use common::case_insensitive_hash_map::{
 use common::checkpoint_manager::CheckpointServiceHandle;
 use common::metrics::{SINK_EVENTS_TOTAL, SINK_FLUSH_DURATION_SECONDS, SINK_FLUSH_ERRORS_TOTAL};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
+use common::runtime_progress;
 use common::schema::{
     extract_mysql_create_table_column_definitions, extract_mysql_generated_column_names,
     mysql_column_allows_null_from_definition, mysql_column_is_auto_increment_from_definition,
@@ -237,8 +238,25 @@ impl DamengSink {
             panic!("{}", e);
         }
 
-        let client = Self::connect_client(&host, port, &username, &password)
-            .unwrap_or_else(|e| panic!("Failed to connect to Dameng: {}", e));
+        let connect_stage = "sink.dameng.connect";
+        runtime_progress::begin_schema_stage(connect_stage, "Dameng sink 连接", 1).await;
+        let client = match Self::connect_client(&host, port, &username, &password) {
+            Ok(client) => {
+                runtime_progress::record_schema_stage_item(connect_stage, "dameng").await;
+                runtime_progress::finish_schema_stage(connect_stage).await;
+                client
+            }
+            Err(e) => {
+                runtime_progress::record_schema_stage_error(
+                    connect_stage,
+                    "dameng",
+                    e.to_string().as_str(),
+                )
+                .await;
+                runtime_progress::finish_schema_stage(connect_stage).await;
+                panic!("Failed to connect to Dameng: {}", e);
+            }
+        };
 
         let sink_batch_size = config.sink_batch_size.unwrap_or(256);
         let init_insert_batch_rows = config
@@ -293,25 +311,64 @@ impl DamengSink {
         sink.ensure_schema()
             .await
             .unwrap_or_else(|e| panic!("Dameng ensure schema failed: {}", e));
-        sink.disable_foreign_key_constraints_for_init()
-            .await
-            .unwrap_or_else(|e| {
+        let stage = "sink.dameng.disable_foreign_keys";
+        runtime_progress::begin_schema_stage(stage, "Dameng sink 初始化前禁用外键", 1).await;
+        match sink.disable_foreign_key_constraints_for_init().await {
+            Ok(_) => {
+                runtime_progress::record_schema_stage_item(stage, "disable_foreign_keys").await;
+                runtime_progress::finish_schema_stage(stage).await;
+            }
+            Err(e) => {
+                runtime_progress::record_schema_stage_error(
+                    stage,
+                    "disable_foreign_keys",
+                    e.as_str(),
+                )
+                .await;
+                runtime_progress::finish_schema_stage(stage).await;
                 panic!(
                     "Dameng disable foreign key constraints before init failed: {}",
                     e
-                )
-            });
+                );
+            }
+        }
         if config.sync_stored_procedure_enabled() && !sink.random_check_data_after_init {
-            sink.sync_stored_routines(config)
-                .await
-                .unwrap_or_else(|e| panic!("Dameng sync stored routines failed: {}", e));
+            let stage = "sink.dameng.stored_routines";
+            runtime_progress::begin_schema_stage(stage, "Dameng sink 同步存储过程/函数", 1).await;
+            match sink.sync_stored_routines(config).await {
+                Ok(_) => {
+                    runtime_progress::record_schema_stage_item(stage, "stored_routines").await;
+                    runtime_progress::finish_schema_stage(stage).await;
+                }
+                Err(e) => {
+                    runtime_progress::record_schema_stage_error(
+                        stage,
+                        "stored_routines",
+                        e.as_str(),
+                    )
+                    .await;
+                    runtime_progress::finish_schema_stage(stage).await;
+                    panic!("Dameng sync stored routines failed: {}", e);
+                }
+            }
         } else if config.sync_stored_procedure_enabled() {
             info!("Dameng random data check init mode skips stored routine synchronization");
         }
         if config.sync_stored_view_enabled() && !sink.random_check_data_after_init {
-            sink.sync_stored_views(config)
-                .await
-                .unwrap_or_else(|e| panic!("Dameng sync stored views failed: {}", e));
+            let stage = "sink.dameng.stored_views";
+            runtime_progress::begin_schema_stage(stage, "Dameng sink 同步视图", 1).await;
+            match sink.sync_stored_views(config).await {
+                Ok(_) => {
+                    runtime_progress::record_schema_stage_item(stage, "stored_views").await;
+                    runtime_progress::finish_schema_stage(stage).await;
+                }
+                Err(e) => {
+                    runtime_progress::record_schema_stage_error(stage, "stored_views", e.as_str())
+                        .await;
+                    runtime_progress::finish_schema_stage(stage).await;
+                    panic!("Dameng sync stored views failed: {}", e);
+                }
+            }
         } else if config.sync_stored_view_enabled() {
             info!("Dameng random data check init mode skips view synchronization");
         }
@@ -2970,55 +3027,98 @@ impl DamengSink {
             );
             return Ok(());
         }
+        let stage = "sink.dameng.ensure_schema";
+        runtime_progress::begin_schema_stage(
+            stage,
+            "Dameng sink 表/字段/注释检查",
+            self.table_info_list.len() as u64,
+        )
+        .await;
         for table_info in &self.table_info_list {
             let schema = Self::table_info_target_schema(table_info, self.schema.as_str());
-            let table_created = self
-                .ensure_table(schema.as_str(), table_info)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "Dameng ensure table failed: {} {}",
-                        Self::target_table_key(schema.as_str(), table_info.table_name.as_str()),
-                        e
+            let table_label =
+                Self::target_table_key(schema.as_str(), table_info.table_name.as_str());
+            let table_created = match self.ensure_table(schema.as_str(), table_info).await {
+                Ok(created) => created,
+                Err(e) => {
+                    let error = format!("Dameng ensure table failed: {} {}", table_label, e);
+                    runtime_progress::record_schema_stage_error(
+                        stage,
+                        table_label.as_str(),
+                        error.as_str(),
                     )
-                })?;
-            self.ensure_columns(schema.as_str(), table_info)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "Dameng ensure columns failed: {} {}",
-                        Self::target_table_key(schema.as_str(), table_info.table_name.as_str()),
-                        e
-                    )
-                })?;
-            if table_created {
-                self.ensure_table_comment(schema.as_str(), table_info)
-                    .await
-                    .map_err(|e| {
-                        format!(
-                            "Dameng ensure table comment failed: {} {}",
-                            Self::target_table_key(schema.as_str(), table_info.table_name.as_str()),
-                            e
-                        )
-                    })?;
+                    .await;
+                    runtime_progress::finish_schema_stage(stage).await;
+                    return Err(error);
+                }
+            };
+            if let Err(e) = self.ensure_columns(schema.as_str(), table_info).await {
+                let error = format!("Dameng ensure columns failed: {} {}", table_label, e);
+                runtime_progress::record_schema_stage_error(
+                    stage,
+                    table_label.as_str(),
+                    error.as_str(),
+                )
+                .await;
+                runtime_progress::finish_schema_stage(stage).await;
+                return Err(error);
             }
-            self.ensure_column_comments(schema.as_str(), table_info)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "Dameng ensure column comments failed: {} {}",
-                        Self::target_table_key(schema.as_str(), table_info.table_name.as_str()),
-                        e
+            if table_created {
+                if let Err(e) = self.ensure_table_comment(schema.as_str(), table_info).await {
+                    let error =
+                        format!("Dameng ensure table comment failed: {} {}", table_label, e);
+                    runtime_progress::record_schema_stage_error(
+                        stage,
+                        table_label.as_str(),
+                        error.as_str(),
                     )
-                })?;
+                    .await;
+                    runtime_progress::finish_schema_stage(stage).await;
+                    return Err(error);
+                }
+            }
+            if let Err(e) = self
+                .ensure_column_comments(schema.as_str(), table_info)
+                .await
+            {
+                let error = format!(
+                    "Dameng ensure column comments failed: {} {}",
+                    table_label, e
+                );
+                runtime_progress::record_schema_stage_error(
+                    stage,
+                    table_label.as_str(),
+                    error.as_str(),
+                )
+                .await;
+                runtime_progress::finish_schema_stage(stage).await;
+                return Err(error);
+            }
+            runtime_progress::record_schema_stage_item(stage, table_label.as_str()).await;
         }
+        runtime_progress::finish_schema_stage(stage).await;
         Ok(())
     }
 
     async fn ensure_database(&self) -> Result<(), String> {
-        for schema in self.target_schemas() {
-            self.ensure_database_schema(schema.as_str()).await?;
+        let schemas = self.target_schemas();
+        let stage = "sink.dameng.ensure_database";
+        runtime_progress::begin_schema_stage(
+            stage,
+            "Dameng sink schema 准备",
+            schemas.len() as u64,
+        )
+        .await;
+        for schema in schemas {
+            if let Err(e) = self.ensure_database_schema(schema.as_str()).await {
+                runtime_progress::record_schema_stage_error(stage, schema.as_str(), e.as_str())
+                    .await;
+                runtime_progress::finish_schema_stage(stage).await;
+                return Err(e);
+            }
+            runtime_progress::record_schema_stage_item(stage, schema.as_str()).await;
         }
+        runtime_progress::finish_schema_stage(stage).await;
         Ok(())
     }
 
@@ -7013,6 +7113,19 @@ impl Sink for DamengSink {
             .start_timer();
 
         if !*self.initialized.read().await {
+            let stage = "sink.dameng.column_cache";
+            let table_total = self
+                .table_info_list
+                .iter()
+                .map(|table_info| {
+                    let schema = Self::table_info_target_schema(table_info, self.schema.as_str());
+                    Self::target_table_key(schema.as_str(), table_info.table_name.as_str())
+                        .to_ascii_lowercase()
+                })
+                .collect::<HashSet<_>>()
+                .len() as u64;
+            runtime_progress::begin_schema_stage(stage, "Dameng sink 首次字段缓存", table_total)
+                .await;
             let mut inserted_tables = HashSet::new();
             for table_info in &self.table_info_list {
                 let schema = Self::table_info_target_schema(table_info, self.schema.as_str());
@@ -7042,9 +7155,11 @@ impl Sink for DamengSink {
                     }
                     col_info.entry_insert(table_key.as_str(), col.clone());
                 }
+                runtime_progress::record_schema_stage_item(stage, table_key.as_str()).await;
             }
             *self.columns_cache.lock().await = col_info;
             *self.initialized.write().await = true;
+            runtime_progress::finish_schema_stage(stage).await;
         }
 
         let mut buf = self.buffer.lock().await;
@@ -7369,11 +7484,57 @@ impl Sink for DamengSink {
             );
             self.run_random_check_after_init_now().await;
         } else {
-            self.ensure_secondary_indexes().await?;
-            self.ensure_foreign_keys().await?;
+            let indexes_stage = "sink.dameng.secondary_indexes";
+            runtime_progress::begin_schema_stage(indexes_stage, "Dameng sink 初始化后二级索引", 1)
+                .await;
+            match self.ensure_secondary_indexes().await {
+                Ok(_) => {
+                    runtime_progress::record_schema_stage_item(indexes_stage, "secondary_indexes")
+                        .await;
+                    runtime_progress::finish_schema_stage(indexes_stage).await;
+                }
+                Err(e) => {
+                    runtime_progress::record_schema_stage_error(
+                        indexes_stage,
+                        "secondary_indexes",
+                        e.as_str(),
+                    )
+                    .await;
+                    runtime_progress::finish_schema_stage(indexes_stage).await;
+                    return Err(e);
+                }
+            }
+
+            let foreign_keys_stage = "sink.dameng.foreign_keys";
+            runtime_progress::begin_schema_stage(foreign_keys_stage, "Dameng sink 初始化后外键", 1)
+                .await;
+            match self.ensure_foreign_keys().await {
+                Ok(_) => {
+                    runtime_progress::record_schema_stage_item(foreign_keys_stage, "foreign_keys")
+                        .await;
+                    runtime_progress::finish_schema_stage(foreign_keys_stage).await;
+                }
+                Err(e) => {
+                    runtime_progress::record_schema_stage_error(
+                        foreign_keys_stage,
+                        "foreign_keys",
+                        e.as_str(),
+                    )
+                    .await;
+                    runtime_progress::finish_schema_stage(foreign_keys_stage).await;
+                    return Err(e);
+                }
+            }
+
+            let enable_stage = "sink.dameng.enable_foreign_keys";
+            runtime_progress::begin_schema_stage(enable_stage, "Dameng sink 初始化后恢复外键", 1)
+                .await;
             self.enable_foreign_key_constraints_after_init().await;
+            runtime_progress::record_schema_stage_item(enable_stage, "enable_foreign_keys").await;
+            runtime_progress::finish_schema_stage(enable_stage).await;
             self.spawn_random_check_after_init().await;
         }
+        runtime_progress::finish_schema_initialization().await;
         Ok(())
     }
 }

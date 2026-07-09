@@ -5,6 +5,7 @@ use common::case_insensitive_hash_map::{
 use common::checkpoint_manager::CheckpointServiceHandle;
 use common::metrics::{SINK_EVENTS_TOTAL, SINK_FLUSH_DURATION_SECONDS, SINK_FLUSH_ERRORS_TOTAL};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
+use common::runtime_progress;
 use common::schema::{
     extract_mysql_create_table_column_definitions, mysql_column_allows_null_from_definition,
     mysql_type_token_from_column_definition, normalize_mysql_column_type_token,
@@ -62,6 +63,13 @@ impl MySqlSink {
         let primary_database = target_databases.first().cloned().unwrap_or_default();
         let mut target_pools = HashMap::new();
         let mut connection_urls = HashMap::new();
+        let target_database_stage = "sink.mysql.target_databases";
+        runtime_progress::begin_schema_stage(
+            target_database_stage,
+            "MySQL sink 目标库准备",
+            target_databases.len() as u64,
+        )
+        .await;
         for database in &target_databases {
             let connection_url =
                 mysql_connection_url_from_config(&config.sink_config[0], Some(database));
@@ -73,16 +81,44 @@ impl MySqlSink {
             .await
             {
                 Ok(value) => value,
-                Err(value) => return value,
+                Err(value) => {
+                    runtime_progress::record_schema_stage_error(
+                        target_database_stage,
+                        database.as_str(),
+                        "target database pool initialization returned early",
+                    )
+                    .await;
+                    runtime_progress::finish_schema_stage(target_database_stage).await;
+                    return value;
+                }
             };
+            runtime_progress::record_schema_stage_item(target_database_stage, database.as_str())
+                .await;
             target_pools.insert(database.to_ascii_lowercase(), pool);
             connection_urls.insert(database.to_ascii_lowercase(), connection_url);
         }
+        runtime_progress::finish_schema_stage(target_database_stage).await;
 
         if config.sync_stored_procedure_enabled() {
-            Self::sync_stored_routines(config, &target_pools, primary_database.as_str())
-                .await
-                .unwrap_or_else(|e| panic!("MySQL sync stored routines failed: {}", e));
+            let stage = "sink.mysql.stored_routines";
+            runtime_progress::begin_schema_stage(stage, "MySQL sink 同步存储过程/函数", 1).await;
+            match Self::sync_stored_routines(config, &target_pools, primary_database.as_str()).await
+            {
+                Ok(_) => {
+                    runtime_progress::record_schema_stage_item(stage, "stored_routines").await;
+                    runtime_progress::finish_schema_stage(stage).await;
+                }
+                Err(e) => {
+                    runtime_progress::record_schema_stage_error(
+                        stage,
+                        "stored_routines",
+                        e.as_str(),
+                    )
+                    .await;
+                    runtime_progress::finish_schema_stage(stage).await;
+                    panic!("MySQL sync stored routines failed: {}", e);
+                }
+            }
         }
 
         let mut target_tables: HashMap<String, TableInfoVo> = HashMap::new();
@@ -97,6 +133,13 @@ impl MySqlSink {
         }
 
         if config.auto_create_table.unwrap_or(true) {
+            let stage = "sink.mysql.create_table";
+            runtime_progress::begin_schema_stage(
+                stage,
+                "MySQL sink 自动建表",
+                target_tables.len() as u64,
+            )
+            .await;
             let sql = "select * from information_schema.`COLUMNS` where TABLE_SCHEMA = ? AND TABLE_NAME = ?";
             for table_info in target_tables.values() {
                 let database =
@@ -105,14 +148,26 @@ impl MySqlSink {
                     .get(database.to_ascii_lowercase().as_str())
                     .unwrap_or_else(|| panic!("target database pool not found: {}", database));
                 let table_name = table_info.table_name.clone();
-                let is_empty = sqlx::query(sql)
+                let table_label = database_table_key(database.as_str(), table_name.as_str());
+                let is_empty = match sqlx::query(sql)
                     .persistent(false)
                     .bind(&database)
                     .bind(&table_name)
                     .fetch_all(pool)
                     .await
-                    .unwrap()
-                    .is_empty();
+                {
+                    Ok(rows) => rows.is_empty(),
+                    Err(e) => {
+                        runtime_progress::record_schema_stage_error(
+                            stage,
+                            table_label.as_str(),
+                            e.to_string().as_str(),
+                        )
+                        .await;
+                        runtime_progress::finish_schema_stage(stage).await;
+                        panic!("query failed: {}", e);
+                    }
+                };
                 if is_empty {
                     let create_table_sql = if config.sync_foreign_key_tables_enabled() {
                         Self::create_table_sql_without_foreign_keys(
@@ -121,13 +176,29 @@ impl MySqlSink {
                     } else {
                         table_info.create_table_sql.clone()
                     };
-                    pool.execute(create_table_sql.as_str())
-                        .await
-                        .expect("Failed to create table");
+                    if let Err(e) = pool.execute(create_table_sql.as_str()).await {
+                        runtime_progress::record_schema_stage_error(
+                            stage,
+                            table_label.as_str(),
+                            e.to_string().as_str(),
+                        )
+                        .await;
+                        runtime_progress::finish_schema_stage(stage).await;
+                        panic!("Failed to create table: {}", e);
+                    }
                 }
+                runtime_progress::record_schema_stage_item(stage, table_label.as_str()).await;
             }
+            runtime_progress::finish_schema_stage(stage).await;
         }
         if config.auto_add_column.unwrap_or(true) {
+            let stage = "sink.mysql.add_column";
+            runtime_progress::begin_schema_stage(
+                stage,
+                "MySQL sink 自动加字段",
+                target_tables.len() as u64,
+            )
+            .await;
             for table_info in target_tables.values() {
                 let database =
                     Self::table_info_target_database(table_info, primary_database.as_str());
@@ -135,6 +206,7 @@ impl MySqlSink {
                     .get(database.to_ascii_lowercase().as_str())
                     .unwrap_or_else(|| panic!("target database pool not found: {}", database));
                 let table_name = table_info.table_name.clone();
+                let table_label = database_table_key(database.as_str(), table_name.as_str());
                 let rows = sqlx::query(
                     "select COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE from information_schema.`COLUMNS` where TABLE_SCHEMA = ? AND TABLE_NAME = ?",
                 )
@@ -172,13 +244,28 @@ impl MySqlSink {
                             error!(
                                 "auto add column failed: {}.{} {} {}",
                                 database, table_name, src_col, e
+                            );
+                            runtime_progress::record_schema_stage_error(
+                                stage,
+                                format!("{}.{}", table_label, src_col).as_str(),
+                                e.to_string().as_str(),
                             )
+                            .await;
                         }
                     }
                 }
+                runtime_progress::record_schema_stage_item(stage, table_label.as_str()).await;
             }
+            runtime_progress::finish_schema_stage(stage).await;
         }
         if config.auto_modify_column.unwrap_or(true) {
+            let stage = "sink.mysql.modify_column";
+            runtime_progress::begin_schema_stage(
+                stage,
+                "MySQL sink 自动改字段",
+                target_tables.len() as u64,
+            )
+            .await;
             for table_info in target_tables.values() {
                 let database =
                     Self::table_info_target_database(table_info, primary_database.as_str());
@@ -186,6 +273,7 @@ impl MySqlSink {
                     .get(database.to_ascii_lowercase().as_str())
                     .unwrap_or_else(|| panic!("target database pool not found: {}", database));
                 let table_name = table_info.table_name.clone();
+                let table_label = database_table_key(database.as_str(), table_name.as_str());
                 let defs = extract_mysql_create_table_column_definitions(
                     table_info.create_table_sql.as_str(),
                 );
@@ -255,18 +343,39 @@ impl MySqlSink {
                             "auto modify column success: {}.{} {} reason: {}",
                             database, table_name, src_col, reason
                         ),
-                        Err(e) => error!(
-                            "auto modify column failed: {}.{} {} {}",
-                            database, table_name, src_col, e
-                        ),
+                        Err(e) => {
+                            runtime_progress::record_schema_stage_error(
+                                stage,
+                                format!("{}.{}", table_label, src_col).as_str(),
+                                e.to_string().as_str(),
+                            )
+                            .await;
+                            error!(
+                                "auto modify column failed: {}.{} {} {}",
+                                database, table_name, src_col, e
+                            );
+                        }
                     }
                 }
+                runtime_progress::record_schema_stage_item(stage, table_label.as_str()).await;
             }
+            runtime_progress::finish_schema_stage(stage).await;
         }
         if config.sync_stored_view_enabled() {
-            Self::sync_stored_views(config, &target_pools, primary_database.as_str())
-                .await
-                .unwrap_or_else(|e| panic!("MySQL sync stored views failed: {}", e));
+            let stage = "sink.mysql.stored_views";
+            runtime_progress::begin_schema_stage(stage, "MySQL sink 同步视图", 1).await;
+            match Self::sync_stored_views(config, &target_pools, primary_database.as_str()).await {
+                Ok(_) => {
+                    runtime_progress::record_schema_stage_item(stage, "stored_views").await;
+                    runtime_progress::finish_schema_stage(stage).await;
+                }
+                Err(e) => {
+                    runtime_progress::record_schema_stage_error(stage, "stored_views", e.as_str())
+                        .await;
+                    runtime_progress::finish_schema_stage(stage).await;
+                    panic!("MySQL sync stored views failed: {}", e);
+                }
+            }
         }
         let sink_batch_size = config.sink_batch_size.unwrap_or(256);
         MySqlSink {
@@ -475,45 +584,105 @@ impl MySqlSink {
         if !self.sync_foreign_key_tables {
             return Ok(());
         }
+        let total = self
+            .table_info_list
+            .iter()
+            .map(|table_info| table_info.foreign_keys.len() as u64)
+            .sum();
+        let stage = "sink.mysql.foreign_keys";
+        runtime_progress::begin_schema_stage(stage, "MySQL sink 初始化后外键", total).await;
         for table_info in &self.table_info_list {
             if table_info.foreign_keys.is_empty() {
                 continue;
             }
             let database =
                 Self::table_info_target_database(table_info, self.primary_database.as_str());
-            let pool = self
+            let pool = match self
                 .target_pools
                 .get(database.to_ascii_lowercase().as_str())
-                .ok_or_else(|| format!("target database pool not found: {}", database))?;
+            {
+                Some(pool) => pool,
+                None => {
+                    let error = format!("target database pool not found: {}", database);
+                    runtime_progress::record_schema_stage_error(
+                        stage,
+                        database.as_str(),
+                        error.as_str(),
+                    )
+                    .await;
+                    runtime_progress::finish_schema_stage(stage).await;
+                    return Err(error);
+                }
+            };
             for foreign_key in &table_info.foreign_keys {
-                if Self::foreign_key_exists(
+                let exists = match Self::foreign_key_exists(
                     pool,
                     database.as_str(),
                     table_info.table_name.as_str(),
                     foreign_key.constraint_name.as_str(),
                 )
-                .await?
+                .await
                 {
+                    Ok(exists) => exists,
+                    Err(e) => {
+                        runtime_progress::record_schema_stage_error(
+                            stage,
+                            format!("{}.{}", database, foreign_key.constraint_name).as_str(),
+                            e.as_str(),
+                        )
+                        .await;
+                        runtime_progress::finish_schema_stage(stage).await;
+                        return Err(e);
+                    }
+                };
+                if exists {
+                    runtime_progress::record_schema_stage_item(
+                        stage,
+                        format!("{}.{}", database, foreign_key.constraint_name).as_str(),
+                    )
+                    .await;
                     continue;
                 }
                 let Some(sql) = Self::foreign_key_sql(database.as_str(), foreign_key) else {
-                    return Err(format!(
+                    let error = format!(
                         "invalid foreign key metadata: {}.{}",
                         table_info.table_name, foreign_key.constraint_name
-                    ));
+                    );
+                    runtime_progress::record_schema_stage_error(
+                        stage,
+                        format!("{}.{}", database, foreign_key.constraint_name).as_str(),
+                        error.as_str(),
+                    )
+                    .await;
+                    runtime_progress::finish_schema_stage(stage).await;
+                    return Err(error);
                 };
-                pool.execute(sql.as_str()).await.map_err(|e| {
-                    format!(
+                if let Err(e) = pool.execute(sql.as_str()).await {
+                    let error = format!(
                         "MySQL auto add foreign key failed: {}.{} {}",
                         database, foreign_key.constraint_name, e
+                    );
+                    runtime_progress::record_schema_stage_error(
+                        stage,
+                        format!("{}.{}", database, foreign_key.constraint_name).as_str(),
+                        error.as_str(),
                     )
-                })?;
+                    .await;
+                    runtime_progress::finish_schema_stage(stage).await;
+                    return Err(error);
+                }
                 info!(
                     "MySQL auto add foreign key success: {}.{}",
                     database, foreign_key.constraint_name
                 );
+                runtime_progress::record_schema_stage_item(
+                    stage,
+                    format!("{}.{}", database, foreign_key.constraint_name).as_str(),
+                )
+                .await;
             }
         }
+        runtime_progress::finish_schema_stage(stage).await;
         Ok(())
     }
 
@@ -1659,6 +1828,22 @@ impl Sink for MySqlSink {
             .start_timer();
 
         if !*self.initialized.read().await {
+            let stage = "sink.mysql.column_cache";
+            let table_total = self
+                .table_info_list
+                .iter()
+                .map(|table_info| {
+                    let database = Self::table_info_target_database(
+                        table_info,
+                        self.primary_database.as_str(),
+                    );
+                    Self::target_table_key(database.as_str(), table_info.table_name.as_str())
+                        .to_ascii_lowercase()
+                })
+                .collect::<HashSet<_>>()
+                .len() as u64;
+            runtime_progress::begin_schema_stage(stage, "MySQL sink 首次字段缓存", table_total)
+                .await;
             let mut inserted_tables = HashSet::new();
             for table_info in &self.table_info_list {
                 let database =
@@ -1698,11 +1883,13 @@ impl Sink for MySqlSink {
                 for c in cols {
                     col_info.entry_insert(table_key.as_str(), c.clone());
                 }
+                runtime_progress::record_schema_stage_item(stage, table_key.as_str()).await;
             }
             let mut cols = self.columns_cache.lock().await;
 
             *cols = col_info;
             *self.initialized.write().await = true;
+            runtime_progress::finish_schema_stage(stage).await;
         }
 
         let mut buf = self.buffer.lock().await;
@@ -1881,7 +2068,9 @@ impl Sink for MySqlSink {
     async fn after_initialization(&mut self) -> Result<(), String> {
         self.flush_with_retry(&FlushByOperation::Init).await;
         *self.source_initializing.write().await = false;
-        self.ensure_foreign_keys().await
+        self.ensure_foreign_keys().await?;
+        runtime_progress::finish_schema_initialization().await;
+        Ok(())
     }
 }
 

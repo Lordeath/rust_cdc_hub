@@ -368,7 +368,7 @@ impl UiState {
         };
         let health_status = if last_source_error.is_some() {
             "degraded"
-        } else if runtime_progress.initializing {
+        } else if runtime_progress.schema_running || runtime_progress.initializing {
             "initializing"
         } else {
             "running"
@@ -1497,6 +1497,22 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     </section>
 
     <section class="card section" style="margin-top:16px">
+      <h2 data-i18n="schema_progress">表结构初始化</h2>
+      <div class="progress-grid">
+        <div class="progress-box"><div class="label" data-i18n="current_status">当前状态</div><div class="value" id="schemaState">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="schema_current_stage">当前阶段</div><div class="value compact" id="schemaCurrentStage">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="schema_duration">阶段总耗时</div><div class="value" id="schemaDuration">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="schema_errors">错误数</div><div class="value" id="schemaErrors">-</div></div>
+      </div>
+      <div id="schemaTimingGrid" class="progress-grid progress-timing-grid" hidden>
+        <div class="progress-box"><div class="label" data-i18n="schema_started_at">表结构开始时间</div><div class="value compact" id="schemaStartedAt">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="schema_finished_at">表结构结束时间</div><div class="value compact" id="schemaFinishedAt">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="schema_items">处理对象</div><div class="value compact" id="schemaItems">-</div></div>
+      </div>
+      <div id="schemaProgressTable" class="table-wrap"></div>
+    </section>
+
+    <section class="card section" style="margin-top:16px">
       <h2 data-i18n="sync_progress">数据同步进度</h2>
       <div class="progress-grid">
         <div class="progress-box"><div class="label" data-i18n="current_status">当前状态</div><div class="value" id="progressState">-</div></div>
@@ -1559,6 +1575,19 @@ const translations = {
     dirty_items: '待持久化',
     last_position: '最后持久化位点',
     no_checkpoint_error: '暂无 checkpoint 错误',
+    schema_progress: '表结构初始化',
+    schema_current_stage: '当前阶段',
+    schema_duration: '阶段总耗时',
+    schema_errors: '错误数',
+    schema_started_at: '表结构开始时间',
+    schema_finished_at: '表结构结束时间',
+    schema_items: '处理对象',
+    no_schema_progress: '暂无表结构初始化记录',
+    stage_name: '阶段',
+    duration: '耗时',
+    progress: '进度',
+    errors: '错误',
+    last_item: '最近对象',
     sync_progress: '数据同步进度',
     current_status: '当前状态',
     current_table: '当前表',
@@ -1651,6 +1680,19 @@ const translations = {
     dirty_items: 'Dirty Items',
     last_position: 'Last Persisted Position',
     no_checkpoint_error: 'No checkpoint errors',
+    schema_progress: 'Schema Initialization',
+    schema_current_stage: 'Current Stage',
+    schema_duration: 'Stage Duration',
+    schema_errors: 'Errors',
+    schema_started_at: 'Schema Started',
+    schema_finished_at: 'Schema Finished',
+    schema_items: 'Items',
+    no_schema_progress: 'No schema initialization records',
+    stage_name: 'Stage',
+    duration: 'Duration',
+    progress: 'Progress',
+    errors: 'Errors',
+    last_item: 'Last Item',
     sync_progress: 'Data Sync Progress',
     current_status: 'Current Status',
     current_table: 'Current Table',
@@ -1711,6 +1753,7 @@ let currentLang = localStorage.getItem('rustCdcHubLang') || 'zh';
 let latestStatus = null;
 const tableSortState = {
   pluginFilters: { key: 'last_event_at', dir: 'desc' },
+  schemaProgress: { key: 'running_sort', dir: 'desc' },
   syncProgress: { key: 'last_event_at', dir: 'desc' },
 };
 function t(key) {
@@ -1849,6 +1892,17 @@ function tableInitializationDurationSeconds(table, now) {
   const effectiveEnd = finishedAt > 0 ? finishedAt : Number(now || 0);
   return Math.max(0, effectiveEnd - startedAt);
 }
+function schemaStageDurationSeconds(stage, now) {
+  const recorded = Number(stage.duration_seconds || 0);
+  const startedAt = Number(stage.started_at || 0);
+  if (stage.running && startedAt > 0) {
+    return recorded + Math.max(0, Number(now || 0) - startedAt);
+  }
+  if (recorded > 0) return recorded;
+  const finishedAt = Number(stage.finished_at || 0);
+  if (startedAt > 0 && finishedAt > 0) return Math.max(0, finishedAt - startedAt);
+  return 0;
+}
 function renderColumnInFilters(cfg, progress) {
   const section = el('pluginFilterSection');
   if (!section) return;
@@ -1925,6 +1979,58 @@ function renderInitializationTiming(progress, now) {
   setText('initializationStartedAt', fmtTs(startedAt));
   setText('initializationFinishedAt', finishedAt > 0 ? fmtTs(finishedAt) : t('initializing_running'));
   setText('initializationDuration', fmtDuration(duration));
+}
+function renderSchemaProgress(progress, now) {
+  const stages = Object.values(progress.schema_stages || {});
+  const currentStageKey = progress.schema_current_stage || '';
+  const currentStage = stages.find((stage) => stage.stage === currentStageKey);
+  const totalDuration = stages.reduce((sum, stage) => sum + schemaStageDurationSeconds(stage, now), 0);
+  const totalDone = stages.reduce((sum, stage) => sum + Number(stage.item_done || 0), 0);
+  const totalItems = stages.reduce((sum, stage) => sum + Number(stage.item_total || 0), 0);
+  const totalErrors = stages.reduce((sum, stage) => sum + Number(stage.error_total || 0), 0);
+  const startedAt = Number(progress.schema_started_at || 0);
+  const finishedAt = progress.schema_running ? 0 : Number(progress.schema_finished_at || 0);
+  setText('schemaState', stages.length ? displayPhase(progress.schema_running ? 'initializing' : 'done') : '-');
+  setText('schemaCurrentStage', currentStage?.label || currentStageKey || '-');
+  setText('schemaDuration', stages.length ? fmtDuration(totalDuration) : '-');
+  setText('schemaErrors', totalErrors);
+  const timingGrid = el('schemaTimingGrid');
+  if (timingGrid) timingGrid.hidden = startedAt <= 0;
+  setText('schemaStartedAt', fmtTs(startedAt));
+  setText('schemaFinishedAt', finishedAt > 0 ? fmtTs(finishedAt) : (startedAt > 0 ? t('initializing_running') : '-'));
+  setText('schemaItems', totalItems > 0 ? `${totalDone}/${totalItems}` : (stages.length ? `${totalDone}` : '-'));
+  const target = el('schemaProgressTable');
+  if (!target) return;
+  if (!stages.length) {
+    target.innerHTML = `<div class="empty">${escapeHtml(t('no_schema_progress'))}</div>`;
+    return;
+  }
+  const rowsWithDurations = stages.map((stage) => {
+    const duration = schemaStageDurationSeconds(stage, now);
+    const done = Number(stage.item_done || 0);
+    const total = Number(stage.item_total || 0);
+    return {
+      ...stage,
+      stage_label: stage.label || stage.stage || '-',
+      running_sort: stage.running ? 1 : 0,
+      duration_seconds: duration,
+      duration_label: fmtDuration(duration),
+      progress_done: done,
+      progress_label: total > 0 ? `${done}/${total}` : (done > 0 ? `${done}` : '-'),
+    };
+  });
+  const rows = sortRows(rowsWithDurations, 'schemaProgress')
+    .map((stage) => `<tr class="${stage.running ? 'phase-initializing' : ''}">
+      <td>${escapeHtml(stage.stage_label)}</td>
+      <td>${escapeHtml(displayPhase(stage.running ? 'initializing' : 'done'))}</td>
+      <td>${escapeHtml(stage.duration_label)}</td>
+      <td>${escapeHtml(stage.progress_label)}</td>
+      <td>${escapeHtml(stage.last_item || '-')}</td>
+      <td>${escapeHtml(stage.error_total ?? 0)}</td>
+      <td>${escapeHtml(fmtTs(stage.last_event_at))}</td>
+    </tr>`)
+    .join('');
+  target.innerHTML = `<table><thead><tr>${sortHeader('schemaProgress', 'stage_label', t('stage_name'))}${sortHeader('schemaProgress', 'running_sort', t('phase'))}${sortHeader('schemaProgress', 'duration_seconds', t('duration'))}${sortHeader('schemaProgress', 'progress_done', t('progress'))}${sortHeader('schemaProgress', 'last_item', t('last_item'))}${sortHeader('schemaProgress', 'error_total', t('errors'))}${sortHeader('schemaProgress', 'last_event_at', t('last_event_at'))}</tr></thead><tbody>${rows}</tbody></table>`;
 }
 function renderResources(resources) {
   const system = resources?.system || {};
@@ -2005,6 +2111,7 @@ function renderStatusData(data) {
     setText('progressFiltered', progressFiltered);
     renderResources(data.resources);
     renderCheckpointService(data.checkpoint_service);
+    renderSchemaProgress(progress, data.now);
     renderInitializationTiming(progress, data.now);
     renderColumnInFilters(cfg, progress);
     renderSyncProgressTable(progressTables, data.now);
@@ -2739,6 +2846,18 @@ plugins:
                 .get("initialization_finished_at")
                 .is_some()
         );
+        assert!(
+            v.get("runtime_progress")
+                .unwrap()
+                .get("schema_started_at")
+                .is_some()
+        );
+        assert!(
+            v.get("runtime_progress")
+                .unwrap()
+                .get("schema_stages")
+                .is_some()
+        );
         let checkpoint_service = v.get("checkpoint_service").unwrap();
         assert_eq!(
             checkpoint_service
@@ -2923,6 +3042,11 @@ plugins:
         assert!(s.contains("Checkpoint 后台任务"));
         assert!(s.contains("checkpointServiceState"));
         assert!(s.contains("function renderCheckpointService"));
+        assert!(s.contains("表结构初始化"));
+        assert!(s.contains("schemaProgressTable"));
+        assert!(s.contains("function renderSchemaProgress"));
+        assert!(s.contains("function schemaStageDurationSeconds"));
+        assert!(s.contains("schemaProgress: { key: 'running_sort', dir: 'desc' }"));
         assert!(s.contains("tableSortState"));
         assert!(s.contains("syncProgress: { key: 'last_event_at', dir: 'desc' }"));
         assert!(s.contains("function setTableSort"));

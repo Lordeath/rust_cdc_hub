@@ -200,13 +200,40 @@ impl MysqlSourceConfig {
                 Some(&database),
             );
             let mut table_info_list: Vec<TableInfoVo> = vec![];
-            let pool = get_mysql_pool_by_url_with_max_connections(
+            let connect_stage = format!("source.mysql.{}.connect", database);
+            runtime_progress::begin_schema_stage(
+                connect_stage.as_str(),
+                format!("MySQL source 连接 {}", database).as_str(),
+                1,
+            )
+            .await;
+            let pool = match get_mysql_pool_by_url_with_max_connections(
                 &connection_url,
                 "mysql source 初始化获取数据结构",
                 1,
             )
             .await
-            .unwrap_or_else(|e| panic!("MySQL source 初始化获取数据结构连接失败: {}", e));
+            {
+                Ok(pool) => {
+                    runtime_progress::record_schema_stage_item(
+                        connect_stage.as_str(),
+                        database.as_str(),
+                    )
+                    .await;
+                    runtime_progress::finish_schema_stage(connect_stage.as_str()).await;
+                    pool
+                }
+                Err(e) => {
+                    runtime_progress::record_schema_stage_error(
+                        connect_stage.as_str(),
+                        database.as_str(),
+                        e.as_str(),
+                    )
+                    .await;
+                    runtime_progress::finish_schema_stage(connect_stage.as_str()).await;
+                    panic!("MySQL source 初始化获取数据结构连接失败: {}", e);
+                }
+            };
 
             let mut current_source_tables = configured_table_names.clone();
             let sync_foreign_key_tables = config.sync_foreign_key_tables_enabled();
@@ -218,18 +245,42 @@ impl MysqlSourceConfig {
                         || current_source_tables[0].eq_ignore_ascii_case("*")));
             if full_table_discovery {
                 // get all tables
+                let discovery_stage = format!("source.mysql.{}.table_discovery", database);
+                runtime_progress::begin_schema_stage(
+                    discovery_stage.as_str(),
+                    format!("MySQL source 表发现 {}", database).as_str(),
+                    1,
+                )
+                .await;
                 let show_tables_sql = Self::full_table_discovery_sql(
                     sync_foreign_key_tables,
                     sync_schema_only_tables,
                 );
-                let tables: Vec<String> = sqlx::query(show_tables_sql.as_str())
-                    .fetch_all(&pool)
-                    .await
-                    .expect("query failed")
-                    .into_iter()
-                    .map(|row| mysql_row_text_value(&row, "table_name"))
-                    // .map(|row| row.table_name)
-                    .collect();
+                let tables_result = sqlx::query(show_tables_sql.as_str()).fetch_all(&pool).await;
+                let tables: Vec<String> = match tables_result {
+                    Ok(rows) => {
+                        runtime_progress::record_schema_stage_item(
+                            discovery_stage.as_str(),
+                            database.as_str(),
+                        )
+                        .await;
+                        runtime_progress::finish_schema_stage(discovery_stage.as_str()).await;
+                        rows.into_iter()
+                            .map(|row| mysql_row_text_value(&row, "table_name"))
+                            // .map(|row| row.table_name)
+                            .collect()
+                    }
+                    Err(e) => {
+                        runtime_progress::record_schema_stage_error(
+                            discovery_stage.as_str(),
+                            database.as_str(),
+                            e.to_string().as_str(),
+                        )
+                        .await;
+                        runtime_progress::finish_schema_stage(discovery_stage.as_str()).await;
+                        panic!("query failed: {}", e);
+                    }
+                };
                 info!("get all tables from {}: {:?}", database, tables);
                 current_source_tables = tables;
             }
@@ -258,11 +309,39 @@ impl MysqlSourceConfig {
                 .iter()
                 .map(|table_name| table_name.to_ascii_lowercase())
                 .collect::<HashSet<_>>();
+            let comments_stage = format!("source.mysql.{}.table_comments", database);
+            runtime_progress::begin_schema_stage(
+                comments_stage.as_str(),
+                format!("MySQL source 表注释 {}", database).as_str(),
+                1,
+            )
+            .await;
             let table_comments =
                 Self::fetch_table_comments(&pool, database.as_str(), &selected_table_keys).await;
+            runtime_progress::record_schema_stage_item(comments_stage.as_str(), database.as_str())
+                .await;
+            runtime_progress::finish_schema_stage(comments_stage.as_str()).await;
+
+            let indexes_stage = format!("source.mysql.{}.secondary_indexes", database);
+            runtime_progress::begin_schema_stage(
+                indexes_stage.as_str(),
+                format!("MySQL source 二级索引 {}", database).as_str(),
+                1,
+            )
+            .await;
             let secondary_indexes =
                 Self::fetch_secondary_indexes(&pool, database.as_str(), &selected_table_keys).await;
+            runtime_progress::record_schema_stage_item(indexes_stage.as_str(), database.as_str())
+                .await;
+            runtime_progress::finish_schema_stage(indexes_stage.as_str()).await;
 
+            let table_schema_stage = format!("source.mysql.{}.table_schema", database);
+            runtime_progress::begin_schema_stage(
+                table_schema_stage.as_str(),
+                format!("MySQL source 逐表结构 {}", database).as_str(),
+                current_source_tables.len() as u64,
+            )
+            .await;
             for table_name in current_source_tables.clone() {
                 // fill table_info
                 let show_create_table_sql = format!(
@@ -270,21 +349,49 @@ impl MysqlSourceConfig {
                     qualified_mysql_table_name(&database, &table_name)
                 );
                 info!("{}", show_create_table_sql);
-                let show_create_table_result = sqlx::query(&show_create_table_sql)
-                    .fetch_one(&pool)
-                    .await
-                    .expect("query failed");
+                let show_create_table_result =
+                    match sqlx::query(&show_create_table_sql).fetch_one(&pool).await {
+                        Ok(row) => row,
+                        Err(e) => {
+                            runtime_progress::record_schema_stage_error(
+                                table_schema_stage.as_str(),
+                                table_name.as_str(),
+                                e.to_string().as_str(),
+                            )
+                            .await;
+                            runtime_progress::finish_schema_stage(table_schema_stage.as_str())
+                                .await;
+                            panic!("query failed: {}", e);
+                        }
+                    };
                 let create_table_sql = show_create_table_result.get(1);
                 let pk_column_sql = r#"
                     select COLUMN_NAME as column_name, COLUMN_KEY as column_key, DATA_TYPE as data_type
                     from information_schema.`COLUMNS`
                     where TABLE_SCHEMA = (select database()) AND TABLE_NAME = ?
                 "#;
-                let col_list = sqlx::query_as::<_, ColumnInfoFromMysql>(pk_column_sql)
+                let col_list = match sqlx::query_as::<_, ColumnInfoFromMysql>(pk_column_sql)
                     .bind(table_name.clone())
                     .fetch_all(&pool)
                     .await
-                    .expect("query failed");
+                {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        runtime_progress::record_schema_stage_error(
+                            table_schema_stage.as_str(),
+                            table_name.as_str(),
+                            e.to_string().as_str(),
+                        )
+                        .await;
+                        runtime_progress::finish_schema_stage(table_schema_stage.as_str()).await;
+                        panic!("query failed: {}", e);
+                    }
+                };
+                runtime_progress::record_schema_stage_item(
+                    table_schema_stage.as_str(),
+                    table_name.as_str(),
+                )
+                .await;
 
                 let Some(pk_column) = Self::table_cdc_pk_column(
                     table_name.as_str(),
@@ -313,13 +420,27 @@ impl MysqlSourceConfig {
                     foreign_keys: Vec::new(),
                 });
             }
+            runtime_progress::finish_schema_stage(table_schema_stage.as_str()).await;
             if sync_foreign_key_tables {
                 let selected_tables = table_info_list
                     .iter()
                     .map(|table_info| table_info.table_name.to_ascii_lowercase())
                     .collect::<HashSet<_>>();
+                let foreign_keys_stage = format!("source.mysql.{}.foreign_keys", database);
+                runtime_progress::begin_schema_stage(
+                    foreign_keys_stage.as_str(),
+                    format!("MySQL source 外键元数据 {}", database).as_str(),
+                    1,
+                )
+                .await;
                 let foreign_keys =
                     Self::fetch_foreign_keys(&pool, database.as_str(), &selected_tables).await;
+                runtime_progress::record_schema_stage_item(
+                    foreign_keys_stage.as_str(),
+                    database.as_str(),
+                )
+                .await;
+                runtime_progress::finish_schema_stage(foreign_keys_stage.as_str()).await;
                 for table_info in &mut table_info_list {
                     table_info.foreign_keys = foreign_keys
                         .get(table_info.table_name.to_ascii_lowercase().as_str())

@@ -90,6 +90,7 @@ pub trait Sink: Send + Sync {
     async fn alter_flush(&mut self) -> Result<(), String>;
 
     async fn after_initialization(&mut self) -> Result<(), String> {
+        runtime_progress::finish_schema_initialization().await;
         Ok(())
     }
 

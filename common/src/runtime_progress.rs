@@ -13,8 +13,37 @@ pub struct RuntimeProgress {
     pub current_table: String,
     pub initialization_started_at: i64,
     pub initialization_finished_at: i64,
+    #[serde(default)]
+    pub schema_running: bool,
+    #[serde(default)]
+    pub schema_current_stage: String,
+    #[serde(default)]
+    pub schema_started_at: i64,
+    #[serde(default)]
+    pub schema_finished_at: i64,
+    #[serde(default)]
+    pub schema_stages: BTreeMap<String, SchemaStageProgress>,
     pub tables: BTreeMap<String, TableProgress>,
     pub plugin_filters: BTreeMap<String, PluginFilterProgress>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchemaStageProgress {
+    pub stage: String,
+    pub label: String,
+    pub running: bool,
+    #[serde(default)]
+    pub started_at: i64,
+    #[serde(default)]
+    pub finished_at: i64,
+    #[serde(default)]
+    pub duration_seconds: i64,
+    pub item_total: u64,
+    pub item_done: u64,
+    pub error_total: u64,
+    pub last_item: String,
+    pub last_error: String,
+    pub last_event_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,9 +79,108 @@ impl RuntimeProgress {
             current_table: String::new(),
             initialization_started_at: 0,
             initialization_finished_at: 0,
+            schema_running: false,
+            schema_current_stage: String::new(),
+            schema_started_at: 0,
+            schema_finished_at: 0,
+            schema_stages: BTreeMap::new(),
             tables: BTreeMap::new(),
             plugin_filters: BTreeMap::new(),
         }
+    }
+
+    pub fn begin_schema_stage(&mut self, stage: &str, label: &str, item_total: u64, now: i64) {
+        self.schema_running = true;
+        self.schema_current_stage = stage.to_string();
+        self.schema_finished_at = 0;
+        if self.schema_started_at == 0 {
+            self.schema_started_at = now;
+        }
+
+        let stage_progress = self
+            .schema_stages
+            .entry(stage.to_string())
+            .or_insert_with(|| SchemaStageProgress {
+                stage: stage.to_string(),
+                label: label.to_string(),
+                running: false,
+                started_at: 0,
+                finished_at: 0,
+                duration_seconds: 0,
+                item_total: 0,
+                item_done: 0,
+                error_total: 0,
+                last_item: String::new(),
+                last_error: String::new(),
+                last_event_at: 0,
+            });
+        stage_progress.label = label.to_string();
+        stage_progress.running = true;
+        stage_progress.started_at = now;
+        stage_progress.finished_at = 0;
+        stage_progress.item_total = stage_progress.item_total.saturating_add(item_total);
+        stage_progress.last_event_at = now;
+    }
+
+    pub fn record_schema_stage_item(&mut self, stage: &str, item: &str, now: i64) {
+        let stage_progress = self.schema_stage_mut(stage, now);
+        stage_progress.item_done = stage_progress.item_done.saturating_add(1);
+        stage_progress.last_item = item.to_string();
+        stage_progress.last_event_at = now;
+        if stage_progress.running {
+            self.schema_running = true;
+            self.schema_current_stage = stage.to_string();
+            self.schema_finished_at = 0;
+        }
+    }
+
+    pub fn record_schema_stage_error(&mut self, stage: &str, item: &str, error: &str, now: i64) {
+        let stage_progress = self.schema_stage_mut(stage, now);
+        stage_progress.error_total = stage_progress.error_total.saturating_add(1);
+        stage_progress.last_item = item.to_string();
+        stage_progress.last_error = error.chars().take(500).collect();
+        stage_progress.last_event_at = now;
+        if stage_progress.running {
+            self.schema_running = true;
+            self.schema_current_stage = stage.to_string();
+            self.schema_finished_at = 0;
+        }
+    }
+
+    pub fn finish_schema_stage(&mut self, stage: &str, now: i64) {
+        if let Some(stage_progress) = self.schema_stages.get_mut(stage) {
+            if stage_progress.started_at == 0 {
+                stage_progress.started_at = now;
+            }
+            if stage_progress.running {
+                stage_progress.duration_seconds = stage_progress
+                    .duration_seconds
+                    .saturating_add(now.saturating_sub(stage_progress.started_at));
+            }
+            stage_progress.running = false;
+            stage_progress.finished_at = now;
+            stage_progress.last_event_at = now;
+        }
+        self.refresh_schema_current_stage(now);
+    }
+
+    pub fn finish_schema_initialization(&mut self, now: i64) {
+        if self.schema_started_at == 0 {
+            return;
+        }
+        for stage_progress in self.schema_stages.values_mut() {
+            if stage_progress.running {
+                stage_progress.duration_seconds = stage_progress
+                    .duration_seconds
+                    .saturating_add(now.saturating_sub(stage_progress.started_at));
+                stage_progress.running = false;
+                stage_progress.finished_at = now;
+                stage_progress.last_event_at = now;
+            }
+        }
+        self.schema_running = false;
+        self.schema_current_stage.clear();
+        self.schema_finished_at = now;
     }
 
     pub fn begin_table_initialization(&mut self, table_name: &str, now: i64) {
@@ -165,6 +293,28 @@ impl RuntimeProgress {
             })
     }
 
+    fn schema_stage_mut(&mut self, stage: &str, now: i64) -> &mut SchemaStageProgress {
+        if self.schema_started_at == 0 {
+            self.schema_started_at = now;
+        }
+        self.schema_stages
+            .entry(stage.to_string())
+            .or_insert_with(|| SchemaStageProgress {
+                stage: stage.to_string(),
+                label: stage.to_string(),
+                running: false,
+                started_at: now,
+                finished_at: 0,
+                duration_seconds: 0,
+                item_total: 0,
+                item_done: 0,
+                error_total: 0,
+                last_item: String::new(),
+                last_error: String::new(),
+                last_event_at: now,
+            })
+    }
+
     fn refresh_current_table(&mut self) {
         let current_is_initializing = self
             .tables
@@ -181,6 +331,20 @@ impl RuntimeProgress {
             .max_by_key(|table| table.last_event_at)
             .map(|table| table.table_name.clone())
             .unwrap_or_default();
+    }
+
+    fn refresh_schema_current_stage(&mut self, now: i64) {
+        self.schema_current_stage = self
+            .schema_stages
+            .values()
+            .filter(|stage| stage.running)
+            .max_by_key(|stage| stage.last_event_at)
+            .map(|stage| stage.stage.clone())
+            .unwrap_or_default();
+        self.schema_running = !self.schema_current_stage.is_empty();
+        if !self.schema_running && self.schema_started_at > 0 {
+            self.schema_finished_at = now;
+        }
     }
 }
 
@@ -210,6 +374,46 @@ pub async fn finish_initialization() {
         .lock()
         .await
         .finish_initialization(chrono::Utc::now().timestamp());
+}
+
+pub async fn begin_schema_stage(stage: &str, label: &str, item_total: u64) {
+    RUNTIME_PROGRESS.lock().await.begin_schema_stage(
+        stage,
+        label,
+        item_total,
+        chrono::Utc::now().timestamp(),
+    );
+}
+
+pub async fn record_schema_stage_item(stage: &str, item: &str) {
+    RUNTIME_PROGRESS.lock().await.record_schema_stage_item(
+        stage,
+        item,
+        chrono::Utc::now().timestamp(),
+    );
+}
+
+pub async fn record_schema_stage_error(stage: &str, item: &str, error: &str) {
+    RUNTIME_PROGRESS.lock().await.record_schema_stage_error(
+        stage,
+        item,
+        error,
+        chrono::Utc::now().timestamp(),
+    );
+}
+
+pub async fn finish_schema_stage(stage: &str) {
+    RUNTIME_PROGRESS
+        .lock()
+        .await
+        .finish_schema_stage(stage, chrono::Utc::now().timestamp());
+}
+
+pub async fn finish_schema_initialization() {
+    RUNTIME_PROGRESS
+        .lock()
+        .await
+        .finish_schema_initialization(chrono::Utc::now().timestamp());
 }
 
 pub async fn record_read(table_name: &str, phase: &str, last_pk: Option<String>) {
@@ -266,6 +470,11 @@ mod tests {
         assert!(progress.current_table.is_empty());
         assert_eq!(progress.initialization_started_at, 0);
         assert_eq!(progress.initialization_finished_at, 0);
+        assert!(!progress.schema_running);
+        assert!(progress.schema_current_stage.is_empty());
+        assert_eq!(progress.schema_started_at, 0);
+        assert_eq!(progress.schema_finished_at, 0);
+        assert!(progress.schema_stages.is_empty());
         assert!(progress.tables.is_empty());
         assert!(progress.plugin_filters.is_empty());
     }
@@ -358,5 +567,49 @@ mod tests {
         assert_eq!(charges.output_total, 0);
         assert_eq!(charges.filtered_total, 1);
         assert_eq!(charges.table_name, "charges");
+    }
+
+    #[test]
+    fn runtime_progress_tracks_schema_stage() {
+        let mut progress = RuntimeProgress::new();
+        progress.begin_schema_stage("source.mysql.tables", "MySQL source 表发现", 2, 10);
+        progress.record_schema_stage_item("source.mysql.tables", "orders", 11);
+        progress.record_schema_stage_error("source.mysql.tables", "charges", "query failed", 12);
+
+        assert!(progress.schema_running);
+        assert_eq!(progress.schema_current_stage, "source.mysql.tables");
+        assert_eq!(progress.schema_started_at, 10);
+        assert_eq!(progress.schema_finished_at, 0);
+
+        progress.finish_schema_stage("source.mysql.tables", 15);
+        let stage = progress.schema_stages.get("source.mysql.tables").unwrap();
+        assert!(!stage.running);
+        assert_eq!(stage.item_total, 2);
+        assert_eq!(stage.item_done, 1);
+        assert_eq!(stage.error_total, 1);
+        assert_eq!(stage.last_item, "charges");
+        assert_eq!(stage.last_error, "query failed");
+        assert_eq!(stage.duration_seconds, 5);
+        assert!(!progress.schema_running);
+        assert!(progress.schema_current_stage.is_empty());
+        assert_eq!(progress.schema_finished_at, 15);
+    }
+
+    #[test]
+    fn runtime_progress_finishes_running_schema_stages() {
+        let mut progress = RuntimeProgress::new();
+        progress.begin_schema_stage("sink.mysql.create_table", "MySQL sink 自动建表", 1, 20);
+
+        progress.finish_schema_initialization(24);
+
+        let stage = progress
+            .schema_stages
+            .get("sink.mysql.create_table")
+            .unwrap();
+        assert!(!stage.running);
+        assert_eq!(stage.finished_at, 24);
+        assert_eq!(stage.duration_seconds, 4);
+        assert!(!progress.schema_running);
+        assert_eq!(progress.schema_finished_at, 24);
     }
 }
