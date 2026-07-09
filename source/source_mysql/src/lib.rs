@@ -281,7 +281,8 @@ impl MysqlSourceConfig {
                         panic!("query failed: {}", e);
                     }
                 };
-                info!("get all tables from {}: {:?}", database, tables);
+                info!("get all tables from {}: count={}", database, tables.len());
+                debug!("get all tables from {}: {:?}", database, tables);
                 current_source_tables = tables;
             }
 
@@ -348,7 +349,7 @@ impl MysqlSourceConfig {
                     "show create table {}",
                     qualified_mysql_table_name(&database, &table_name)
                 );
-                info!("{}", show_create_table_sql);
+                debug!("{}", show_create_table_sql);
                 let show_create_table_result =
                     match sqlx::query(&show_create_table_sql).fetch_one(&pool).await {
                         Ok(row) => row,

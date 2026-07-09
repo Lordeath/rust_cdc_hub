@@ -89,6 +89,62 @@ struct DamengColumnInfo {
     nullable: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+struct DamengSchemaMetadata {
+    tables: HashSet<String>,
+    columns_by_table: HashMap<String, HashMap<String, DamengColumnInfo>>,
+    column_comments_by_table: Option<HashMap<String, HashMap<String, String>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DamengColumnEnsureSummary {
+    added_target_column_keys: HashSet<String>,
+    default_mismatches: DamengDefaultMismatchSummary,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DamengDefaultMismatchSummary {
+    total: usize,
+    samples: Vec<String>,
+}
+
+impl DamengDefaultMismatchSummary {
+    fn record(
+        &mut self,
+        table_key: &str,
+        source_column: &str,
+        existing_default: Option<&String>,
+        expected_default: Option<String>,
+    ) {
+        self.total = self.total.saturating_add(1);
+        if self.samples.len() < 20 {
+            self.samples.push(format!(
+                "{}.{} existing={:?} expected={:?}",
+                table_key, source_column, existing_default, expected_default
+            ));
+        }
+    }
+
+    fn merge(&mut self, other: DamengDefaultMismatchSummary) {
+        self.total = self.total.saturating_add(other.total);
+        let remaining = 20usize.saturating_sub(self.samples.len());
+        self.samples
+            .extend(other.samples.into_iter().take(remaining));
+    }
+
+    fn log_warn(&self, context: &str) {
+        if self.total == 0 {
+            return;
+        }
+        warn!(
+            "Dameng {} default mismatch summary: total={} samples={}",
+            context,
+            self.total,
+            self.samples.join(" | ")
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DamengRequiredColumnInfo {
     column_name: String,
@@ -3032,10 +3088,142 @@ impl DamengSink {
             );
             return Ok(());
         }
-        let stage = "sink.dameng.ensure_schema";
+        let metadata_stage = "sink.dameng.load_target_metadata";
+        let metadata_schemas = self.target_metadata_schemas();
         runtime_progress::begin_schema_stage(
-            stage,
-            "Dameng sink 表/字段/注释检查",
+            metadata_stage,
+            "Dameng sink 目标元数据读取",
+            metadata_schemas.len() as u64,
+        )
+        .await;
+        let mut metadata_by_schema = HashMap::new();
+        for schema in &metadata_schemas {
+            let schema_item = Self::schema_stage_item(schema);
+            match self.load_target_schema_metadata(schema.as_str()).await {
+                Ok(metadata) => {
+                    metadata_by_schema.insert(Self::schema_metadata_key(schema), metadata);
+                    runtime_progress::record_schema_stage_item(
+                        metadata_stage,
+                        schema_item.as_str(),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    runtime_progress::record_schema_stage_error(
+                        metadata_stage,
+                        schema_item.as_str(),
+                        e.as_str(),
+                    )
+                    .await;
+                    runtime_progress::finish_schema_stage(metadata_stage).await;
+                    return Err(e);
+                }
+            }
+        }
+        runtime_progress::finish_schema_stage(metadata_stage).await;
+
+        let tables_stage = "sink.dameng.ensure_tables";
+        runtime_progress::begin_schema_stage(
+            tables_stage,
+            "Dameng sink 表检查/自动建表",
+            self.table_info_list.len() as u64,
+        )
+        .await;
+        let mut created_tables = HashSet::new();
+        for table_info in &self.table_info_list {
+            let schema = Self::table_info_target_schema(table_info, self.schema.as_str());
+            let table_label =
+                Self::target_table_key(schema.as_str(), table_info.table_name.as_str());
+            let schema_key = Self::schema_metadata_key(schema.as_str());
+            let table_key = Self::table_metadata_key(table_info.table_name.as_str());
+            let exists = metadata_by_schema
+                .get(schema_key.as_str())
+                .is_some_and(|metadata| metadata.tables.contains(table_key.as_str()));
+            let table_created = match self.ensure_table(schema.as_str(), table_info, exists).await {
+                Ok(created) => created,
+                Err(e) => {
+                    let error = format!("Dameng ensure table failed: {} {}", table_label, e);
+                    runtime_progress::record_schema_stage_error(
+                        tables_stage,
+                        table_label.as_str(),
+                        error.as_str(),
+                    )
+                    .await;
+                    runtime_progress::finish_schema_stage(tables_stage).await;
+                    return Err(error);
+                }
+            };
+            if table_created {
+                created_tables.insert(table_label.to_ascii_lowercase());
+                if let Some(metadata) = metadata_by_schema.get_mut(schema_key.as_str()) {
+                    metadata.tables.insert(table_key);
+                }
+            }
+            runtime_progress::record_schema_stage_item(tables_stage, table_label.as_str()).await;
+        }
+        runtime_progress::finish_schema_stage(tables_stage).await;
+
+        let columns_stage = "sink.dameng.ensure_columns";
+        runtime_progress::begin_schema_stage(
+            columns_stage,
+            "Dameng sink 字段检查/自动补列",
+            self.table_info_list.len() as u64,
+        )
+        .await;
+        let mut added_columns_by_table: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut default_mismatches = DamengDefaultMismatchSummary::default();
+        for table_info in &self.table_info_list {
+            let schema = Self::table_info_target_schema(table_info, self.schema.as_str());
+            let table_label =
+                Self::target_table_key(schema.as_str(), table_info.table_name.as_str());
+            if created_tables.contains(table_label.to_ascii_lowercase().as_str()) {
+                runtime_progress::record_schema_stage_item(columns_stage, table_label.as_str())
+                    .await;
+                continue;
+            }
+            let existing_cols = metadata_by_schema
+                .get(Self::schema_metadata_key(schema.as_str()).as_str())
+                .and_then(|metadata| {
+                    metadata
+                        .columns_by_table
+                        .get(Self::table_metadata_key(table_info.table_name.as_str()).as_str())
+                })
+                .cloned()
+                .unwrap_or_default();
+            match self
+                .ensure_columns(schema.as_str(), table_info, &existing_cols)
+                .await
+            {
+                Ok(summary) => {
+                    if !summary.added_target_column_keys.is_empty() {
+                        added_columns_by_table
+                            .entry(table_label.to_ascii_lowercase())
+                            .or_default()
+                            .extend(summary.added_target_column_keys);
+                    }
+                    default_mismatches.merge(summary.default_mismatches);
+                }
+                Err(e) => {
+                    let error = format!("Dameng ensure columns failed: {} {}", table_label, e);
+                    runtime_progress::record_schema_stage_error(
+                        columns_stage,
+                        table_label.as_str(),
+                        error.as_str(),
+                    )
+                    .await;
+                    runtime_progress::finish_schema_stage(columns_stage).await;
+                    return Err(error);
+                }
+            }
+            runtime_progress::record_schema_stage_item(columns_stage, table_label.as_str()).await;
+        }
+        runtime_progress::finish_schema_stage(columns_stage).await;
+        default_mismatches.log_warn("schema initialization");
+
+        let comments_stage = "sink.dameng.ensure_comments";
+        runtime_progress::begin_schema_stage(
+            comments_stage,
+            "Dameng sink 表/字段注释检查",
             self.table_info_list.len() as u64,
         )
         .await;
@@ -3043,47 +3231,41 @@ impl DamengSink {
             let schema = Self::table_info_target_schema(table_info, self.schema.as_str());
             let table_label =
                 Self::target_table_key(schema.as_str(), table_info.table_name.as_str());
-            let table_created = match self.ensure_table(schema.as_str(), table_info).await {
-                Ok(created) => created,
-                Err(e) => {
-                    let error = format!("Dameng ensure table failed: {} {}", table_label, e);
-                    runtime_progress::record_schema_stage_error(
-                        stage,
-                        table_label.as_str(),
-                        error.as_str(),
-                    )
-                    .await;
-                    runtime_progress::finish_schema_stage(stage).await;
-                    return Err(error);
-                }
-            };
-            if let Err(e) = self.ensure_columns(schema.as_str(), table_info).await {
-                let error = format!("Dameng ensure columns failed: {} {}", table_label, e);
-                runtime_progress::record_schema_stage_error(
-                    stage,
-                    table_label.as_str(),
-                    error.as_str(),
-                )
-                .await;
-                runtime_progress::finish_schema_stage(stage).await;
-                return Err(error);
-            }
+            let table_label_key = table_label.to_ascii_lowercase();
+            let table_created = created_tables.contains(table_label_key.as_str());
             if table_created {
                 if let Err(e) = self.ensure_table_comment(schema.as_str(), table_info).await {
                     let error =
                         format!("Dameng ensure table comment failed: {} {}", table_label, e);
                     runtime_progress::record_schema_stage_error(
-                        stage,
+                        comments_stage,
                         table_label.as_str(),
                         error.as_str(),
                     )
                     .await;
-                    runtime_progress::finish_schema_stage(stage).await;
+                    runtime_progress::finish_schema_stage(comments_stage).await;
                     return Err(error);
                 }
             }
+            let existing_comments = metadata_by_schema
+                .get(Self::schema_metadata_key(schema.as_str()).as_str())
+                .and_then(|metadata| metadata.column_comments_by_table.as_ref())
+                .and_then(|comments| {
+                    comments.get(Self::table_metadata_key(table_info.table_name.as_str()).as_str())
+                })
+                .cloned();
+            let added_columns = added_columns_by_table
+                .get(table_label_key.as_str())
+                .cloned()
+                .unwrap_or_default();
             if let Err(e) = self
-                .ensure_column_comments(schema.as_str(), table_info)
+                .ensure_column_comments(
+                    schema.as_str(),
+                    table_info,
+                    existing_comments,
+                    table_created,
+                    &added_columns,
+                )
                 .await
             {
                 let error = format!(
@@ -3091,17 +3273,17 @@ impl DamengSink {
                     table_label, e
                 );
                 runtime_progress::record_schema_stage_error(
-                    stage,
+                    comments_stage,
                     table_label.as_str(),
                     error.as_str(),
                 )
                 .await;
-                runtime_progress::finish_schema_stage(stage).await;
+                runtime_progress::finish_schema_stage(comments_stage).await;
                 return Err(error);
             }
-            runtime_progress::record_schema_stage_item(stage, table_label.as_str()).await;
+            runtime_progress::record_schema_stage_item(comments_stage, table_label.as_str()).await;
         }
-        runtime_progress::finish_schema_stage(stage).await;
+        runtime_progress::finish_schema_stage(comments_stage).await;
         Ok(())
     }
 
@@ -3127,6 +3309,206 @@ impl DamengSink {
         Ok(())
     }
 
+    fn target_metadata_schemas(&self) -> Vec<String> {
+        let mut schemas = Vec::new();
+        let mut seen = HashSet::new();
+        if self.table_info_list.is_empty() {
+            schemas.push(self.schema.clone());
+            return schemas;
+        }
+        for table_info in &self.table_info_list {
+            let schema = Self::table_info_target_schema(table_info, self.schema.as_str());
+            if seen.insert(Self::schema_metadata_key(schema.as_str())) {
+                schemas.push(schema);
+            }
+        }
+        schemas
+    }
+
+    fn schema_metadata_key(schema: &str) -> String {
+        schema.to_ascii_lowercase()
+    }
+
+    fn table_metadata_key(table_name: &str) -> String {
+        table_name.to_ascii_lowercase()
+    }
+
+    fn schema_stage_item(schema: &str) -> String {
+        if schema.trim().is_empty() {
+            "current_user".to_string()
+        } else {
+            schema.to_string()
+        }
+    }
+
+    async fn load_target_schema_metadata(
+        &self,
+        schema: &str,
+    ) -> Result<DamengSchemaMetadata, String> {
+        let tables = self.load_target_schema_tables(schema).await?;
+        let (columns_by_table, column_comments_by_table) = match self
+            .load_target_schema_columns_and_comments(schema)
+            .await
+        {
+            Ok((columns, comments)) => (columns, Some(comments)),
+            Err(e) => {
+                warn!(
+                    "Dameng batch column/comment metadata query failed, fallback to column-only metadata and per-table comments: schema={} error={}",
+                    Self::schema_stage_item(schema),
+                    e
+                );
+                (self.load_target_schema_columns(schema).await?, None)
+            }
+        };
+        Ok(DamengSchemaMetadata {
+            tables,
+            columns_by_table,
+            column_comments_by_table,
+        })
+    }
+
+    async fn load_target_schema_columns_and_comments(
+        &self,
+        schema: &str,
+    ) -> Result<
+        (
+            HashMap<String, HashMap<String, DamengColumnInfo>>,
+            HashMap<String, HashMap<String, String>>,
+        ),
+        String,
+    > {
+        let sql = Self::schema_columns_and_comments_metadata_sql(schema);
+        let rows = self.query(sql.as_str(), &[]).await?;
+        let mut columns_by_table: HashMap<String, HashMap<String, DamengColumnInfo>> =
+            HashMap::new();
+        let mut comments_by_table: HashMap<String, HashMap<String, String>> = HashMap::new();
+        for row in rows.iter() {
+            let Some(table_name) = row.get::<String>(0).ok() else {
+                continue;
+            };
+            let table_key = Self::table_metadata_key(table_name.as_str());
+            let Some(column_metadata) = row.get::<String>(1).ok() else {
+                continue;
+            };
+            let Some((column_name, info)) =
+                Self::parse_column_metadata(column_metadata.as_str(), '\x1f')
+            else {
+                continue;
+            };
+            let column_key = column_name.to_ascii_lowercase();
+            columns_by_table
+                .entry(table_key.clone())
+                .or_default()
+                .insert(column_key.clone(), info);
+            let Some(comment_metadata) = row.get::<String>(2).ok() else {
+                continue;
+            };
+            let Some((comment_column_name, comment)) = comment_metadata.split_once('\x1f') else {
+                continue;
+            };
+            if comment_column_name.is_empty() {
+                continue;
+            }
+            comments_by_table.entry(table_key).or_default().insert(
+                comment_column_name.to_ascii_lowercase(),
+                comment.to_string(),
+            );
+        }
+        Ok((columns_by_table, comments_by_table))
+    }
+
+    async fn load_target_schema_tables(&self, schema: &str) -> Result<HashSet<String>, String> {
+        let sql = Self::schema_tables_metadata_sql(schema);
+        let rows = self.query(sql.as_str(), &[]).await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| row.get::<String>(0).ok())
+            .map(|table_name| Self::table_metadata_key(table_name.as_str()))
+            .collect())
+    }
+
+    async fn load_target_schema_columns(
+        &self,
+        schema: &str,
+    ) -> Result<HashMap<String, HashMap<String, DamengColumnInfo>>, String> {
+        let sql = Self::schema_columns_metadata_sql(schema);
+        let rows = self.query(sql.as_str(), &[]).await?;
+        let mut columns_by_table: HashMap<String, HashMap<String, DamengColumnInfo>> =
+            HashMap::new();
+        for row in rows.iter() {
+            let Some(table_name) = row.get::<String>(0).ok() else {
+                continue;
+            };
+            let Some(metadata) = row.get::<String>(1).ok() else {
+                continue;
+            };
+            let Some((column_name, info)) = Self::parse_column_metadata(metadata.as_str(), '\x1f')
+            else {
+                continue;
+            };
+            columns_by_table
+                .entry(Self::table_metadata_key(table_name.as_str()))
+                .or_default()
+                .insert(column_name.to_ascii_lowercase(), info);
+        }
+        Ok(columns_by_table)
+    }
+
+    fn column_metadata_expr() -> String {
+        Self::qualified_column_metadata_expr("")
+    }
+
+    fn qualified_column_metadata_expr(prefix: &str) -> String {
+        format!(
+            "{prefix}COLUMN_NAME || CHR(31) || {prefix}DATA_TYPE || CHR(31) || {prefix}DATA_LENGTH || CHR(31) || {prefix}CHAR_LENGTH || CHR(31) || NVL(TO_CHAR({prefix}DATA_PRECISION), '') || CHR(31) || NVL(TO_CHAR({prefix}DATA_SCALE), '') || CHR(31) || NVL(REPLACE(REPLACE(TRIM({prefix}DATA_DEFAULT), CHR(30), ' '), CHR(31), ' '), '') || CHR(31) || {prefix}NULLABLE"
+        )
+    }
+
+    fn schema_tables_metadata_sql(schema: &str) -> String {
+        if schema.is_empty() {
+            "SELECT TABLE_NAME FROM USER_TABLES ORDER BY TABLE_NAME".to_string()
+        } else {
+            format!(
+                "SELECT TABLE_NAME FROM ALL_TABLES WHERE {} ORDER BY TABLE_NAME",
+                Self::eq_original_or_upper_sql("OWNER", schema)
+            )
+        }
+    }
+
+    fn schema_columns_and_comments_metadata_sql(schema: &str) -> String {
+        let expr = Self::qualified_column_metadata_expr("c.");
+        let comment_expr = "c.COLUMN_NAME || CHR(31) || NVL(REPLACE(REPLACE(cc.COMMENTS, CHR(30), ' '), CHR(31), ' '), '')";
+        if schema.is_empty() {
+            format!(
+                "SELECT c.TABLE_NAME, {}, {} FROM USER_TAB_COLUMNS c LEFT JOIN USER_COL_COMMENTS cc ON cc.TABLE_NAME = c.TABLE_NAME AND cc.COLUMN_NAME = c.COLUMN_NAME ORDER BY c.TABLE_NAME, c.COLUMN_ID",
+                expr, comment_expr
+            )
+        } else {
+            format!(
+                "SELECT c.TABLE_NAME, {}, {} FROM ALL_TAB_COLUMNS c LEFT JOIN ALL_COL_COMMENTS cc ON cc.OWNER = c.OWNER AND cc.TABLE_NAME = c.TABLE_NAME AND cc.COLUMN_NAME = c.COLUMN_NAME WHERE {} ORDER BY c.TABLE_NAME, c.COLUMN_ID",
+                expr,
+                comment_expr,
+                Self::eq_original_or_upper_sql("c.OWNER", schema)
+            )
+        }
+    }
+
+    fn schema_columns_metadata_sql(schema: &str) -> String {
+        let expr = Self::column_metadata_expr();
+        if schema.is_empty() {
+            format!(
+                "SELECT TABLE_NAME, {} FROM USER_TAB_COLUMNS ORDER BY TABLE_NAME, COLUMN_ID",
+                expr
+            )
+        } else {
+            format!(
+                "SELECT TABLE_NAME, {} FROM ALL_TAB_COLUMNS WHERE {} ORDER BY TABLE_NAME, COLUMN_ID",
+                expr,
+                Self::eq_original_or_upper_sql("OWNER", schema)
+            )
+        }
+    }
+
     async fn ensure_table_comment(
         &self,
         schema: &str,
@@ -3134,12 +3516,6 @@ impl DamengSink {
     ) -> Result<(), String> {
         let expected_comment = table_info.table_comment.trim();
         if expected_comment.is_empty() {
-            return Ok(());
-        }
-        let existing_comment = self
-            .existing_table_comment(schema, table_info.table_name.as_str())
-            .await?;
-        if existing_comment.as_deref() == Some(expected_comment) {
             return Ok(());
         }
         let sql =
@@ -3166,16 +3542,24 @@ impl DamengSink {
         &self,
         schema: &str,
         table_info: &TableInfoVo,
+        existing_comments: Option<HashMap<String, String>>,
+        table_created: bool,
+        force_target_keys: &HashSet<String>,
     ) -> Result<(), String> {
         let expected_comments = Self::mysql_column_comments(table_info);
         if expected_comments.is_empty() {
             return Ok(());
         }
 
-        let existing_comments = self
-            .existing_column_comments(schema, table_info.table_name.as_str())
-            .await?;
-        if existing_comments.is_empty() {
+        let existing_comments = match existing_comments {
+            Some(comments) => comments,
+            None if table_created => HashMap::new(),
+            None => {
+                self.existing_column_comments(schema, table_info.table_name.as_str())
+                    .await?
+            }
+        };
+        if !table_created && existing_comments.is_empty() && force_target_keys.is_empty() {
             warn!(
                 "Dameng target table comment metadata is empty, skip comment check: {}",
                 Self::target_table_key(schema, table_info.table_name.as_str())
@@ -3189,21 +3573,23 @@ impl DamengSink {
             let Some(expected_comment) = expected_comments.get(target_key.as_str()) else {
                 continue;
             };
-            match Self::column_comment_needs_update(
-                &existing_comments,
-                target_key.as_str(),
-                expected_comment.as_str(),
-            ) {
-                None => {
-                    warn!(
-                        "Dameng skip comment for missing target column: {} {}",
-                        Self::target_table_key(schema, table_info.table_name.as_str()),
-                        src_col
-                    );
-                    continue;
+            if !table_created && !force_target_keys.contains(target_key.as_str()) {
+                match Self::column_comment_needs_update(
+                    &existing_comments,
+                    target_key.as_str(),
+                    expected_comment.as_str(),
+                ) {
+                    None => {
+                        warn!(
+                            "Dameng skip comment for missing target column: {} {}",
+                            Self::target_table_key(schema, table_info.table_name.as_str()),
+                            src_col
+                        );
+                        continue;
+                    }
+                    Some(false) => continue,
+                    Some(true) => {}
                 }
-                Some(false) => continue,
-                Some(true) => {}
             }
 
             let sql = Self::comment_on_column_sql(
@@ -3777,14 +4163,16 @@ impl DamengSink {
         error.contains("unsupported MySQL syntax")
     }
 
-    async fn ensure_table(&self, schema: &str, table_info: &TableInfoVo) -> Result<bool, String> {
+    async fn ensure_table(
+        &self,
+        schema: &str,
+        table_info: &TableInfoVo,
+        exists: bool,
+    ) -> Result<bool, String> {
         if !self.auto_create_table {
             return Ok(false);
         }
-        if self
-            .table_exists(schema, table_info.table_name.as_str())
-            .await?
-        {
+        if exists {
             return Ok(false);
         }
 
@@ -4009,13 +4397,16 @@ impl DamengSink {
         Ok(())
     }
 
-    async fn ensure_columns(&self, schema: &str, table_info: &TableInfoVo) -> Result<(), String> {
+    async fn ensure_columns(
+        &self,
+        schema: &str,
+        table_info: &TableInfoVo,
+        existing_cols: &HashMap<String, DamengColumnInfo>,
+    ) -> Result<DamengColumnEnsureSummary, String> {
+        let mut summary = DamengColumnEnsureSummary::default();
         if !self.auto_add_column && !self.auto_modify_column {
-            return Ok(());
+            return Ok(summary);
         }
-        let existing_cols = self
-            .existing_columns(schema, table_info.table_name.as_str())
-            .await?;
         if existing_cols.is_empty() {
             warn!(
                 "Dameng target table metadata is empty, skip column check: {} auto_create_table={} auto_add_column={} auto_modify_column={}",
@@ -4024,11 +4415,12 @@ impl DamengSink {
                 self.auto_add_column,
                 self.auto_modify_column
             );
-            return Ok(());
+            return Ok(summary);
         }
         let defs =
             extract_mysql_create_table_column_definitions(table_info.create_table_sql.as_str());
         let primary_key_columns = Self::source_primary_key_columns(table_info);
+        let table_key = Self::target_table_key(schema, table_info.table_name.as_str());
         for src_col in &table_info.columns {
             let key = src_col.to_ascii_lowercase();
             let target_col = Self::target_column_name(src_col);
@@ -4078,9 +4470,9 @@ impl DamengSink {
                     || default_mismatch
                     || should_relax_nullable
                 {
-                    info!(
+                    debug!(
                         "Dameng column check: {}.{} existing={} data_length={} char_length={} nullable={} default={:?} expected={} mysql_nullable={} auto_modify={}",
-                        Self::target_table_key(schema, table_info.table_name.as_str()),
+                        table_key,
                         src_col,
                         existing_col.data_type,
                         existing_col.data_length,
@@ -4093,12 +4485,17 @@ impl DamengSink {
                     );
                 }
                 if default_mismatch {
-                    warn!(
+                    let expected_default =
+                        Self::mysql_column_default_value_sql(mysql_type.as_str(), def.as_str());
+                    debug!(
                         "Dameng skip auto modify default mismatch: {}.{} existing_default={:?} expected_default={:?}",
-                        Self::target_table_key(schema, table_info.table_name.as_str()),
+                        table_key, src_col, existing_col.default_value, expected_default
+                    );
+                    summary.default_mismatches.record(
+                        table_key.as_str(),
                         src_col,
-                        existing_col.default_value,
-                        Self::mysql_column_default_value_sql(mysql_type.as_str(), def.as_str())
+                        existing_col.default_value.as_ref(),
+                        expected_default,
                     );
                 }
                 if should_modify && !self.auto_modify_column {
@@ -4195,8 +4592,11 @@ impl DamengSink {
                     return Err(msg);
                 }
             }
+            summary
+                .added_target_column_keys
+                .insert(target_key.to_string());
         }
-        Ok(())
+        Ok(summary)
     }
 
     async fn ensure_dml_columns(
@@ -4289,7 +4689,7 @@ impl DamengSink {
                     || default_mismatch
                     || should_relax_nullable
                 {
-                    info!(
+                    debug!(
                         "Dameng DML column check: {}.{} existing={} data_length={} char_length={} nullable={} default={:?} expected={} mysql_nullable={} auto_modify={}",
                         table_key,
                         src_col,
@@ -4304,7 +4704,7 @@ impl DamengSink {
                     );
                 }
                 if default_mismatch {
-                    warn!(
+                    debug!(
                         "Dameng DML skip auto modify default mismatch: {}.{} existing_default={:?} expected_default={:?}",
                         table_key,
                         src_col,
@@ -4724,27 +5124,6 @@ impl DamengSink {
         format!("{} NULL", data_type)
     }
 
-    async fn table_exists(&self, schema: &str, table_name: &str) -> Result<bool, String> {
-        let sql = if schema.is_empty() {
-            format!(
-                "SELECT COUNT(*) FROM USER_TABLES WHERE {}",
-                Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
-            )
-        } else {
-            format!(
-                "SELECT COUNT(*) FROM ALL_TABLES WHERE {} AND {}",
-                Self::eq_original_or_upper_sql("OWNER", schema),
-                Self::eq_original_or_upper_sql("TABLE_NAME", table_name)
-            )
-        };
-        let rows = self.query(sql.as_str(), &[]).await?;
-        let count = rows
-            .first()
-            .and_then(|row| row.get::<i32>(0).ok())
-            .unwrap_or(0);
-        Ok(count > 0)
-    }
-
     async fn schema_exists(&self, schema: &str) -> Result<bool, String> {
         let rows = self
             .query(Self::schema_exists_sql(schema).as_str(), &[])
@@ -4772,7 +5151,7 @@ impl DamengSink {
     }
 
     fn columns_metadata_sql(schema: &str, table_name: &str) -> String {
-        let expr = "COLUMN_NAME || CHR(31) || DATA_TYPE || CHR(31) || DATA_LENGTH || CHR(31) || CHAR_LENGTH || CHR(31) || NVL(TO_CHAR(DATA_PRECISION), '') || CHR(31) || NVL(TO_CHAR(DATA_SCALE), '') || CHR(31) || NVL(REPLACE(REPLACE(TRIM(DATA_DEFAULT), CHR(30), ' '), CHR(31), ' '), '') || CHR(31) || NULLABLE";
+        let expr = Self::column_metadata_expr();
         if schema.is_empty() {
             format!(
                 "SELECT {} FROM USER_TAB_COLUMNS WHERE {} ORDER BY COLUMN_ID",
@@ -4789,19 +5168,7 @@ impl DamengSink {
         }
     }
 
-    async fn existing_table_comment(
-        &self,
-        schema: &str,
-        table_name: &str,
-    ) -> Result<Option<String>, String> {
-        let sql = Self::table_comment_sql(schema, table_name);
-        let rows = self.query(sql.as_str(), &[]).await?;
-        Ok(rows
-            .first()
-            .and_then(|row| row.get::<String>(0).ok())
-            .map(|comment| comment.trim().to_string()))
-    }
-
+    #[cfg(test)]
     fn table_comment_sql(schema: &str, table_name: &str) -> String {
         if schema.is_empty() {
             format!(
@@ -8775,7 +9142,9 @@ mod tests {
     use dameng_types::DmValue;
     use std::collections::{HashMap, HashSet};
 
-    use super::{DamengForeignKeyConstraintInfo, DamengParam, DamengSink};
+    use super::{
+        DamengDefaultMismatchSummary, DamengForeignKeyConstraintInfo, DamengParam, DamengSink,
+    };
 
     #[test]
     fn strips_numeric_schema_suffix_for_view_routes() {
@@ -9972,6 +10341,26 @@ mod tests {
     }
 
     #[test]
+    fn schema_metadata_sql_reads_schema_wide_metadata() {
+        let table_sql = DamengSink::schema_tables_metadata_sql("target_schema");
+        let combined_sql = DamengSink::schema_columns_and_comments_metadata_sql("target_schema");
+        let columns_sql = DamengSink::schema_columns_metadata_sql("target_schema");
+
+        assert!(table_sql.contains("FROM ALL_TABLES"));
+        assert!(table_sql.contains("(OWNER = 'target_schema' OR OWNER = 'TARGET_SCHEMA')"));
+        assert!(combined_sql.contains("FROM ALL_TAB_COLUMNS c"));
+        assert!(combined_sql.contains("LEFT JOIN ALL_COL_COMMENTS cc"));
+        assert!(combined_sql.contains("c.TABLE_NAME, c.COLUMN_NAME || CHR(31)"));
+        assert!(combined_sql.contains("ORDER BY c.TABLE_NAME, c.COLUMN_ID"));
+        assert!(combined_sql.contains("(c.OWNER = 'target_schema' OR c.OWNER = 'TARGET_SCHEMA')"));
+        assert!(!combined_sql.contains(" IN "));
+        assert!(columns_sql.contains("FROM ALL_TAB_COLUMNS"));
+        assert!(columns_sql.contains("TABLE_NAME, COLUMN_NAME || CHR(31)"));
+        assert!(columns_sql.contains("ORDER BY TABLE_NAME, COLUMN_ID"));
+        assert!(!columns_sql.contains(" IN "));
+    }
+
+    #[test]
     fn columns_metadata_sql_reads_one_row_per_column() {
         let sql = DamengSink::columns_metadata_sql("target_schema", "orders");
 
@@ -10017,6 +10406,25 @@ mod tests {
             256
         );
         assert!(row_cols.get("integraldeductitems").unwrap().nullable);
+    }
+
+    #[test]
+    fn default_mismatch_summary_limits_samples() {
+        let mut summary = DamengDefaultMismatchSummary::default();
+        let existing = "0".to_string();
+        for index in 0..25 {
+            summary.record(
+                "target.orders",
+                format!("col{}", index).as_str(),
+                Some(&existing),
+                Some("1".to_string()),
+            );
+        }
+
+        assert_eq!(summary.total, 25);
+        assert_eq!(summary.samples.len(), 20);
+        assert!(summary.samples[0].contains("col0"));
+        assert!(summary.samples[19].contains("col19"));
     }
 
     #[test]
