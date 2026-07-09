@@ -30,7 +30,9 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::process;
 use std::str::FromStr;
+use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, trace, warn};
 
@@ -44,6 +46,8 @@ const DAMENG_RANDOM_CHECK_BINARY_CHUNK_BYTES: usize = 1000;
 const DAMENG_RANDOM_CHECK_PAYLOAD_COLUMN_LIMIT: usize = 64;
 const DAMENG_RANDOM_CHECK_RESULT_FILE: &str = "/opt/fxm/datacheck-resule.log";
 const DEFAULT_DAMENG_INIT_INSERT_BATCH_ROWS: usize = 16;
+const DAMENG_CONNECTION_RETRY_MAX_ELAPSED_SECS: u64 = 300;
+const DAMENG_CONNECTION_RETRY_MAX_SLEEP_SECS: u64 = 30;
 
 #[derive(Debug, Clone)]
 enum DamengParam {
@@ -390,6 +394,7 @@ impl DamengSink {
         let client = Self::connect_client(&self.host, self.port, &self.username, &self.password)
             .map_err(|e| e.to_string())?;
         *self.client.lock().await = client;
+        self.clear_active_identity_insert_state().await;
         Ok(())
     }
 
@@ -5233,6 +5238,15 @@ impl DamengSink {
             || error.contains("io error")
     }
 
+    fn should_clear_identity_insert_after_disable_error(error: &str) -> bool {
+        Self::is_dameng_connection_error(error)
+    }
+
+    fn dameng_connection_retry_sleep_secs(loop_count: u32) -> u64 {
+        let shift = loop_count.saturating_sub(1).min(5);
+        (1u64 << shift).min(DAMENG_CONNECTION_RETRY_MAX_SLEEP_SECS)
+    }
+
     fn dameng_param_sql_literal(param: &DamengParam) -> String {
         match param {
             DamengParam::Null => "NULL".to_string(),
@@ -5291,32 +5305,59 @@ impl DamengSink {
     ) -> Result<(), String> {
         let key = Self::identity_insert_cache_key(table_key);
         let qualified_table = Self::qualified_table(schema, table_name);
-        let mut active = self.active_identity_insert_table.lock().await;
-        if active
-            .as_ref()
-            .is_some_and(|(active_key, _)| active_key == &key)
-        {
-            return Ok(());
-        }
+        let active_qualified_table = {
+            let active = self.active_identity_insert_table.lock().await;
+            if active
+                .as_ref()
+                .is_some_and(|(active_key, _)| active_key == &key)
+            {
+                return Ok(());
+            }
+            active
+                .as_ref()
+                .map(|(_, active_qualified_table)| active_qualified_table.clone())
+        };
 
-        if let Some((_, active_qualified_table)) = active.as_ref() {
+        if let Some(active_qualified_table) = active_qualified_table {
             self.set_identity_insert(active_qualified_table.as_str(), false)
                 .await?;
         }
         self.set_identity_insert(qualified_table.as_str(), true)
             .await?;
+        let mut active = self.active_identity_insert_table.lock().await;
         *active = Some((key, qualified_table));
         Ok(())
     }
 
     async fn disable_active_identity_insert(&self) -> Result<(), String> {
-        let mut active = self.active_identity_insert_table.lock().await;
-        if let Some((_, active_qualified_table)) = active.as_ref() {
-            self.set_identity_insert(active_qualified_table.as_str(), false)
-                .await?;
-            *active = None;
+        let active_qualified_table = {
+            let active = self.active_identity_insert_table.lock().await;
+            active
+                .as_ref()
+                .map(|(_, active_qualified_table)| active_qualified_table.clone())
+        };
+        let Some(active_qualified_table) = active_qualified_table else {
+            return Ok(());
+        };
+
+        match self
+            .set_identity_insert(active_qualified_table.as_str(), false)
+            .await
+        {
+            Ok(_) => {
+                self.clear_active_identity_insert_state().await;
+                Ok(())
+            }
+            Err(e) if Self::should_clear_identity_insert_after_disable_error(e.as_str()) => {
+                warn!(
+                    "Dameng identity_insert OFF failed after connection loss; clear stale session state: table={} error={}",
+                    active_qualified_table, e
+                );
+                self.clear_active_identity_insert_state().await;
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
-        Ok(())
     }
 
     async fn clear_active_identity_insert_state(&self) {
@@ -7080,6 +7121,55 @@ impl DamengSink {
 
 #[async_trait]
 impl Sink for DamengSink {
+    async fn flush_with_retry(&mut self, from_timer: &FlushByOperation) {
+        let mut loop_count = 0u32;
+        let mut connection_retry_elapsed_secs = 0u64;
+        loop {
+            loop_count += 1;
+            let sink_result = self.flush(from_timer).await;
+            if sink_result.is_ok() {
+                break;
+            }
+            let error = sink_result.expect_err("error not found");
+            if Self::is_dameng_connection_error(error.as_str()) {
+                if connection_retry_elapsed_secs >= DAMENG_CONNECTION_RETRY_MAX_ELAPSED_SECS {
+                    error!(
+                        "Dameng flush connection error exceeded retry window: elapsed={}s attempts={} error={}",
+                        connection_retry_elapsed_secs, loop_count, error
+                    );
+                    process::exit(1);
+                }
+                let remaining_secs = DAMENG_CONNECTION_RETRY_MAX_ELAPSED_SECS
+                    .saturating_sub(connection_retry_elapsed_secs);
+                let sleep_secs =
+                    Self::dameng_connection_retry_sleep_secs(loop_count).min(remaining_secs);
+                error!(
+                    "Dameng flush connection error, retrying after backoff: attempt={} elapsed={}s sleep={}s error={}",
+                    loop_count, connection_retry_elapsed_secs, sleep_secs, error
+                );
+                tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+                connection_retry_elapsed_secs =
+                    connection_retry_elapsed_secs.saturating_add(sleep_secs);
+                continue;
+            }
+
+            error!("error occurred {} loop_count: {}", error, loop_count);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if loop_count > 30 {
+                error!("flush error");
+                process::exit(1);
+            }
+        }
+        trace!("flush success");
+        match self.alter_flush().await {
+            Ok(_) => {}
+            Err(e) => {
+                error!("alter flush error: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
     async fn connect(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.client.lock().await.query("SELECT 1 FROM DUAL")?;
         info!("Connected to Dameng");
@@ -10034,6 +10124,9 @@ mod tests {
             "connection reset by peer"
         ));
         assert!(DamengSink::is_dameng_connection_error(
+            "IO error: Connection refused (os error 111)"
+        ));
+        assert!(DamengSink::is_dameng_connection_error(
             "protocol error: incomplete protocol data"
         ));
         assert!(DamengSink::is_random_check_payload_unstable_error(
@@ -10042,6 +10135,36 @@ mod tests {
         assert!(!DamengSink::is_dameng_connection_error(
             "query failed: -6602: duplicate key"
         ));
+    }
+
+    #[test]
+    fn identity_insert_disable_connection_error_clears_stale_state() {
+        assert!(
+            DamengSink::should_clear_identity_insert_after_disable_error(
+                "IO error: Broken pipe (os error 32)"
+            )
+        );
+        assert!(
+            DamengSink::should_clear_identity_insert_after_disable_error(
+                "IO error: Connection refused (os error 111)"
+            )
+        );
+        assert!(
+            !DamengSink::should_clear_identity_insert_after_disable_error(
+                "permission denied for SET IDENTITY_INSERT"
+            )
+        );
+    }
+
+    #[test]
+    fn dameng_connection_retry_backoff_is_capped() {
+        assert_eq!(DamengSink::dameng_connection_retry_sleep_secs(1), 1);
+        assert_eq!(DamengSink::dameng_connection_retry_sleep_secs(2), 2);
+        assert_eq!(DamengSink::dameng_connection_retry_sleep_secs(3), 4);
+        assert_eq!(DamengSink::dameng_connection_retry_sleep_secs(4), 8);
+        assert_eq!(DamengSink::dameng_connection_retry_sleep_secs(5), 16);
+        assert_eq!(DamengSink::dameng_connection_retry_sleep_secs(6), 30);
+        assert_eq!(DamengSink::dameng_connection_retry_sleep_secs(30), 30);
     }
 
     #[test]
