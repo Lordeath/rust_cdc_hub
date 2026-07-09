@@ -17,6 +17,7 @@ sink_config:
     password: SYSDBA
     database: TARGET_SCHEMA
     init_insert_batch_rows: 16  # 初始化数据写入时合并多行 INSERT，默认 16
+    flush_interval_secs: 5      # 定时 flush 间隔，默认 5 秒
 
 auto_create_database: true  # Dameng: creates target schema when missing
 auto_create_table: true

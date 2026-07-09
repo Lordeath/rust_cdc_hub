@@ -289,6 +289,7 @@ sink_config:
     password: SYSDBA
     database: TARGET_SCHEMA
     init_insert_batch_rows: 16
+    flush_interval_secs: 5
 
 auto_create_database: true  # Dameng: creates the target schema, not a physical database
 auto_create_table: true
@@ -298,7 +299,7 @@ random_check_data_after_init: false
 random_check_data_after_init_batch_size_min: 10
 ```
 
-Dameng uses a single-database, multi-schema model. `sink_config.database`/`sink_config.schema` is treated as the target schema; when `auto_create_database` is enabled, the sink runs `CREATE SCHEMA`, switches to that schema, and then creates tables/adds columns as needed. In multi mode, `database_route[].sink` is the target schema, and writes, table creation, column migration, and `IDENTITY_INSERT` state are isolated by target schema. `sink_config.init_insert_batch_rows` controls how many initialization rows are combined into each multi-row `INSERT`; it defaults to `16` and falls back to row-by-row writes if a batch insert fails. When `random_check_data_after_init` is enabled, every random-check startup first overwrites `/opt/fxm/datacheck-resule.log`; once checking starts, the file is overwritten again and appended with table-level results plus column mismatches.
+Dameng uses a single-database, multi-schema model. `sink_config.database`/`sink_config.schema` is treated as the target schema; when `auto_create_database` is enabled, the sink runs `CREATE SCHEMA`, switches to that schema, and then creates tables/adds columns as needed. In multi mode, `database_route[].sink` is the target schema, and writes, table creation, column migration, and `IDENTITY_INSERT` state are isolated by target schema. `sink_config.init_insert_batch_rows` controls how many initialization rows are combined into each multi-row `INSERT`; it defaults to `16`. `sink_config.flush_interval_secs` controls the timer flush interval and defaults to `5` seconds. Batch insert failures fall back to row-by-row writes. When `random_check_data_after_init` is enabled, every random-check startup first overwrites `/opt/fxm/datacheck-resule.log`; once checking starts, the file is overwritten again and appended with table-level results plus column mismatches.
 
 ### MySQL → Print example
 

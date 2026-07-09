@@ -2350,7 +2350,7 @@ fn add_flush_timer(
     let flush_interval_secs = config
         .first_sink("flush_interval_secs")
         .parse::<u64>()
-        .unwrap_or(1);
+        .unwrap_or(5);
     let sink_for_timer = sink.clone();
     let ui_state_for_timer = ui_state.clone();
     tokio::spawn(async move {

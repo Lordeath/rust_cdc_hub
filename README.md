@@ -290,6 +290,7 @@ sink_config:
     password: SYSDBA
     database: TARGET_SCHEMA
     init_insert_batch_rows: 16
+    flush_interval_secs: 5
 
 auto_create_database: true  # 达梦：自动创建目标 schema，不是物理数据库
 auto_create_table: true
@@ -299,7 +300,7 @@ random_check_data_after_init: false
 random_check_data_after_init_batch_size_min: 10
 ```
 
-达梦是单库多模式模型，`sink_config.database`/`sink_config.schema` 会作为目标 schema 使用；开启 `auto_create_database` 时会执行 `CREATE SCHEMA`，然后切换到该 schema 再自动建表/补列。多库模式下，`database_route[].sink` 表示目标 schema，写入、建表、补列和 `IDENTITY_INSERT` 状态都会按目标 schema 隔离。`sink_config.init_insert_batch_rows` 控制初始化数据写入时每条多行 `INSERT` 合并的行数，默认 `16`；批量写失败会退回逐行写入。开启 `random_check_data_after_init` 时，每次启动随机验证模式都会先覆盖写入 `/opt/fxm/datacheck-resule.log`，校验开始后再次覆盖并追加表级结果和字段差异。
+达梦是单库多模式模型，`sink_config.database`/`sink_config.schema` 会作为目标 schema 使用；开启 `auto_create_database` 时会执行 `CREATE SCHEMA`，然后切换到该 schema 再自动建表/补列。多库模式下，`database_route[].sink` 表示目标 schema，写入、建表、补列和 `IDENTITY_INSERT` 状态都会按目标 schema 隔离。`sink_config.init_insert_batch_rows` 控制初始化数据写入时每条多行 `INSERT` 合并的行数，默认 `16`；`sink_config.flush_interval_secs` 控制定时 flush 间隔，默认 `5` 秒；批量写失败会退回逐行写入。开启 `random_check_data_after_init` 时，每次启动随机验证模式都会先覆盖写入 `/opt/fxm/datacheck-resule.log`，校验开始后再次覆盖并追加表级结果和字段差异。
 
 ### MySQL → Print 示例
 
