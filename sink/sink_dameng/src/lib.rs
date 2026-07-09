@@ -7485,10 +7485,21 @@ impl DamengSink {
         Some((precision, scale))
     }
 
-    fn restore_failed_flush_batch(buffer: &mut Vec<DataBuffer>, failed_batch: &[DataBuffer]) {
+    fn restore_failed_flush_batch(
+        buffer: &mut Vec<DataBuffer>,
+        failed_batch: &[DataBuffer],
+        trigger: &str,
+    ) {
         if failed_batch.is_empty() {
             return;
         }
+        let existing_buffer_len = buffer.len();
+        warn!(
+            "Dameng flush failed; restored full batch to buffer: trigger={} restored_batch={} existing_buffer={}",
+            trigger,
+            failed_batch.len(),
+            existing_buffer_len
+        );
         if buffer.is_empty() {
             buffer.extend(failed_batch.iter().cloned());
             return;
@@ -7733,7 +7744,7 @@ impl Sink for DamengSink {
                         .with_label_values(&["dameng", "write"])
                         .inc();
                     let mut buf = self.buffer.lock().await;
-                    Self::restore_failed_flush_batch(&mut buf, &batch);
+                    Self::restore_failed_flush_batch(&mut buf, &batch, trigger.as_str());
                     flush_result = Err(e);
                     break;
                 }
@@ -7938,7 +7949,7 @@ impl Sink for DamengSink {
                     .with_label_values(&["dameng", "write"])
                     .inc();
                 let mut buf = self.buffer.lock().await;
-                Self::restore_failed_flush_batch(&mut buf, &batch);
+                Self::restore_failed_flush_batch(&mut buf, &batch, trigger.as_str());
                 flush_result = Err(e);
                 break;
             }
@@ -8163,7 +8174,7 @@ impl DamengSink {
         }
         self.delete_record_by_pk_value(schema, table_name, table_key, pk_name, old_pk)
             .await?;
-        self.insert_record(schema, table_name, table_key, pk_name, columns, record)
+        self.insert_or_update_record(schema, table_name, table_key, pk_name, columns, record)
             .await
     }
 
@@ -10645,7 +10656,7 @@ mod tests {
         ];
         let mut buffer = vec![update_record_with_pk(None, Some(Value::Int64(3)))];
 
-        DamengSink::restore_failed_flush_batch(&mut buffer, &failed_batch);
+        DamengSink::restore_failed_flush_batch(&mut buffer, &failed_batch, "Signal");
 
         let pk_values = buffer
             .iter()
@@ -10662,7 +10673,7 @@ mod tests {
         ];
         let mut buffer = Vec::new();
 
-        DamengSink::restore_failed_flush_batch(&mut buffer, &failed_batch);
+        DamengSink::restore_failed_flush_batch(&mut buffer, &failed_batch, "Signal");
 
         let pk_values = buffer
             .iter()
