@@ -7484,6 +7484,21 @@ impl DamengSink {
             .unwrap_or(0);
         Some((precision, scale))
     }
+
+    fn restore_failed_flush_batch(buffer: &mut Vec<DataBuffer>, failed_batch: &[DataBuffer]) {
+        if failed_batch.is_empty() {
+            return;
+        }
+        if buffer.is_empty() {
+            buffer.extend(failed_batch.iter().cloned());
+            return;
+        }
+
+        let mut restored = Vec::with_capacity(failed_batch.len() + buffer.len());
+        restored.extend(failed_batch.iter().cloned());
+        restored.append(buffer);
+        *buffer = restored;
+    }
 }
 
 #[async_trait]
@@ -7633,7 +7648,6 @@ impl Sink for DamengSink {
         let batch = std::mem::take(&mut *buf);
         drop(buf);
 
-        let mut cache_for_roll_back = Vec::with_capacity(batch.len());
         let mut flush_result = Ok(());
         let mut index = 0;
         while index < batch.len() {
@@ -7664,8 +7678,7 @@ impl Sink for DamengSink {
                 let records = &batch[index..end];
                 let columns =
                     Self::merge_dml_columns_with_records(&table_info, &base_columns, records);
-                for item in records {
-                    cache_for_roll_back.push(item.clone());
+                for _ in records {
                     SINK_EVENTS_TOTAL
                         .with_label_values(&["dameng", table_key.as_str(), "create"])
                         .inc();
@@ -7720,9 +7733,7 @@ impl Sink for DamengSink {
                         .with_label_values(&["dameng", "write"])
                         .inc();
                     let mut buf = self.buffer.lock().await;
-                    for cached_data_buffer in cache_for_roll_back {
-                        buf.push(cached_data_buffer);
-                    }
+                    Self::restore_failed_flush_batch(&mut buf, &batch);
                     flush_result = Err(e);
                     break;
                 }
@@ -7731,7 +7742,6 @@ impl Sink for DamengSink {
                 continue;
             }
 
-            cache_for_roll_back.push(record.clone());
             let op_str = match &record.op {
                 Operation::CREATE(_) => "create",
                 Operation::UPDATE => "update",
@@ -7928,9 +7938,7 @@ impl Sink for DamengSink {
                     .with_label_values(&["dameng", "write"])
                     .inc();
                 let mut buf = self.buffer.lock().await;
-                for cached_data_buffer in cache_for_roll_back {
-                    buf.push(cached_data_buffer);
-                }
+                Self::restore_failed_flush_batch(&mut buf, &batch);
                 flush_result = Err(e);
                 break;
             }
@@ -10627,6 +10635,40 @@ mod tests {
 
         assert!(!DamengSink::record_pk_changed("id", &same_record));
         assert!(!DamengSink::record_pk_changed("id", &missing_before));
+    }
+
+    #[test]
+    fn restore_failed_flush_batch_restores_whole_batch_before_existing_buffer() {
+        let failed_batch = vec![
+            update_record_with_pk(None, Some(Value::Int64(1))),
+            update_record_with_pk(None, Some(Value::Int64(2))),
+        ];
+        let mut buffer = vec![update_record_with_pk(None, Some(Value::Int64(3)))];
+
+        DamengSink::restore_failed_flush_batch(&mut buffer, &failed_batch);
+
+        let pk_values = buffer
+            .iter()
+            .map(|record| record.get_pk("id").resolve_string())
+            .collect::<Vec<_>>();
+        assert_eq!(pk_values, vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn restore_failed_flush_batch_restores_into_empty_buffer() {
+        let failed_batch = vec![
+            update_record_with_pk(None, Some(Value::Int64(1))),
+            update_record_with_pk(None, Some(Value::Int64(2))),
+        ];
+        let mut buffer = Vec::new();
+
+        DamengSink::restore_failed_flush_batch(&mut buffer, &failed_batch);
+
+        let pk_values = buffer
+            .iter()
+            .map(|record| record.get_pk("id").resolve_string())
+            .collect::<Vec<_>>();
+        assert_eq!(pk_values, vec!["1", "2"]);
     }
 
     #[test]
