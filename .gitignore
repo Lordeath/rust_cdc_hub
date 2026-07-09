@@ -38,3 +38,6 @@ config_example_mysql.yaml
 config_example_starrocks.yaml
 .trae
 .docker_temp*
+
+# Local secrets and deployment variables
+.env

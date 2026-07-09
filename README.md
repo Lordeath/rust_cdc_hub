@@ -455,6 +455,31 @@ docker run --name rust_cdc_hub --rm -it \
 
 如果未启用 `log_file`，日志仍只输出到 console，`/app/logs` 挂载不是必需的。
 
+本地测试或远端部署需要连接信息时，可以在仓库根目录维护一个不提交 Git 的 `.env`。先让环境变量生效，再执行变量化命令；例如：
+
+```sh
+set -a
+source .env
+set +a
+
+cd "$CDC_PROJECT_DIR" \
+  && docker build --network host -t "$CDC_IMAGE" -f "$CDC_DOCKERFILE" . \
+  && docker save -o "$CDC_ARCHIVE" "$CDC_IMAGE" \
+  && scp "$CDC_ARCHIVE" "$CDC_REMOTE:$CDC_REMOTE_ARCHIVE" \
+  && rm -f "$CDC_ARCHIVE" \
+  && ssh "$CDC_REMOTE" docker load -i "$CDC_REMOTE_ARCHIVE" \
+  && ssh "$CDC_REMOTE" docker rm -f "$CDC_CONTAINER" \
+  && ssh "$CDC_REMOTE" docker run -d --name "$CDC_CONTAINER" --network host \
+    -v "$CDC_REMOTE_ROOT:$CDC_REMOTE_ROOT" \
+    -v "$CDC_CHECKPOINT_DIR:/checkpoint" \
+    -e CONFIG_PATH="$CDC_CONFIG_PATH" \
+    -e TZ="$CDC_TZ" \
+    "$CDC_IMAGE" "$CDC_APP_ARGS" \
+  && ssh "$CDC_REMOTE" docker logs -f --tail=2000 "$CDC_CONTAINER"
+```
+
+同一个 `.env` 也可以放置 `MONGODB_URI` 等测试连接串；文档和示例不要写入真实密码。
+
 也可以直接挂载本地编译产物到基础镜像中运行：
 
 ```sh

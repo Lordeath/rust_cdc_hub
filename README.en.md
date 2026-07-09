@@ -416,6 +416,31 @@ docker run --name rust_cdc_hub --rm -it \
 
 If `log_file` is not enabled, logs are still written only to the console and mounting `/app/logs` is optional.
 
+For local testing or remote deployment, keep connection details in a root-level `.env` file that is not committed to Git. Load it before running the variable-based command:
+
+```sh
+set -a
+source .env
+set +a
+
+cd "$CDC_PROJECT_DIR" \
+  && docker build --network host -t "$CDC_IMAGE" -f "$CDC_DOCKERFILE" . \
+  && docker save -o "$CDC_ARCHIVE" "$CDC_IMAGE" \
+  && scp "$CDC_ARCHIVE" "$CDC_REMOTE:$CDC_REMOTE_ARCHIVE" \
+  && rm -f "$CDC_ARCHIVE" \
+  && ssh "$CDC_REMOTE" docker load -i "$CDC_REMOTE_ARCHIVE" \
+  && ssh "$CDC_REMOTE" docker rm -f "$CDC_CONTAINER" \
+  && ssh "$CDC_REMOTE" docker run -d --name "$CDC_CONTAINER" --network host \
+    -v "$CDC_REMOTE_ROOT:$CDC_REMOTE_ROOT" \
+    -v "$CDC_CHECKPOINT_DIR:/checkpoint" \
+    -e CONFIG_PATH="$CDC_CONFIG_PATH" \
+    -e TZ="$CDC_TZ" \
+    "$CDC_IMAGE" "$CDC_APP_ARGS" \
+  && ssh "$CDC_REMOTE" docker logs -f --tail=2000 "$CDC_CONTAINER"
+```
+
+The same `.env` can also contain test connection strings such as `MONGODB_URI`; do not write real passwords in committed docs or examples.
+
 You can also mount a locally built binary into a base image:
 
 ```sh
