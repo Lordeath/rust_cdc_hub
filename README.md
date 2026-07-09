@@ -140,6 +140,7 @@ export CONFIG_PATH=/path/to/config.yaml
 | `source_batch_size` | 否 | Source 批量读取/处理大小。 |
 | `sink_batch_size` | 否 | Sink 批量写入大小。 |
 | `checkpoint_file_path` | 否 | checkpoint 路径。未配置时使用 `/checkpoint/checkpoints.sqlite`；配置为目录时使用该目录下的 `checkpoints.sqlite`；配置为 `.db`/`.sqlite`/`.sqlite3` 文件时直接使用该文件。 |
+| `checkpoint_flush_interval_secs` | 否 | checkpoint 后台任务刷盘间隔，默认 `30` 秒；配置为 `0` 或不配置时使用默认值。 |
 | `log_level` | 否 | 日志级别，如 `debug`、`info`。 |
 | `log_file` | 否 | 文件日志配置。默认不启用；启用后会继续打印 console，并按日期或大小滚动写入文件。 |
 | `enable_ui` | 否 | 是否启用监控 UI，默认 `true`。 |
@@ -241,7 +242,7 @@ ui_port: 8080
 
 `log_file.enabled: true` 时，程序会写入 `/app/logs/rust_cdc_hub.log`，并按天或超过 `max_size_mb` 滚动；归档日志默认压缩为 `.gz`，同时受 `retention_days` 和 `max_backup_files` 限制。日志目录无法创建或写入时启动失败。
 
-checkpoint 使用 SQLite + WAL 持久化。首次启动 SQLite checkpoint 时，会自动扫描同目录旧版 `checkpoint_*.json` 文件并导入，旧 JSON 文件会保留作为回滚备份。运行中只在 sink flush 成功后批量提交已变化的位点，避免空 flush 反复重写所有 checkpoint。SQLite WAL 模式会在 checkpoint 文件旁产生 `-wal` 和 `-shm` 文件。
+checkpoint 使用 SQLite + WAL 持久化。首次启动 SQLite checkpoint 时，会自动扫描同目录旧版 `checkpoint_*.json` 文件并导入，旧 JSON 文件会保留作为回滚备份。运行中只有 `CheckpointService` 后台任务持有 SQLite 连接并执行写入；source/sink 只把已确认安全的表级 checkpoint 和 binlog stream checkpoint 提交到内存队列，由后台任务按 `checkpoint_flush_interval_secs` 合并后批量刷盘。无变化时不会写盘；长时间没有目标表数据但 binlog 持续推进时，stream checkpoint 会记录最近安全消费位点，避免重启后从很旧的表级 checkpoint 重新扫描大量无效 binlog。SQLite WAL 模式会在 checkpoint 文件旁产生 `-wal` 和 `-shm` 文件。状态页和 `/status` 会展示 checkpoint 后台任务的存活、dirty 数量、最近成功/失败和最后持久化位点。
 
 开启 `sync_stored_procedure` 后，MySQL/Dameng sink 初始化时会按源库到目标库的路由同步 `PROCEDURE` 和 `FUNCTION`。目标库已有同名对象且 `overwrite_stored_procedure: false` 时会跳过；设为 `true` 时，MySQL 目标端会先 `DROP PROCEDURE/FUNCTION IF EXISTS` 再重建，Dameng 目标端会使用 `CREATE OR REPLACE` 覆盖。同步前会从 `SHOW CREATE PROCEDURE/FUNCTION` 结果里去掉 `DEFINER=\`user\`@\`host\``，避免把源库用户带到目标库。MySQL → Dameng 会做基础 DMSQL 转换，复杂 MySQL 专有语法可能导致初始化失败并输出对象名和错误原因。
 

@@ -78,7 +78,8 @@ pub trait Sink: Send + Sync {
         match self.alter_flush().await {
             Ok(_) => {}
             Err(e) => {
-                error!("alter flush error: {}", e.to_string())
+                error!("alter flush error: {}", e.to_string());
+                process::exit(1);
             }
         }
     }
@@ -152,6 +153,7 @@ pub struct CdcConfig {
     pub source_batch_size: Option<usize>,
     pub sink_batch_size: Option<usize>,
     pub checkpoint_file_path: Option<String>,
+    pub checkpoint_flush_interval_secs: Option<u64>,
     pub log_level: Option<String>,
     pub log_file: Option<LogFileConfig>,
     pub enable_ui: Option<bool>,
@@ -2180,6 +2182,7 @@ mod tests {
             source_batch_size: None,
             sink_batch_size: None,
             checkpoint_file_path: None,
+            checkpoint_flush_interval_secs: None,
             log_level: None,
             log_file: None,
             enable_ui: None,

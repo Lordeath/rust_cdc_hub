@@ -1,6 +1,7 @@
 extern crate core;
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, http::header, web};
+use common::checkpoint_manager::{CheckpointServiceHandle, checkpoint_service_from_config};
 use common::metrics::APP_RESTART_COUNT;
 use common::runtime_progress;
 use common::{
@@ -204,13 +205,29 @@ struct UiState {
     source_restart_count: Arc<AtomicI64>,
     system_monitor: Arc<Mutex<System>>,
     process_pid: u32,
+    checkpoint_service: Option<CheckpointServiceHandle>,
 }
 
 impl UiState {
-    fn new(config: &CdcConfig) -> Self {
-        Self::new_with_started_at(config, Utc::now().timestamp())
+    fn new_with_checkpoint_service(
+        config: &CdcConfig,
+        checkpoint_service: CheckpointServiceHandle,
+    ) -> Self {
+        Self::new_with_started_at_and_checkpoint_service(
+            config,
+            Utc::now().timestamp(),
+            Some(checkpoint_service),
+        )
     }
+    #[cfg(test)]
     fn new_with_started_at(config: &CdcConfig, started_at: i64) -> Self {
+        Self::new_with_started_at_and_checkpoint_service(config, started_at, None)
+    }
+    fn new_with_started_at_and_checkpoint_service(
+        config: &CdcConfig,
+        started_at: i64,
+        checkpoint_service: Option<CheckpointServiceHandle>,
+    ) -> Self {
         let database_split = database_split_summary(config);
         let column_in_enabled = plugin_config(config, PluginType::ColumnIn).is_some();
         let log_file = config.log_file_config();
@@ -223,6 +240,7 @@ impl UiState {
             "source_batch_size": config.source_batch_size,
             "sink_batch_size": config.sink_batch_size,
             "checkpoint_file_path": config.checkpoint_file_path.clone(),
+            "checkpoint_flush_interval_secs": config.checkpoint_flush_interval_secs,
             "auto_create_database": config.auto_create_database.unwrap_or(true),
             "auto_create_table": config.auto_create_table.unwrap_or(true),
             "auto_add_column": config.auto_add_column.unwrap_or(true),
@@ -264,6 +282,7 @@ impl UiState {
                     .with_cpu(CpuRefreshKind::everything()),
             ))),
             process_pid: process::id(),
+            checkpoint_service,
         }
     }
 
@@ -343,6 +362,10 @@ impl UiState {
         let last_source_restart_at = self.last_source_restart_at.load(Ordering::Relaxed);
         let runtime_progress = runtime_progress::snapshot().await;
         let resources = self.resource_snapshot().await;
+        let checkpoint_service = match &self.checkpoint_service {
+            Some(checkpoint_service) => checkpoint_service.snapshot().await,
+            None => common::checkpoint_manager::CheckpointServiceSnapshot::disabled_for_tests(),
+        };
         let health_status = if last_source_error.is_some() {
             "degraded"
         } else if runtime_progress.initializing {
@@ -367,6 +390,7 @@ impl UiState {
             "last_source_error": last_source_error,
             "runtime_progress": runtime_progress,
             "resources": resources,
+            "checkpoint_service": checkpoint_service,
             "split_mode": split_snapshot.clone(),
             "database_split": split_snapshot.clone(),
             "links": {
@@ -1462,6 +1486,17 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     </section>
 
     <section class="card section" style="margin-top:16px">
+      <h2 data-i18n="checkpoint_service">Checkpoint 后台任务</h2>
+      <div class="progress-grid">
+        <div class="progress-box"><div class="label" data-i18n="service_state">服务状态</div><div class="value" id="checkpointServiceState">-</div><div class="hint" id="checkpointLastHeartbeat">heartbeat: -</div></div>
+        <div class="progress-box"><div class="label" data-i18n="checkpoint_flush_count">刷盘次数 / 失败</div><div class="value" id="checkpointFlushCount">-</div><div class="hint" id="checkpointLastSuccess">last success: -</div></div>
+        <div class="progress-box"><div class="label" data-i18n="dirty_items">待持久化</div><div class="value" id="checkpointDirty">-</div><div class="hint" id="checkpointInterval">interval: -</div></div>
+        <div class="progress-box"><div class="label" data-i18n="last_position">最后持久化位点</div><div class="value compact" id="checkpointLastPosition">-</div><div class="hint" id="checkpointSqlitePath">sqlite: -</div></div>
+      </div>
+      <div id="checkpointErrorBox" class="error-box empty" data-i18n="no_checkpoint_error">暂无 checkpoint 错误</div>
+    </section>
+
+    <section class="card section" style="margin-top:16px">
       <h2 data-i18n="sync_progress">数据同步进度</h2>
       <div class="progress-grid">
         <div class="progress-box"><div class="label" data-i18n="current_status">当前状态</div><div class="value" id="progressState">-</div></div>
@@ -1518,6 +1553,12 @@ const translations = {
     trim_memory_done: '回收完成',
     trim_memory_unsupported: '当前平台不支持',
     trim_memory_failed: '内存回收失败',
+    checkpoint_service: 'Checkpoint 后台任务',
+    service_state: '服务状态',
+    checkpoint_flush_count: '刷盘次数 / 失败',
+    dirty_items: '待持久化',
+    last_position: '最后持久化位点',
+    no_checkpoint_error: '暂无 checkpoint 错误',
     sync_progress: '数据同步进度',
     current_status: '当前状态',
     current_table: '当前表',
@@ -1561,6 +1602,7 @@ const translations = {
     status_initializing: '初始化中',
     status_degraded: '异常',
     status_unknown: '未知',
+    status_stopped: '已停止',
     status_ui_error: '界面错误',
     phase_running: '运行中',
     phase_initializing: '初始化中',
@@ -1603,6 +1645,12 @@ const translations = {
     trim_memory_done: 'Trim completed',
     trim_memory_unsupported: 'Unsupported on this platform',
     trim_memory_failed: 'Memory trim failed',
+    checkpoint_service: 'Checkpoint Service',
+    service_state: 'Service State',
+    checkpoint_flush_count: 'Flushes / Errors',
+    dirty_items: 'Dirty Items',
+    last_position: 'Last Persisted Position',
+    no_checkpoint_error: 'No checkpoint errors',
     sync_progress: 'Data Sync Progress',
     current_status: 'Current Status',
     current_table: 'Current Table',
@@ -1646,6 +1694,7 @@ const translations = {
     status_initializing: 'Initializing',
     status_degraded: 'Degraded',
     status_unknown: 'Unknown',
+    status_stopped: 'Stopped',
     status_ui_error: 'UI Error',
     phase_running: 'Running',
     phase_initializing: 'Initializing',
@@ -1886,6 +1935,21 @@ function renderResources(resources) {
   setText('processMemory', fmtBytes(processInfo.memory_bytes));
   setText('processPid', `pid: ${processInfo.pid ?? '-'}`);
 }
+function renderCheckpointService(service) {
+  const state = service || {};
+  setText('checkpointServiceState', state.running ? t('status_running') : t('status_stopped'));
+  setText('checkpointLastHeartbeat', `heartbeat: ${fmtTs(state.last_heartbeat_at)}`);
+  setText('checkpointFlushCount', `${state.flush_count ?? 0} / ${state.flush_error_count ?? 0}`);
+  setText('checkpointLastSuccess', `last success: ${fmtTs(state.last_flush_succeeded_at)}`);
+  setText('checkpointDirty', `${state.dirty_table_count ?? 0} table / ${state.dirty_stream_count ?? 0} stream`);
+  setText('checkpointInterval', `interval: ${state.flush_interval_secs ?? '-'}s`);
+  const pos = state.last_persisted_position;
+  setText('checkpointLastPosition', pos ? `${pos.kind || '-'} ${pos.binlog_filename || '-'}/${pos.binlog_position ?? '-'}` : '-');
+  setText('checkpointSqlitePath', `sqlite: ${state.sqlite_path || '-'}`);
+  const errBox = el('checkpointErrorBox');
+  errBox.textContent = state.last_error || t('no_checkpoint_error');
+  errBox.classList.toggle('empty', !state.last_error);
+}
 async function trimMemory() {
   const button = el('memoryTrimButton');
   const resultBox = el('memoryTrimResult');
@@ -1940,6 +2004,7 @@ function renderStatusData(data) {
     setText('progressReadSynced', `${progressRead} / ${progressSynced}`);
     setText('progressFiltered', progressFiltered);
     renderResources(data.resources);
+    renderCheckpointService(data.checkpoint_service);
     renderInitializationTiming(progress, data.now);
     renderColumnInFilters(cfg, progress);
     renderSyncProgressTable(progressTables, data.now);
@@ -1954,6 +2019,7 @@ function renderStatusData(data) {
       kvRow('Source batch size', cfg.source_batch_size),
       kvRow('Sink batch size', cfg.sink_batch_size),
       kvRow(t('checkpoint_path'), cfg.checkpoint_file_path),
+      kvRow('Checkpoint flush interval', cfg.checkpoint_flush_interval_secs),
       kvRow(t('auto_create_database'), cfg.auto_create_database),
       kvRow(t('auto_create_table'), cfg.auto_create_table),
       kvRow(t('auto_add_column'), cfg.auto_add_column),
@@ -2060,7 +2126,8 @@ async fn main() {
         panic!("{}", e);
     }
     reset_random_check_result_file_on_start(&config);
-    let ui_state = UiState::new(&config);
+    let checkpoint_service = checkpoint_service_from_config(&config).await;
+    let ui_state = UiState::new_with_checkpoint_service(&config, checkpoint_service.clone());
     if config.enable_ui.unwrap_or(true) {
         let bind = config.ui_bind.clone().unwrap_or("0.0.0.0".to_string());
         let port = resolve_ui_port(&config, ui_port_from_env());
@@ -2076,12 +2143,14 @@ async fn main() {
             })
             .expect("spawn ui-server thread failed");
     }
-    let mut source: Arc<Mutex<dyn Source>> = SourceFactory::create_source(&config).await;
+    let mut source: Arc<Mutex<dyn Source>> =
+        SourceFactory::create_source(&config, checkpoint_service.clone()).await;
     add_plugin(&config, &source).await;
     info!("成功创建source");
     let table_info_list = source.lock().await.get_table_info().await;
     ui_state.set_table_info_list(table_info_list.clone()).await;
-    let mut sink = SinkFactory::create_sink(&config, table_info_list).await;
+    let mut sink =
+        SinkFactory::create_sink(&config, table_info_list, checkpoint_service.clone()).await;
     info!("成功创建sink");
     if let Err(e) = sink.lock().await.connect().await {
         error!("Failed to connect to sink: {}", e);
@@ -2115,12 +2184,13 @@ async fn main() {
             // 添加重试间隔，避免立即重试导致资源耗尽
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             // 重新创建source获取表信息
-            source = SourceFactory::create_source(&config).await;
+            source = SourceFactory::create_source(&config, checkpoint_service.clone()).await;
             add_plugin(&config, &source).await;
             let table_info_list = source.lock().await.get_table_info().await;
             ui_state.set_table_info_list(table_info_list.clone()).await;
             // 重新创建sink并连接
-            sink = SinkFactory::create_sink(&config, table_info_list).await;
+            sink = SinkFactory::create_sink(&config, table_info_list, checkpoint_service.clone())
+                .await;
             if let Err(e) = sink.lock().await.connect().await {
                 error!("Failed to connect to sink: {}", e);
                 panic!("Failed to connect to sink: {}", e);
@@ -2401,6 +2471,8 @@ plugins:
                 pk_column: "id".to_string(),
                 create_table_sql: "".to_string(),
                 columns: vec!["id".to_string(), "project_id".to_string()],
+                table_comment: String::new(),
+                indexes: vec![],
                 foreign_keys: vec![],
             },
             TableInfoVo {
@@ -2414,6 +2486,8 @@ plugins:
                     "project_id".to_string(),
                     "tenant_id".to_string(),
                 ],
+                table_comment: String::new(),
+                indexes: vec![],
                 foreign_keys: vec![],
             },
         ]
@@ -2665,6 +2739,23 @@ plugins:
                 .get("initialization_finished_at")
                 .is_some()
         );
+        let checkpoint_service = v.get("checkpoint_service").unwrap();
+        assert_eq!(
+            checkpoint_service
+                .get("running")
+                .unwrap()
+                .as_bool()
+                .unwrap(),
+            false
+        );
+        assert!(
+            checkpoint_service
+                .get("flush_interval_secs")
+                .unwrap()
+                .is_number()
+        );
+        assert!(checkpoint_service.get("dirty_table_count").is_some());
+        assert!(checkpoint_service.get("dirty_stream_count").is_some());
         assert_eq!(
             v.get("database_split")
                 .unwrap()
@@ -2829,6 +2920,9 @@ plugins:
         assert!(s.contains("memoryTrimButton"));
         assert!(s.contains("function trimMemory"));
         assert!(s.contains("api/admin/memory/trim"));
+        assert!(s.contains("Checkpoint 后台任务"));
+        assert!(s.contains("checkpointServiceState"));
+        assert!(s.contains("function renderCheckpointService"));
         assert!(s.contains("tableSortState"));
         assert!(s.contains("syncProgress: { key: 'last_event_at', dir: 'desc' }"));
         assert!(s.contains("function setTableSort"));

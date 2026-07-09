@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use common::case_insensitive_hash_map::{
     CaseInsensitiveHashMapTableInfoVo, CaseInsensitiveHashMapVecString,
 };
-use common::checkpoint_manager::{CheckpointManager, checkpoint_manager_from_config};
+use common::checkpoint_manager::CheckpointServiceHandle;
 use common::metrics::{SINK_EVENTS_TOTAL, SINK_FLUSH_DURATION_SECONDS, SINK_FLUSH_ERRORS_TOTAL};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::schema::{
@@ -30,7 +30,6 @@ use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::str::FromStr;
-use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, trace, warn};
 
@@ -172,7 +171,7 @@ pub struct DamengSink {
     table_info_cache: Mutex<CaseInsensitiveHashMapTableInfoVo>,
     columns_cache: Mutex<CaseInsensitiveHashMapVecString>,
     checkpoint: Mutex<HashMap<String, MysqlCheckPointDetailEntity>>,
-    checkpoint_manager: Arc<dyn CheckpointManager>,
+    checkpoint_service: CheckpointServiceHandle,
     identity_insert_tables: Mutex<HashSet<String>>,
     init_upsert_first_tables: Mutex<HashSet<String>>,
     active_identity_insert_table: Mutex<Option<(String, String)>>,
@@ -209,7 +208,11 @@ impl DamengSink {
         }
     }
 
-    pub async fn new(config: &CdcConfig, table_info_list: Vec<TableInfoVo>) -> Self {
+    pub async fn new(
+        config: &CdcConfig,
+        table_info_list: Vec<TableInfoVo>,
+        checkpoint_service: CheckpointServiceHandle,
+    ) -> Self {
         let host = config.first_sink_not_blank("host");
         let port = config.first_sink("port").parse::<u16>().unwrap_or(5236);
         let username = config.first_sink_not_blank("username");
@@ -262,7 +265,7 @@ impl DamengSink {
             table_info_cache: Mutex::new(CaseInsensitiveHashMapTableInfoVo::new_with_no_arg()),
             columns_cache: Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg()),
             checkpoint: Mutex::new(HashMap::new()),
-            checkpoint_manager: checkpoint_manager_from_config(config).await,
+            checkpoint_service,
             identity_insert_tables: Mutex::new(HashSet::new()),
             init_upsert_first_tables: Mutex::new(HashSet::new()),
             active_identity_insert_table: Mutex::new(None),
@@ -7350,7 +7353,9 @@ impl Sink for DamengSink {
         if entries.is_empty() {
             return Ok(());
         }
-        self.checkpoint_manager.save_many(&entries).await?;
+        self.checkpoint_service
+            .record_table_applied_many(entries)
+            .await?;
         self.checkpoint.lock().await.clear();
         trace!("Dameng alter flush done");
         Ok(())

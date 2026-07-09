@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use common::case_insensitive_hash_map::{
     CaseInsensitiveHashMapTableInfoVo, CaseInsensitiveHashMapVecString,
 };
-use common::checkpoint_manager::{CheckpointManager, checkpoint_manager_from_config};
+use common::checkpoint_manager::CheckpointServiceHandle;
 use common::metrics::{SINK_EVENTS_TOTAL, SINK_FLUSH_DURATION_SECONDS, SINK_FLUSH_ERRORS_TOTAL};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::schema::{
@@ -24,7 +24,6 @@ use sqlx::{Executor, MySql, Pool, Row};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
-use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tracing::log::trace;
@@ -46,11 +45,15 @@ pub struct MySqlSink {
     columns_cache: Mutex<CaseInsensitiveHashMapVecString>,
     // pk_cache: Mutex<CaseInsensitiveHashMapVecString>,
     checkpoint: Mutex<HashMap<String, MysqlCheckPointDetailEntity>>,
-    checkpoint_manager: Arc<dyn CheckpointManager>,
+    checkpoint_service: CheckpointServiceHandle,
 }
 
 impl MySqlSink {
-    pub async fn new(config: &CdcConfig, table_info_list: Vec<TableInfoVo>) -> Self {
+    pub async fn new(
+        config: &CdcConfig,
+        table_info_list: Vec<TableInfoVo>,
+        checkpoint_service: CheckpointServiceHandle,
+    ) -> Self {
         if let Err(e) = Self::validate_merged_target_schema(&table_info_list) {
             panic!("{}", e);
         }
@@ -280,7 +283,7 @@ impl MySqlSink {
             columns_cache: Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg()),
             // pk_cache: Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg()),
             checkpoint: Mutex::new(HashMap::new()),
-            checkpoint_manager: checkpoint_manager_from_config(config).await,
+            checkpoint_service,
         }
     }
 
@@ -1867,7 +1870,9 @@ impl Sink for MySqlSink {
         if entries.is_empty() {
             return Ok(());
         }
-        self.checkpoint_manager.save_many(&entries).await?;
+        self.checkpoint_service
+            .record_table_applied_many(entries)
+            .await?;
         self.checkpoint.lock().await.clear();
         trace!("alter flush done");
         Ok(())

@@ -3,7 +3,7 @@ mod starrocks_client;
 use crate::starrocks_client::StarrocksClient;
 use async_trait::async_trait;
 use common::case_insensitive_hash_map::CaseInsensitiveHashMap;
-use common::checkpoint_manager::{CheckpointManager, checkpoint_manager_from_config};
+use common::checkpoint_manager::CheckpointServiceHandle;
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::schema::{
     extract_mysql_create_table_column_definitions, mysql_column_allows_null_from_definition,
@@ -13,7 +13,6 @@ use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfo
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::log::trace;
 use tracing::{error, info, warn};
@@ -42,7 +41,7 @@ pub struct StarrocksSink {
     pks_cache: Mutex<HashMap<String, Vec<String>>>,
 
     checkpoint: Mutex<HashMap<String, MysqlCheckPointDetailEntity>>,
-    checkpoint_manager: Arc<dyn CheckpointManager>,
+    checkpoint_service: CheckpointServiceHandle,
 }
 
 impl StarrocksSink {
@@ -81,7 +80,11 @@ impl StarrocksSink {
         }
         Ok(values)
     }
-    pub async fn new(config: &CdcConfig, table_info_list: Vec<TableInfoVo>) -> Self {
+    pub async fn new(
+        config: &CdcConfig,
+        table_info_list: Vec<TableInfoVo>,
+        checkpoint_service: CheckpointServiceHandle,
+    ) -> Self {
         let username = config.first_sink_not_blank("username");
         let password = config.first_sink_not_blank("password");
         let host = config.first_sink_not_blank("host");
@@ -124,7 +127,7 @@ impl StarrocksSink {
             columns_cache: Mutex::new(HashMap::new()),
             pks_cache: Mutex::new(HashMap::new()),
             checkpoint: Mutex::new(HashMap::new()),
-            checkpoint_manager: checkpoint_manager_from_config(config).await,
+            checkpoint_service,
         }
     }
 
@@ -629,7 +632,9 @@ impl Sink for StarrocksSink {
         if entries.is_empty() {
             return Ok(());
         }
-        self.checkpoint_manager.save_many(&entries).await?;
+        self.checkpoint_service
+            .record_table_applied_many(entries)
+            .await?;
         self.checkpoint.lock().await.clear();
         Ok(())
     }

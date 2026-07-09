@@ -1,25 +1,28 @@
 use async_trait::async_trait;
-use common::checkpoint_manager::{CheckpointManager, checkpoint_manager_from_config};
+use common::checkpoint_manager::CheckpointServiceHandle;
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::{CdcConfig, DataBuffer, FlushByOperation, Sink, TableInfoVo};
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
 
 pub struct PrintSink {
     config: CdcConfig,
     checkpoint: Mutex<HashMap<String, MysqlCheckPointDetailEntity>>,
-    checkpoint_manager: Arc<dyn CheckpointManager>,
+    checkpoint_service: CheckpointServiceHandle,
 }
 
 impl PrintSink {
-    pub async fn new(config: &CdcConfig, _table_info_list: Vec<TableInfoVo>) -> Self {
+    pub async fn new(
+        config: &CdcConfig,
+        _table_info_list: Vec<TableInfoVo>,
+        checkpoint_service: CheckpointServiceHandle,
+    ) -> Self {
         PrintSink {
             config: config.clone(),
             checkpoint: Mutex::new(HashMap::new()),
-            checkpoint_manager: checkpoint_manager_from_config(config).await,
+            checkpoint_service,
         }
     }
 }
@@ -62,7 +65,9 @@ impl Sink for PrintSink {
         if entries.is_empty() {
             return Ok(());
         }
-        self.checkpoint_manager.save_many(&entries).await?;
+        self.checkpoint_service
+            .record_table_applied_many(entries)
+            .await?;
         self.checkpoint.lock().await.clear();
         Ok(())
     }

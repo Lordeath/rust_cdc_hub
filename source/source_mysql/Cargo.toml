@@ -13,3 +13,4 @@ sqlx = { version = "0.8.6", default-features = false, features = ["mysql", "tls-
 serde = { version = "1.0.228", features = ["derive"] }
 tracing = "0.1"
 regex = "1.12.3"
+md5 = "0.8"

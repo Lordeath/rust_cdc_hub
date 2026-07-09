@@ -1,11 +1,10 @@
 use async_trait::async_trait;
-use common::checkpoint_manager::{CheckpointManager, checkpoint_manager_from_config};
+use common::checkpoint_manager::CheckpointServiceHandle;
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo};
 use meilisearch_sdk::client::Client;
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
 
@@ -21,11 +20,15 @@ pub struct MeiliSearchSink {
     buffer: Mutex<Vec<DataBuffer>>,
     initialized: RwLock<bool>,
     checkpoint: Mutex<HashMap<String, MysqlCheckPointDetailEntity>>,
-    checkpoint_manager: Arc<dyn CheckpointManager>,
+    checkpoint_service: CheckpointServiceHandle,
 }
 
 impl MeiliSearchSink {
-    pub async fn new(config: &CdcConfig, _table_info_list: Vec<TableInfoVo>) -> Self {
+    pub async fn new(
+        config: &CdcConfig,
+        _table_info_list: Vec<TableInfoVo>,
+        checkpoint_service: CheckpointServiceHandle,
+    ) -> Self {
         let meili_url = config.first_sink("meili_url");
         let meili_master_key = config.first_sink("meili_master_key");
         let meili_table_name = config.first_sink("table_name");
@@ -42,7 +45,7 @@ impl MeiliSearchSink {
             buffer: Mutex::new(Vec::with_capacity(BATCH_SIZE)),
             initialized: RwLock::new(false),
             checkpoint: Mutex::new(HashMap::new()),
-            checkpoint_manager: checkpoint_manager_from_config(config).await,
+            checkpoint_service,
         }
     }
 }
@@ -186,7 +189,9 @@ impl Sink for MeiliSearchSink {
         if entries.is_empty() {
             return Ok(());
         }
-        self.checkpoint_manager.save_many(&entries).await?;
+        self.checkpoint_service
+            .record_table_applied_many(entries)
+            .await?;
         self.checkpoint.lock().await.clear();
         Ok(())
     }
