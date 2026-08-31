@@ -23,7 +23,7 @@ use chrono::Local;
 use chrono::Utc;
 use plugin::PluginFactory;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{env, fs, io, process};
 use tokio::time::sleep;
 use tracing::subscriber::set_global_default;
@@ -36,6 +36,8 @@ use wattle_appender::FileAppender;
 const DEFAULT_UI_PORT: u16 = 18088;
 const DAMENG_RANDOM_CHECK_RESULT_FILE: &str = "/opt/fxm/datacheck-resule.log";
 const BYTES_PER_MB: u64 = 1024 * 1024;
+const MAX_SOURCE_RETRY_TIMES: u32 = 30;
+const STABLE_SOURCE_RUN_RESET_SECS: u64 = 300;
 
 #[cfg(target_os = "linux")]
 unsafe extern "C" {
@@ -2268,12 +2270,13 @@ async fn main() {
     info!("成功增加flush timer");
     let mut retry_times = 0;
     loop {
+        let source_run_started_at = Instant::now();
         let start_result = source.lock().await.start(sink.clone()).await;
         if let Err(e) = start_result {
-            retry_times += 1;
-            if retry_times >= 30 {
+            retry_times = next_source_retry_count(retry_times, source_run_started_at.elapsed());
+            if let Some(exit_code) = source_retry_exit_code(retry_times) {
                 error!("重试次数过多，程序退出: {}", retry_times);
-                break;
+                process::exit(exit_code);
             }
             *ui_state.last_source_error.lock().await = Some(e.message.clone());
             ui_state
@@ -2308,6 +2311,18 @@ async fn main() {
         }
     }
     info!("程序结束");
+}
+
+fn next_source_retry_count(current: u32, source_run_duration: Duration) -> u32 {
+    if source_run_duration >= Duration::from_secs(STABLE_SOURCE_RUN_RESET_SECS) {
+        1
+    } else {
+        current.saturating_add(1)
+    }
+}
+
+fn source_retry_exit_code(retry_times: u32) -> Option<i32> {
+    (retry_times >= MAX_SOURCE_RETRY_TIMES).then_some(1)
 }
 
 async fn add_plugin(config: &CdcConfig, source: &Arc<Mutex<dyn Source>>) {
@@ -2351,7 +2366,7 @@ fn add_flush_timer(
         .first_sink("flush_interval_secs")
         .parse::<u64>()
         .unwrap_or(5);
-    let sink_for_timer = sink.clone();
+    let sink_for_timer = Arc::downgrade(sink);
     let ui_state_for_timer = ui_state.clone();
     tokio::spawn(async move {
         info!("Sink Timer started ({}s window).", flush_interval_secs);
@@ -2360,14 +2375,17 @@ fn add_flush_timer(
         loop {
             // 等待时间窗口到达
             sleep(timer_interval).await;
+            let Some(sink) = sink_for_timer.upgrade() else {
+                info!("Sink Timer stopped because sink was replaced.");
+                break;
+            };
             ui_state_for_timer
                 .last_timer_flush_at
                 .store(Utc::now().timestamp(), Ordering::Relaxed);
             ui_state_for_timer
                 .timer_flush_count
                 .fetch_add(1, Ordering::Relaxed);
-            sink_for_timer
-                .lock()
+            sink.lock()
                 .await
                 .flush_with_retry(&FlushByOperation::Timer)
                 .await;
@@ -2496,6 +2514,39 @@ impl FormatTime for CustomTime {
 mod tests {
     use super::*;
     use actix_web::{body::to_bytes, http::StatusCode, test as actix_test};
+
+    #[tokio::test]
+    async fn flush_timer_does_not_keep_replaced_sink_alive() {
+        let cfg = test_config();
+        let sink = SinkFactory::create_sink(
+            &cfg,
+            Vec::new(),
+            CheckpointServiceHandle::disabled_for_tests(),
+        )
+        .await;
+        let weak_sink = Arc::downgrade(&sink);
+
+        add_flush_timer(&cfg, &sink, UiState::new_with_started_at(&cfg, 0));
+        drop(sink);
+
+        assert!(
+            weak_sink.upgrade().is_none(),
+            "被替换的 sink 不应被旧 flush timer 持有"
+        );
+    }
+
+    #[test]
+    fn retry_exhaustion_uses_non_zero_exit_code() {
+        assert_eq!(source_retry_exit_code(MAX_SOURCE_RETRY_TIMES), Some(1));
+    }
+
+    #[test]
+    fn retry_count_resets_after_stable_source_run() {
+        assert_eq!(
+            next_source_retry_count(12, Duration::from_secs(STABLE_SOURCE_RUN_RESET_SECS)),
+            1
+        );
+    }
 
     fn test_config() -> CdcConfig {
         serde_yaml::from_str(

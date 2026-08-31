@@ -2433,6 +2433,51 @@ fn compute_resume_position(
     ResumePosition::BinlogPosition(file, pos)
 }
 
+fn compute_resume_position_after_initialization(
+    runtime_binlog_filename: Option<&str>,
+    runtime_binlog_position: Option<u32>,
+    stream_checkpoint: Option<&StreamCheckpoint>,
+    checkpoints: &HashMap<String, MysqlCheckPointDetailEntity>,
+    initialization_happened: bool,
+) -> ResumePosition {
+    if !initialization_happened
+        || matches!(
+            (runtime_binlog_filename, runtime_binlog_position),
+            (Some(file), Some(position)) if !file.is_empty() && position > 0
+        )
+    {
+        return compute_resume_position(
+            runtime_binlog_filename,
+            runtime_binlog_position,
+            stream_checkpoint,
+            checkpoints,
+        );
+    }
+
+    let mut positions = checkpoints
+        .values()
+        .filter_map(|checkpoint| {
+            (!checkpoint.last_binlog_filename.is_empty() && checkpoint.last_binlog_position > 0)
+                .then(|| {
+                    (
+                        checkpoint.last_binlog_filename.clone(),
+                        checkpoint.last_binlog_position,
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    if let Some(stream) = stream_checkpoint
+        && !stream.binlog_filename.is_empty()
+        && stream.binlog_position > 0
+    {
+        positions.push((stream.binlog_filename.clone(), stream.binlog_position));
+    }
+    let Some((file, position)) = positions.into_iter().min() else {
+        return ResumePosition::Latest;
+    };
+    ResumePosition::BinlogPosition(file, position)
+}
+
 fn should_ignore_read_error(message: &str) -> bool {
     let msg = message.to_ascii_lowercase();
     msg.contains("timeout") || msg.contains("timed out")
@@ -2599,11 +2644,12 @@ impl Source for MySQLSource {
                     .get(stream_index)
                     .cloned()
                     .flatten();
-                let resume_position = compute_resume_position(
+                let resume_position = compute_resume_position_after_initialization(
                     group.start_binlog_filename.as_deref(),
                     group.start_binlog_position,
                     stream_checkpoint.as_ref(),
                     &group_checkpoints,
+                    any_initialized,
                 );
                 let start_position = match resume_position {
                     ResumePosition::Latest => StartPosition::Latest,
@@ -3072,19 +3118,26 @@ impl Source for MySQLSource {
                                             }),
                                         )
                                         .await;
-                                        let plugin_data =
-                                            detail_with_plugin(&plugins, data_buffer).await;
-                                        if let Ok(item) = plugin_data {
-                                            Self::write_record_with_retry(
-                                                &mut sink,
-                                                &item,
-                                                Some(event_checkpoint_entity.clone()),
-                                            )
-                                            .await;
-                                            runtime_progress::record_synced(&progress_label).await;
-                                        } else {
-                                            runtime_progress::record_filtered(&progress_label)
+                                        let sink_records = pk_column
+                                            .as_deref()
+                                            .map(|pk| data_buffer.sink_records_for_primary_key(pk))
+                                            .unwrap_or_else(|| vec![data_buffer]);
+                                        for sink_record in sink_records {
+                                            let plugin_data =
+                                                detail_with_plugin(&plugins, sink_record).await;
+                                            if let Ok(item) = plugin_data {
+                                                Self::write_record_with_retry(
+                                                    &mut sink,
+                                                    &item,
+                                                    Some(event_checkpoint_entity.clone()),
+                                                )
                                                 .await;
+                                                runtime_progress::record_synced(&progress_label)
+                                                    .await;
+                                            } else {
+                                                runtime_progress::record_filtered(&progress_label)
+                                                    .await;
+                                            }
                                         }
                                     }
 
@@ -3917,6 +3970,37 @@ mod tests {
         assert_eq!(
             rp,
             ResumePosition::BinlogPosition("mysql-bin.000012".to_string(), 4)
+        );
+    }
+
+    #[test]
+    fn initialization_resumes_from_earliest_safe_checkpoint() {
+        let mut checkpoints = HashMap::new();
+        checkpoints.insert(
+            "existing".to_string(),
+            mk_entity(false, "mysql-bin.000010", 120, "existing"),
+        );
+        checkpoints.insert(
+            "new_table".to_string(),
+            mk_entity(false, "mysql-bin.000012", 4, "new_table"),
+        );
+        let stream_checkpoint = StreamCheckpoint::new(
+            "mysql:1:abc".to_string(),
+            "mysql-bin.000010".to_string(),
+            120,
+        );
+
+        let rp = compute_resume_position_after_initialization(
+            None,
+            None,
+            Some(&stream_checkpoint),
+            &checkpoints,
+            true,
+        );
+
+        assert_eq!(
+            rp,
+            ResumePosition::BinlogPosition("mysql-bin.000010".to_string(), 120)
         );
     }
 

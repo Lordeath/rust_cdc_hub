@@ -13,6 +13,22 @@ pub struct StarrocksClient {
     pub mysql_pool: Pool<MySql>,
 }
 impl StarrocksClient {
+    fn stream_load_trace(
+        url: &str,
+        username: &str,
+        _password: &str,
+        columns: &str,
+        body: &str,
+    ) -> String {
+        format!(
+            "StarRocks stream load: url={} username={} columns={} body_bytes={}",
+            url,
+            username,
+            columns,
+            body.len()
+        )
+    }
+
     pub async fn new(
         base_url: &str,
         username: &str,
@@ -51,8 +67,8 @@ impl StarrocksClient {
         // 构造请求 URL
         let url = format!("{}{}/{}/_stream_load", self.base_url, database, table);
         trace!(
-            "curl -L -X PUT {}  -u {}:{}  -H 'format: JSON' -H 'Expect: 100-continue' -H 'strip_outer_array: true' -H 'columns: {}' -d '{}'",
-            url, &self.username, &self.password, columns, body
+            "{}",
+            Self::stream_load_trace(&url, &self.username, &self.password, &columns, &body,)
         );
 
         // 发起 PUT 请求
@@ -154,5 +170,24 @@ impl StarrocksClient {
     pub async fn execute_mysql_sql(&self, sql: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.mysql_pool.execute(sql).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_load_trace_does_not_expose_password_or_body() {
+        let trace = StarrocksClient::stream_load_trace(
+            "http://127.0.0.1:8030/api/db/t/_stream_load",
+            "loader",
+            "super-secret-password",
+            "id,name",
+            r#"[{"id":7,"name":"private-name"}]"#,
+        );
+
+        assert!(!trace.contains("super-secret-password"));
+        assert!(!trace.contains("private-name"));
     }
 }

@@ -1,12 +1,30 @@
 use crate::{TableInfoVo, Value};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::collections::hash_map::Keys;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct CaseInsensitiveHashMap {
     map: HashMap<String, Value>,
     raw_map: HashMap<String, Value>,
+}
+
+impl Serialize for CaseInsensitiveHashMap {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.raw_map.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CaseInsensitiveHashMap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        HashMap::<String, Value>::deserialize(deserializer).map(Self::new)
+    }
 }
 
 impl CaseInsensitiveHashMap {
@@ -259,6 +277,21 @@ mod tests {
         map.insert("ABc".to_string(), Value::Int64(123));
         assert_eq!(1, map.len());
         assert_eq!(2, map.get_raw_map().len());
+    }
+
+    #[test]
+    fn serializes_as_flat_business_fields() {
+        let map = CaseInsensitiveHashMap::new(HashMap::from([
+            ("id".to_string(), Value::Int64(7)),
+            ("name".to_string(), Value::String("demo".to_string())),
+        ]));
+
+        let json = serde_json::to_value(&map).unwrap();
+
+        assert_eq!(json.get("id"), Some(&serde_json::json!(7)));
+        assert_eq!(json.get("name"), Some(&serde_json::json!("demo")));
+        assert!(json.get("map").is_none());
+        assert!(json.get("raw_map").is_none());
     }
     #[test]
     fn test_case_insensitive_hash_map_string() {

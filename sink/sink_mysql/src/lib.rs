@@ -1787,6 +1787,10 @@ impl MySqlSink {
                 .iter()
                 .any(|table_info| !table_info.foreign_keys.is_empty())
     }
+
+    fn should_flush_records_in_order(_has_foreign_key_metadata: bool) -> bool {
+        true
+    }
 }
 
 #[async_trait]
@@ -1942,7 +1946,7 @@ impl Sink for MySqlSink {
         }
         let disable_foreign_key_checks = *self.source_initializing.read().await;
 
-        if self.has_foreign_key_metadata() {
+        if Self::should_flush_records_in_order(self.has_foreign_key_metadata()) {
             for record in &batch {
                 let database = self.record_target_database(record);
                 let table_label =
@@ -2256,5 +2260,10 @@ mod tests {
             .as_deref(),
             Some("bankCollectionLock")
         );
+    }
+
+    #[test]
+    fn batches_without_foreign_keys_still_preserve_source_event_order() {
+        assert!(MySqlSink::should_flush_records_in_order(false));
     }
 }

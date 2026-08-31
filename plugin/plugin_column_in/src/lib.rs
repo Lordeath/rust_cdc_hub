@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use common::case_insensitive_hash_map::CaseInsensitiveHashMap;
 use common::runtime_progress;
 use common::{DataBuffer, Operation, Plugin, PluginConfig, Value};
 
@@ -31,27 +32,34 @@ impl PluginColumnIn {
         }
         PluginColumnIn { columns, values }
     }
+
+    fn configured_value<'a>(
+        &self,
+        values: &'a CaseInsensitiveHashMap,
+    ) -> Option<(&str, &'a Value)> {
+        self.columns.iter().find_map(|column| {
+            let value = values.get(column);
+            (!value.is_none()).then_some((column.as_str(), value))
+        })
+    }
+
+    fn is_allowed(&self, value: &Value) -> bool {
+        let to_compare = value.resolve_string();
+        self.values
+            .iter()
+            .any(|allowed| to_compare.eq_ignore_ascii_case(allowed))
+    }
 }
 
 #[async_trait]
 impl Plugin for PluginColumnIn {
     async fn collect(&mut self, data_buffer: DataBuffer) -> Result<DataBuffer, ()> {
-        let is_delete = matches!(data_buffer.op, Operation::DELETE);
-        let mut contains_some_column = Value::None;
-        let mut matched_column = String::new();
-        for column in &self.columns {
-            let v = if is_delete {
-                data_buffer.before.get(column)
-            } else {
-                data_buffer.after.get(column)
-            };
-            if !v.is_none() {
-                contains_some_column = v.clone();
-                matched_column = column.clone();
-                break;
-            }
-        }
-        if contains_some_column.is_none() {
+        let values = if matches!(data_buffer.op, Operation::DELETE) {
+            &data_buffer.before
+        } else {
+            &data_buffer.after
+        };
+        let Some((matched_column, value)) = self.configured_value(values) else {
             runtime_progress::record_plugin_filter_result(
                 "ColumnIn",
                 &data_buffer.table_name,
@@ -60,19 +68,32 @@ impl Plugin for PluginColumnIn {
             )
             .await;
             return Ok(data_buffer);
+        };
+        let result = self.is_allowed(value);
+
+        if matches!(data_buffer.op, Operation::UPDATE)
+            && !result
+            && self
+                .configured_value(&data_buffer.before)
+                .is_some_and(|(_, before_value)| self.is_allowed(before_value))
+        {
+            runtime_progress::record_plugin_filter_result(
+                "ColumnIn",
+                &data_buffer.table_name,
+                matched_column,
+                true,
+            )
+            .await;
+            let mut delete = data_buffer;
+            delete.op = Operation::DELETE;
+            delete.after = CaseInsensitiveHashMap::new_with_no_arg();
+            return Ok(delete);
         }
-        let to_compare: String = contains_some_column.resolve_string();
-        let mut result = false;
-        for value in &self.values {
-            if to_compare.eq_ignore_ascii_case(value) {
-                result = true;
-                break;
-            }
-        }
+
         runtime_progress::record_plugin_filter_result(
             "ColumnIn",
             &data_buffer.table_name,
-            &matched_column,
+            matched_column,
             result,
         )
         .await;
@@ -178,5 +199,33 @@ mod tests {
         assert_eq!(filter.input_total, 1);
         assert_eq!(filter.output_total, 1);
         assert_eq!(filter.filtered_total, 0);
+    }
+
+    #[tokio::test]
+    async fn column_in_turns_matching_to_non_matching_update_into_delete() {
+        let mut plugin = PluginColumnIn::new(&config());
+        let before = CaseInsensitiveHashMap::new(HashMap::from([
+            ("id".to_string(), Value::Int64(7)),
+            ("project_id".to_string(), Value::String("10001".to_string())),
+        ]));
+        let after = CaseInsensitiveHashMap::new(HashMap::from([
+            ("id".to_string(), Value::Int64(7)),
+            ("project_id".to_string(), Value::String("20001".to_string())),
+        ]));
+        let update = DataBuffer::new(
+            "orders".to_string(),
+            before,
+            after,
+            Operation::UPDATE,
+            "mysql-bin.000001".to_string(),
+            1,
+            120,
+        );
+
+        let result = plugin.collect(update).await.unwrap();
+
+        assert_eq!(result.op, Operation::DELETE);
+        assert_eq!(result.before.get("id").resolve_string(), "7");
+        assert!(result.after.is_empty());
     }
 }

@@ -613,6 +613,47 @@ impl DataBuffer {
     pub fn target_table_key(&self) -> String {
         database_table_key(self.target_database.as_str(), self.table_name.as_str())
     }
+
+    pub fn sink_records_for_primary_key(&self, pk_name: &str) -> Vec<DataBuffer> {
+        if !matches!(self.op, Operation::UPDATE) {
+            return vec![self.clone()];
+        }
+
+        let before_pk = self.before.get(pk_name);
+        let after_pk = self.after.get(pk_name);
+        if before_pk.is_none()
+            || after_pk.is_none()
+            || before_pk.resolve_string() == after_pk.resolve_string()
+        {
+            return vec![self.clone()];
+        }
+
+        let empty = CaseInsensitiveHashMap::new_with_no_arg();
+        vec![
+            DataBuffer::new_with_route(
+                self.source_database.clone(),
+                self.target_database.clone(),
+                self.table_name.clone(),
+                self.before.clone(),
+                empty.clone(),
+                Operation::DELETE,
+                self.binlog_filename.clone(),
+                self.timestamp,
+                self.next_event_position,
+            ),
+            DataBuffer::new_with_route(
+                self.source_database.clone(),
+                self.target_database.clone(),
+                self.table_name.clone(),
+                empty,
+                self.after.clone(),
+                Operation::CREATE(false),
+                self.binlog_filename.clone(),
+                self.timestamp,
+                self.next_event_position,
+            ),
+        ]
+    }
 }
 
 pub fn database_table_key(database: &str, table_name: &str) -> String {
@@ -2012,6 +2053,37 @@ mod tests {
     fn test_resolve_string_blob_as_hex() {
         let v = Value::Blob(vec![0x1f, 0x8b, 0x08, 0xff]);
         assert_eq!(v.resolve_string(), "1f8b08ff");
+    }
+
+    #[test]
+    fn primary_key_update_is_split_into_delete_then_create() {
+        let before = CaseInsensitiveHashMap::new(HashMap::from([
+            ("id".to_string(), Value::Int64(1)),
+            ("name".to_string(), Value::String("before".to_string())),
+        ]));
+        let after = CaseInsensitiveHashMap::new(HashMap::from([
+            ("id".to_string(), Value::Int64(2)),
+            ("name".to_string(), Value::String("after".to_string())),
+        ]));
+        let record = DataBuffer::new_with_route(
+            "source_db".to_string(),
+            "target_db".to_string(),
+            "orders".to_string(),
+            before,
+            after,
+            Operation::UPDATE,
+            "mysql-bin.000001".to_string(),
+            1,
+            120,
+        );
+
+        let records = record.sink_records_for_primary_key("id");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].op, Operation::DELETE);
+        assert_eq!(records[0].before.get("id").resolve_string(), "1");
+        assert_eq!(records[1].op, Operation::CREATE(false));
+        assert_eq!(records[1].after.get("id").resolve_string(), "2");
     }
 
     #[test]
