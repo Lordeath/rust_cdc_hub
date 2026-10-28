@@ -388,6 +388,8 @@ When `enable_ui: true`, the application starts an Actix Web server. Use `ui_bind
 
 When serving the UI behind an Nginx subpath such as `/rust_cdc_hub/`, the frontend uses relative URLs for `status`, `metrics`, `health`, and related endpoints, so a rewrite from the subpath to the application root is supported.
 
+Initialization progress shows elapsed time, source query time, sink write time and current activity for each source table, with cumulative query/write totals above the table. In-flight operations update on every refresh. Query time covers execution and result reception; write time covers target execution and completion confirmation (logging for Print). Failed attempts count, while retry backoff does not. Requests containing multiple source tables are apportioned by row count and marked as estimates; each request contributes only once to the aggregate. Cumulative operation time can exceed elapsed initialization time during parallel work; conversion and filtering still contribute to elapsed time. Statistics are process-local, accumulate across in-process retries and reset on process restart. `/status` exposes `initialization_query_duration_ms`, `initialization_write_duration_ms`, the corresponding `_active` flags and `initialization_write_estimated` in `runtime_progress` and its `tables` entries.
+
 Common endpoints:
 
 | Endpoint | Description |

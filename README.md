@@ -427,6 +427,8 @@ plugins:
 
 如果通过 Nginx 子路径转发，例如 `/rust_cdc_hub/`，前端页面会使用相对路径访问 `status`、`metrics`、`health` 等接口，可配合 `rewrite` 将子路径转发到程序根路径。
 
+数据同步进度会按源表分别展示初始化总耗时、源端查询耗时、目标端写入耗时和当前操作，顶部提供查询与写入累计值。长查询和长写入在执行期间也会随页面刷新更新。查询耗时包含数据库执行与结果接收；写入耗时包含目标端执行与完成确认（Print 为日志输出），失败尝试计入，重试退避等待不计入。多个源表合并在同一次写入请求时，按行数分摊表级耗时，并标注“含分摊估算”；汇总对每次请求只累计一次。分项为累计操作耗时，并行时可能超过实际经过的初始化时间，转换、过滤等时间仍包含在总耗时中。分项统计保存在进程内，进程重启后清零；同一进程内重试已发生的操作继续累计。`/status` 的 `runtime_progress` 及其 `tables` 条目提供 `initialization_query_duration_ms`、`initialization_write_duration_ms`、对应的 `_active` 标记及 `initialization_write_estimated`。
+
 常用端点：
 
 | 端点 | 说明 |

@@ -1,3 +1,4 @@
+use crate::initialization_timing::InitializationTimingProgress;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -13,6 +14,8 @@ pub struct RuntimeProgress {
     pub current_table: String,
     pub initialization_started_at: i64,
     pub initialization_finished_at: i64,
+    #[serde(flatten, default)]
+    pub initialization_timing: InitializationTimingProgress,
     #[serde(default)]
     pub schema_running: bool,
     #[serde(default)]
@@ -54,6 +57,8 @@ pub struct TableProgress {
     pub initialization_started_at: i64,
     #[serde(default)]
     pub initialization_finished_at: i64,
+    #[serde(flatten, default)]
+    pub initialization_timing: InitializationTimingProgress,
     pub read_total: u64,
     pub synced_total: u64,
     pub filtered_total: u64,
@@ -79,6 +84,7 @@ impl RuntimeProgress {
             current_table: String::new(),
             initialization_started_at: 0,
             initialization_finished_at: 0,
+            initialization_timing: InitializationTimingProgress::default(),
             schema_running: false,
             schema_current_stage: String::new(),
             schema_started_at: 0,
@@ -277,7 +283,7 @@ impl RuntimeProgress {
         filter.last_event_at = now;
     }
 
-    fn table_mut(&mut self, table_name: &str) -> &mut TableProgress {
+    pub(crate) fn table_mut(&mut self, table_name: &str) -> &mut TableProgress {
         self.tables
             .entry(table_name.to_string())
             .or_insert_with(|| TableProgress {
@@ -285,6 +291,7 @@ impl RuntimeProgress {
                 phase: "cdc".to_string(),
                 initialization_started_at: 0,
                 initialization_finished_at: 0,
+                initialization_timing: InitializationTimingProgress::default(),
                 read_total: 0,
                 synced_total: 0,
                 filtered_total: 0,
@@ -456,7 +463,9 @@ pub async fn record_plugin_filter_result(
 }
 
 pub async fn snapshot() -> RuntimeProgress {
-    RUNTIME_PROGRESS.lock().await.clone()
+    let mut progress = RUNTIME_PROGRESS.lock().await.clone();
+    crate::initialization_timing::snapshot_into(&mut progress);
+    progress
 }
 
 #[cfg(test)]

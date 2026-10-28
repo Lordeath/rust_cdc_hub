@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use common::checkpoint_manager::CheckpointServiceHandle;
+use common::initialization_timing;
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::{CdcConfig, DataBuffer, FlushByOperation, Sink, TableInfoVo};
 use std::collections::HashMap;
@@ -39,6 +40,7 @@ impl Sink for PrintSink {
         record: &DataBuffer,
         mysql_check_point_detail_entity: &Option<MysqlCheckPointDetailEntity>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let _timing = initialization_timing::track_write(std::slice::from_ref(record));
         info!("进入print");
         info!("{:?}", record);
         if let Some(s) = mysql_check_point_detail_entity {

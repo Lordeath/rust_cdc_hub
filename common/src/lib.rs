@@ -1,6 +1,7 @@
 pub mod case_insensitive_hash_map;
 pub mod checkpoint_manager;
 pub mod custom_error;
+pub mod initialization_timing;
 pub mod metrics;
 pub mod mysql_checkpoint;
 pub mod runtime_progress;

@@ -4,6 +4,7 @@ use crate::starrocks_client::StarrocksClient;
 use async_trait::async_trait;
 use common::case_insensitive_hash_map::CaseInsensitiveHashMap;
 use common::checkpoint_manager::CheckpointServiceHandle;
+use common::initialization_timing::WriteTimingBatch;
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::schema::{
     extract_mysql_create_table_column_definitions, mysql_column_allows_null_from_definition,
@@ -571,10 +572,12 @@ impl Sink for StarrocksSink {
         }
 
         let mut json_list_map: HashMap<String, Vec<HashMap<String, Value>>> = HashMap::new();
+        let mut write_timings: HashMap<String, WriteTimingBatch> = HashMap::new();
 
         let mut cache_for_roll_back: Vec<DataBuffer> = vec![];
         for r in batch {
             let table_name = r.table_name.clone();
+            write_timings.entry(table_name.clone()).or_default().add(&r);
             if !self.table_info_cache.lock().await.contains_key(&table_name) {
                 for table_info in &self.table_info_list {
                     if table_info.table_name == table_name {
@@ -605,6 +608,7 @@ impl Sink for StarrocksSink {
             let mut c2 = c.clone();
             c2.push("__op".to_string());
             let columns = &c2.join(",");
+            let _timing = write_timings.get(&k).map(WriteTimingBatch::start);
             let result = self
                 .starrocks_client
                 .stream_load(&self.database, &k, body, columns.to_string())

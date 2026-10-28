@@ -3,6 +3,7 @@ use common::case_insensitive_hash_map::{
     CaseInsensitiveHashMapTableInfoVo, CaseInsensitiveHashMapVecString,
 };
 use common::checkpoint_manager::CheckpointServiceHandle;
+use common::initialization_timing;
 use common::metrics::{SINK_EVENTS_TOTAL, SINK_FLUSH_DURATION_SECONDS, SINK_FLUSH_ERRORS_TOTAL};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::runtime_progress;
@@ -7714,6 +7715,7 @@ impl Sink for DamengSink {
                         );
                         self.cache_dml_columns(table_key.as_str(), &dml_columns)
                             .await;
+                        let _timing = initialization_timing::track_write(&dml_records);
                         if dml_records.len() > 1 {
                             self.insert_or_update_records_batch(
                                 schema.as_str(),
@@ -7789,26 +7791,29 @@ impl Sink for DamengSink {
                         );
                         self.cache_dml_columns(table_key.as_str(), &dml_columns)
                             .await;
-                        let write_result = if self.random_check_data_after_init {
-                            self.replace_record_for_random_check_init(
-                                schema.as_str(),
-                                table_name.as_str(),
-                                table_key.as_str(),
-                                pk_name.as_str(),
-                                &dml_columns,
-                                &dml_records[0],
-                            )
-                            .await
-                        } else {
-                            self.insert_or_update_record(
-                                schema.as_str(),
-                                table_name.as_str(),
-                                table_key.as_str(),
-                                pk_name.as_str(),
-                                &dml_columns,
-                                &dml_records[0],
-                            )
-                            .await
+                        let write_result = {
+                            let _timing = initialization_timing::track_write(&dml_records);
+                            if self.random_check_data_after_init {
+                                self.replace_record_for_random_check_init(
+                                    schema.as_str(),
+                                    table_name.as_str(),
+                                    table_key.as_str(),
+                                    pk_name.as_str(),
+                                    &dml_columns,
+                                    &dml_records[0],
+                                )
+                                .await
+                            } else {
+                                self.insert_or_update_record(
+                                    schema.as_str(),
+                                    table_name.as_str(),
+                                    table_key.as_str(),
+                                    pk_name.as_str(),
+                                    &dml_columns,
+                                    &dml_records[0],
+                                )
+                                .await
+                            }
                         };
                         let write_result =
                             if write_result.is_ok() && self.random_check_data_after_init {

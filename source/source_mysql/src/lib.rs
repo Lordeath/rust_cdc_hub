@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use common::case_insensitive_hash_map::{CaseInsensitiveHashMap, CaseInsensitiveHashMapVecString};
 use common::checkpoint_manager::{CheckpointServiceHandle, StreamCheckpoint};
 use common::custom_error::{CustomError, CustomErrorType};
+use common::initialization_timing;
 use common::metrics::{SOURCE_EVENTS_TOTAL, SOURCE_LAG_POSITION};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::runtime_progress;
@@ -1108,10 +1109,14 @@ impl MysqlSourceConfigDetail {
             use_random_sample
         );
         // 查询 Row，而不是 HashMap
-        let mut rows: Vec<MySqlRow> = sqlx::query(&sql)
-            .fetch_all(&mut **executor)
-            .await
-            .expect("query failed");
+        let progress_label = self.source_table_key(table_name);
+        let mut rows: Vec<MySqlRow> = {
+            let _timing = initialization_timing::track_query(&progress_label);
+            sqlx::query(&sql)
+                .fetch_all(&mut **executor)
+                .await
+                .expect("query failed")
+        };
         if use_random_sample
             && rows.len() < limit
             && let Some(start) = random_start.as_deref()
@@ -1130,10 +1135,13 @@ impl MysqlSourceConfigDetail {
                 pk_ident,
                 limit.saturating_sub(rows.len())
             );
-            let wrap_rows: Vec<MySqlRow> = sqlx::query(&wrap_sql)
-                .fetch_all(&mut **executor)
-                .await
-                .expect("query failed");
+            let wrap_rows: Vec<MySqlRow> = {
+                let _timing = initialization_timing::track_query(&progress_label);
+                sqlx::query(&wrap_sql)
+                    .fetch_all(&mut **executor)
+                    .await
+                    .expect("query failed")
+            };
             rows.extend(wrap_rows);
         }
         info!(
@@ -1171,6 +1179,7 @@ impl MysqlSourceConfigDetail {
         pk_column: &str,
         executor: &mut Transaction<'_, MySql>,
     ) -> Option<String> {
+        let _timing = initialization_timing::track_query(&self.source_table_key(table_name));
         let table_ref = qualified_mysql_table_name(&self.database, table_name);
         let pk_ident = quote_mysql_identifier(pk_column);
         let sql = format!(

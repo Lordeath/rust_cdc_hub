@@ -1526,7 +1526,10 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         <div class="progress-box"><div class="label" data-i18n="initialization_started_at">初始化开始时间</div><div class="value compact" id="initializationStartedAt">-</div></div>
         <div class="progress-box"><div class="label" data-i18n="initialization_finished_at">初始化结束时间</div><div class="value compact" id="initializationFinishedAt">-</div></div>
         <div class="progress-box"><div class="label" data-i18n="initialization_duration">初始化耗时</div><div class="value compact" id="initializationDuration">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="initialization_query_total">源端查询累计耗时</div><div class="value compact" id="initializationQueryDuration">-</div></div>
+        <div class="progress-box"><div class="label" data-i18n="initialization_write_total">目标端写入累计耗时</div><div class="value compact" id="initializationWriteDuration">-</div></div>
       </div>
+      <p class="hint" data-i18n="initialization_timing_hint">分项为累计操作耗时：并行时可能超过初始化总耗时；转换、过滤和重试等待等计入总耗时。混合请求按源表行数分摊，并标注“含分摊估算”。Print 写入表示日志输出。</p>
       <div id="syncProgressTable" class="table-wrap"></div>
     </section>
 
@@ -1598,6 +1601,17 @@ const translations = {
     initialization_started_at: '初始化开始时间',
     initialization_finished_at: '初始化结束时间',
     initialization_duration: '初始化耗时',
+    initialization_query_total: '源端查询累计耗时',
+    initialization_write_total: '目标端写入累计耗时',
+    initialization_query_duration: '源端查询耗时',
+    initialization_write_duration: '目标端写入耗时',
+    initialization_activity: '初始化当前操作',
+    initialization_querying: '查询中',
+    initialization_writing: '写入中',
+    initialization_querying_writing: '查询及写入中',
+    initialization_processing: '处理中 / 等待',
+    initialization_estimated: '含分摊估算',
+    initialization_timing_hint: '分项为累计操作耗时：并行时可能超过初始化总耗时；转换、过滤和重试等待等计入总耗时。混合请求按源表行数分摊，并标注“含分摊估算”。Print 写入表示日志输出。',
     initializing_running: '进行中',
     raw_json: '原始状态 JSON',
     no_column_in_hits: '暂无 ColumnIn 过滤命中',
@@ -1703,6 +1717,17 @@ const translations = {
     initialization_started_at: 'Initialization Started',
     initialization_finished_at: 'Initialization Finished',
     initialization_duration: 'Initialization Duration',
+    initialization_query_total: 'Cumulative Source Query Time',
+    initialization_write_total: 'Cumulative Sink Write Time',
+    initialization_query_duration: 'Source Query Time',
+    initialization_write_duration: 'Sink Write Time',
+    initialization_activity: 'Initialization Activity',
+    initialization_querying: 'Querying',
+    initialization_writing: 'Writing',
+    initialization_querying_writing: 'Querying and Writing',
+    initialization_processing: 'Processing / Waiting',
+    initialization_estimated: 'Includes Apportioned Estimate',
+    initialization_timing_hint: 'Times accumulate across operations and may exceed elapsed initialization time when running in parallel. Conversion, filtering and retry backoff contribute to elapsed time. Mixed requests are apportioned by source row count and marked as estimates. Print write time measures logging.',
     initializing_running: 'Running',
     raw_json: 'Raw Status JSON',
     no_column_in_hits: 'No ColumnIn filter hits',
@@ -1894,6 +1919,18 @@ function tableInitializationDurationSeconds(table, now) {
   const effectiveEnd = finishedAt > 0 ? finishedAt : Number(now || 0);
   return Math.max(0, effectiveEnd - startedAt);
 }
+function fmtInitializationOperationDuration(ms) {
+  if (ms === undefined || ms === null) return '-';
+  ms = Math.max(0, Number(ms) || 0);
+  return ms < 1000 ? `${Math.floor(ms)}ms` : fmtDuration(Math.floor(ms / 1000));
+}
+function initializationActivity(table) {
+  if (table.initialization_query_active && table.initialization_write_active) return t('initialization_querying_writing');
+  if (table.initialization_query_active) return t('initialization_querying');
+  if (table.initialization_write_active) return t('initialization_writing');
+  if (table.phase === 'initializing') return t('initialization_processing');
+  return '-';
+}
 function schemaStageDurationSeconds(stage, now) {
   const recorded = Number(stage.duration_seconds || 0);
   const startedAt = Number(stage.started_at || 0);
@@ -1948,6 +1985,9 @@ function renderSyncProgressTable(tables, now) {
       ...table,
       initialization_duration: duration ?? -1,
       initialization_duration_label: duration === null ? '-' : fmtDuration(duration),
+      initialization_activity_label: initializationActivity(table),
+      initialization_query_duration_label: duration === null ? '-' : fmtInitializationOperationDuration(table.initialization_query_duration_ms),
+      initialization_write_duration_label: duration === null ? '-' : fmtInitializationOperationDuration(table.initialization_write_duration_ms),
     };
   });
   const rows = sortRows(rowsWithDurations, 'syncProgress')
@@ -1955,6 +1995,9 @@ function renderSyncProgressTable(tables, now) {
       <td>${escapeHtml(table.table_name || '-')}</td>
       <td>${escapeHtml(displayPhase(table.phase))}</td>
       <td>${escapeHtml(table.initialization_duration_label)}</td>
+      <td>${escapeHtml(table.initialization_query_duration_label)}</td>
+      <td>${escapeHtml(table.initialization_write_duration_label)}${table.initialization_write_estimated ? `<div class="hint">${escapeHtml(t('initialization_estimated'))}</div>` : ''}</td>
+      <td>${escapeHtml(table.initialization_activity_label)}</td>
       <td>${escapeHtml(table.read_total ?? 0)}</td>
       <td>${escapeHtml(table.synced_total ?? 0)}</td>
       <td>${escapeHtml(table.filtered_total ?? 0)}</td>
@@ -1962,7 +2005,7 @@ function renderSyncProgressTable(tables, now) {
       <td>${escapeHtml(fmtTs(table.last_event_at))}</td>
     </tr>`)
     .join('');
-  target.innerHTML = `<table><thead><tr>${sortHeader('syncProgress', 'table_name', t('table_name'))}${sortHeader('syncProgress', 'phase', t('phase'))}${sortHeader('syncProgress', 'initialization_duration', t('initialization_duration'))}${sortHeader('syncProgress', 'read_total', t('read'))}${sortHeader('syncProgress', 'synced_total', t('sink_written'))}${sortHeader('syncProgress', 'filtered_total', t('filtered'))}${sortHeader('syncProgress', 'last_pk', t('last_pk'))}${sortHeader('syncProgress', 'last_event_at', t('last_event_at'))}</tr></thead><tbody>${rows}</tbody></table>`;
+  target.innerHTML = `<table><thead><tr>${sortHeader('syncProgress', 'table_name', t('table_name'))}${sortHeader('syncProgress', 'phase', t('phase'))}${sortHeader('syncProgress', 'initialization_duration', t('initialization_duration'))}${sortHeader('syncProgress', 'initialization_query_duration_ms', t('initialization_query_duration'))}${sortHeader('syncProgress', 'initialization_write_duration_ms', t('initialization_write_duration'))}${sortHeader('syncProgress', 'initialization_activity_label', t('initialization_activity'))}${sortHeader('syncProgress', 'read_total', t('read'))}${sortHeader('syncProgress', 'synced_total', t('sink_written'))}${sortHeader('syncProgress', 'filtered_total', t('filtered'))}${sortHeader('syncProgress', 'last_pk', t('last_pk'))}${sortHeader('syncProgress', 'last_event_at', t('last_event_at'))}</tr></thead><tbody>${rows}</tbody></table>`;
 }
 function renderInitializationTiming(progress, now) {
   const timingGrid = el('initializationTimingGrid');
@@ -1970,6 +2013,8 @@ function renderInitializationTiming(progress, now) {
   const startedAt = Number(progress.initialization_started_at || 0);
   const finishedAt = progress.initializing ? 0 : Number(progress.initialization_finished_at || 0);
   timingGrid.hidden = startedAt <= 0;
+  setText('initializationQueryDuration', startedAt > 0 ? fmtInitializationOperationDuration(progress.initialization_query_duration_ms) : '-');
+  setText('initializationWriteDuration', startedAt > 0 ? fmtInitializationOperationDuration(progress.initialization_write_duration_ms) : '-');
   if (startedAt <= 0) {
     setText('initializationStartedAt', '-');
     setText('initializationFinishedAt', '-');
@@ -3076,6 +3121,13 @@ plugins:
         assert!(s.contains("initializationTimingGrid"));
         assert!(s.contains("初始化开始时间"));
         assert!(s.contains("Initialization Duration"));
+        assert!(s.contains("源端查询累计耗时"));
+        assert!(s.contains("Cumulative Sink Write Time"));
+        assert!(s.contains("initializationQueryDuration"));
+        assert!(s.contains("initializationWriteDuration"));
+        assert!(s.contains("含分摊估算"));
+        assert!(s.contains("sortHeader('syncProgress', 'initialization_query_duration_ms'"));
+        assert!(s.contains("sortHeader('syncProgress', 'initialization_write_duration_ms'"));
         assert!(s.contains("function tableInitializationDurationSeconds"));
         assert!(s.contains("progress.initializing ? 0"));
         assert!(s.contains("sortHeader('syncProgress', 'initialization_duration'"));

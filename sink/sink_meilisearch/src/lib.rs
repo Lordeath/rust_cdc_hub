@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use common::checkpoint_manager::CheckpointServiceHandle;
+use common::initialization_timing;
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::{CdcConfig, DataBuffer, FlushByOperation, Operation, Sink, TableInfoVo};
 use meilisearch_sdk::client::Client;
@@ -182,6 +183,7 @@ impl Sink for MeiliSearchSink {
         let upsert_result = if docs.is_empty() {
             Ok(())
         } else {
+            let _timing = initialization_timing::track_write(&cache_for_roll_back);
             match index
                 .add_or_replace(&docs, Some(&self.meili_table_pk))
                 .await
@@ -331,12 +333,90 @@ mod tests {
             .create_async()
             .await;
         let sink = Arc::new(test_sink(server.url().as_str(), "test-key"));
-        sink.buffer.lock().await.push(article_record());
+        let mut record = article_record();
+        record.op = Operation::CREATE(true);
+        record.source_database = "timing_failed_task".to_string();
+        sink.buffer.lock().await.push(record);
 
         let result = sink.flush(&FlushByOperation::Signal).await;
 
         assert!(result.is_err());
+        let progress = common::runtime_progress::snapshot().await;
+        let timing = &progress.tables["timing_failed_task.articles"].initialization_timing;
+        assert!(!timing.initialization_write_active);
+        assert!(!timing.initialization_write_estimated);
+        assert_eq!(sink.buffer.lock().await.len(), 1);
         enqueue.assert_async().await;
         failed_task.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn initialization_write_timing_waits_for_task_and_apportions_mixed_sources() {
+        let mut server = mockito::Server::new_async().await;
+        let enqueue = server.mock("POST", "/indexes/articles/documents")
+            .match_query(Matcher::UrlEncoded("primaryKey".into(), "id".into()))
+            .with_status(202).with_header("content-type", "application/json")
+            .with_body(r#"{"taskUid":2,"indexUid":"articles","status":"enqueued","type":"documentAdditionOrUpdate","enqueuedAt":"2026-08-31T00:00:00.000Z"}"#)
+            .create_async().await;
+        let completed = server.mock("GET", "/tasks/2")
+            .expect_at_least(1)
+            .with_status(200).with_header("content-type", "application/json")
+            .with_chunked_body(|writer| {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                writer.write_all(br#"{"uid":2,"indexUid":"articles","status":"succeeded","type":"documentAdditionOrUpdate","details":{"receivedDocuments":4,"indexedDocuments":4},"duration":"PT0.080S","enqueuedAt":"2026-08-31T00:00:00.000Z","startedAt":"2026-08-31T00:00:00.000Z","finishedAt":"2026-08-31T00:00:00.080Z"}"#)
+            }).create_async().await;
+        let sink = Arc::new(test_sink(server.url().as_str(), "test-key"));
+        for database in [
+            "timing_wait_a",
+            "timing_wait_b",
+            "timing_wait_b",
+            "timing_wait_b",
+        ] {
+            let mut record = article_record();
+            record.op = Operation::CREATE(true);
+            record.source_database = database.into();
+            sink.buffer.lock().await.push(record);
+        }
+        let sink_for_task = sink.clone();
+        let task = tokio::spawn(async move { sink_for_task.flush(&FlushByOperation::Timer).await });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let progress = common::runtime_progress::snapshot().await;
+                if progress
+                    .tables
+                    .get("timing_wait_a.articles")
+                    .is_some_and(|table| {
+                        table.initialization_timing.initialization_write_active
+                            && table.initialization_timing.initialization_write_duration_ms >= 2
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("任务确认前应能看到在途写入耗时");
+        task.await.unwrap().unwrap();
+        let progress = common::runtime_progress::snapshot().await;
+        let a = &progress.tables["timing_wait_a.articles"].initialization_timing;
+        let b = &progress.tables["timing_wait_b.articles"].initialization_timing;
+        assert!(a.initialization_write_duration_ms >= 20);
+        assert!(
+            (b.initialization_write_duration_ms as i64
+                - 3 * a.initialization_write_duration_ms as i64)
+                .abs()
+                <= 2
+        );
+        assert!(!a.initialization_write_active && !b.initialization_write_active);
+        assert!(a.initialization_write_estimated && b.initialization_write_estimated);
+        assert!(sink.buffer.lock().await.is_empty());
+        let later = common::runtime_progress::snapshot().await;
+        assert_eq!(
+            &later.tables["timing_wait_a.articles"].initialization_timing,
+            a
+        );
+        enqueue.assert_async().await;
+        completed.assert_async().await;
     }
 }

@@ -3,6 +3,7 @@ use common::case_insensitive_hash_map::{
     CaseInsensitiveHashMapTableInfoVo, CaseInsensitiveHashMapVecString,
 };
 use common::checkpoint_manager::CheckpointServiceHandle;
+use common::initialization_timing::{self, WriteTimingBatch};
 use common::metrics::{SINK_EVENTS_TOTAL, SINK_FLUSH_DURATION_SECONDS, SINK_FLUSH_ERRORS_TOTAL};
 use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
 use common::runtime_progress;
@@ -1607,6 +1608,7 @@ impl MySqlSink {
         pk_by_table: HashMap<String, String>,
         disable_foreign_key_checks: bool,
     ) -> Result<(), String> {
+        let mut write_timings: HashMap<String, WriteTimingBatch> = HashMap::new();
         let mut insert_map: HashMap<
             String,
             Vec<common::case_insensitive_hash_map::CaseInsensitiveHashMap>,
@@ -1615,6 +1617,9 @@ impl MySqlSink {
 
         for r in batch {
             let table_name = r.table_name.clone();
+            if matches!(r.op, Operation::CREATE(_) | Operation::UPDATE) {
+                write_timings.entry(table_name.clone()).or_default().add(&r);
+            }
             let table_key = Self::target_table_key(database.as_str(), table_name.as_str());
             let pk_name = pk_by_table
                 .get(table_key.to_ascii_lowercase().as_str())
@@ -1657,6 +1662,7 @@ impl MySqlSink {
                 error!("columns is empty: {}.{}", database, table_name);
                 continue;
             }
+            let _timing = write_timings.get(&table_name).map(WriteTimingBatch::start);
             if let Err(e) = Self::execute_upsert_batch(
                 &pool,
                 connection_url.as_str(),
@@ -1742,6 +1748,7 @@ impl MySqlSink {
                         error!("columns is empty: {}.{}", database, table_name);
                         continue;
                     }
+                    let _timing = initialization_timing::track_write(std::slice::from_ref(record));
                     Self::execute_upsert_batch(
                         pool,
                         connection_url.as_str(),
