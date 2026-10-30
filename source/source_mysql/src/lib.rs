@@ -15,8 +15,7 @@ use common::{
     CdcConfig, DataBuffer, FlushByOperation, ForeignKeyInfo, Operation, Plugin, Sink, Source,
     TableIndexInfo, TableInfoVo, Value, database_table_key,
     get_mysql_pool_by_url_with_max_connections, mysql_connection_url_from_config,
-    mysql_row_text_value, mysql_row_to_hashmap, mysql_utf8mb4_string_expr,
-    redact_connection_url_password,
+    mysql_row_text_value, mysql_row_to_hashmap, redact_connection_url_password,
 };
 use mysql_binlog_connector_rust::binlog_client::{BinlogClient, StartPosition};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
@@ -32,7 +31,8 @@ use serde::Serialize;
 use sqlx::Column;
 use sqlx::FromRow;
 use sqlx::Row;
-use sqlx::mysql::MySqlRow;
+use sqlx::mysql::{MySqlArguments, MySqlRow};
+use sqlx::query::Query;
 use sqlx::{MySql, Pool, Transaction};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -957,12 +957,17 @@ impl InitPkCursor {
         }
     }
 
-    fn sql_literal(&self) -> Option<String> {
+    fn bind_query<'q>(
+        &'q self,
+        query: Query<'q, MySql, MySqlArguments>,
+    ) -> Query<'q, MySql, MySqlArguments> {
         match self {
-            Self::Start => None,
-            Self::Signed(v) => Some(v.to_string()),
-            Self::Unsigned(v) => Some(v.to_string()),
-            Self::Text(v) => Some(mysql_utf8mb4_string_expr(v)),
+            Self::Start => query,
+            Self::Signed(v) => query.bind(*v),
+            Self::Unsigned(v) => query.bind(*v),
+            // 绑定值，让 MySQL 按主键列的排序规则比较；CONVERT(hex USING utf8mb4)
+            // 会引入另一种 IMPLICIT collation，和源列冲突并导致 1267。
+            Self::Text(v) => query.bind(v.as_str()),
         }
     }
 
@@ -1055,7 +1060,7 @@ impl MysqlSourceConfigDetail {
         limit: usize,
         random_sample: bool,
         executor: &mut Transaction<'_, MySql>,
-    ) -> Vec<DataBuffer> {
+    ) -> Result<Vec<DataBuffer>, CustomError> {
         let limit = limit.max(1);
         let use_random_sample =
             random_sample && self.pk_column_supports_random_init(table_name, pk_column);
@@ -1085,10 +1090,11 @@ impl MysqlSourceConfigDetail {
                 table_ref, pk_ident, start, pk_ident, limit
             )
         } else {
-            let where_clause = cursor
-                .sql_literal()
-                .map(|id| format!("where {} > {}", pk_ident, id))
-                .unwrap_or_default();
+            let where_clause = if matches!(cursor, InitPkCursor::Start) {
+                String::new()
+            } else {
+                format!("where {} > ?", pk_ident)
+            };
             format!(
                 r#"
                     select *
@@ -1112,10 +1118,15 @@ impl MysqlSourceConfigDetail {
         let progress_label = self.source_table_key(table_name);
         let mut rows: Vec<MySqlRow> = {
             let _timing = initialization_timing::track_query(&progress_label);
-            sqlx::query(&sql)
-                .fetch_all(&mut **executor)
-                .await
-                .expect("query failed")
+            let query = sqlx::query(&sql);
+            let query = if use_random_sample {
+                query
+            } else {
+                cursor.bind_query(query)
+            };
+            query.fetch_all(&mut **executor).await.map_err(|e| {
+                self.initialization_query_error(table_name, pk_column, "分页读取", e)
+            })?
         };
         if use_random_sample
             && rows.len() < limit
@@ -1140,7 +1151,14 @@ impl MysqlSourceConfigDetail {
                 sqlx::query(&wrap_sql)
                     .fetch_all(&mut **executor)
                     .await
-                    .expect("query failed")
+                    .map_err(|e| {
+                        self.initialization_query_error(
+                            table_name,
+                            pk_column,
+                            "随机样本回绕读取",
+                            e,
+                        )
+                    })?
             };
             rows.extend(wrap_rows);
         }
@@ -1156,7 +1174,15 @@ impl MysqlSourceConfigDetail {
         let mut result: Vec<DataBuffer> = vec![];
         for row in rows {
             let before = CaseInsensitiveHashMap::new(HashMap::new());
-            let after = mysql_row_to_hashmap(&row);
+            let mut after = mysql_row_to_hashmap(&row);
+            if matches!(after.get(pk_column), Value::Blob(_)) {
+                // CDC 已限定为整数或 char/varchar 主键。SQLx 将 _bin 排序规则的
+                // 文本列标为 VARBINARY，需按结果集的文本编码读取，不能当二进制游标。
+                let pk = row.try_get_unchecked::<String, _>(pk_column).map_err(|e| {
+                    self.initialization_query_error(table_name, pk_column, "读取字符串主键", e)
+                })?;
+                after.insert(pk_column.to_string(), Value::String(pk));
+            }
             let op = Operation::CREATE(true);
             result.push(DataBuffer::new_with_route(
                 self.database.clone(),
@@ -1170,7 +1196,23 @@ impl MysqlSourceConfigDetail {
                 0,
             ));
         }
-        result
+        Ok(result)
+    }
+
+    fn initialization_query_error(
+        &self,
+        table_name: &str,
+        pk_column: &str,
+        stage: &str,
+        error: sqlx::Error,
+    ) -> CustomError {
+        CustomError {
+            message: format!(
+                "MySQL 源表初始化查询失败: database={}, table={}, pk={}, stage={}, error={}",
+                self.database, table_name, pk_column, stage, error,
+            ),
+            error_type: CustomErrorType::Restart,
+        }
     }
 
     async fn random_init_pk_start(
@@ -1620,7 +1662,7 @@ impl MySQLSource {
                         validation_init_limit.is_some(),
                         &mut tx,
                     )
-                    .await;
+                    .await?;
                 let len = data_buffer_list.len();
                 for data_buffer in data_buffer_list {
                     runtime_progress::record_read(
@@ -4049,7 +4091,7 @@ mod tests {
         let cursor = InitPkCursor::from_value(&Value::UnsignedInt64(42)).unwrap();
 
         assert_eq!(cursor, InitPkCursor::Unsigned(42));
-        assert_eq!(cursor.sql_literal().as_deref(), Some("42"));
+        assert_eq!(cursor.display_value(), "42");
     }
 
     #[test]
@@ -4057,7 +4099,7 @@ mod tests {
         let cursor = InitPkCursor::from_value(&Value::Int32(7)).unwrap();
 
         assert_eq!(cursor, InitPkCursor::Signed(7));
-        assert_eq!(cursor.sql_literal().as_deref(), Some("7"));
+        assert_eq!(cursor.display_value(), "7");
     }
 
     #[test]
@@ -4065,10 +4107,213 @@ mod tests {
         let cursor = InitPkCursor::from_value(&Value::String("A'中".to_string())).unwrap();
 
         assert_eq!(cursor, InitPkCursor::Text("A'中".to_string()));
-        let sql_literal = cursor.sql_literal().unwrap();
-        assert!(sql_literal.starts_with("CONVERT(0x"));
-        assert!(sql_literal.ends_with(" USING utf8mb4)"));
-        assert!(!sql_literal.contains("'"));
+        use sqlx::{Arguments, Execute};
+        let mut query = cursor.bind_query(sqlx::query("SELECT * FROM orders WHERE id > ?"));
+        assert_eq!(query.sql(), "SELECT * FROM orders WHERE id > ?");
+        assert_eq!(query.take_arguments().unwrap().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "需要 CDC_TEST_MYSQL_URL 指向可创建临时表的 MySQL 8 测试库"]
+    async fn init_pagination_preserves_source_pk_collation() {
+        let url = std::env::var("CDC_TEST_MYSQL_URL").expect("CDC_TEST_MYSQL_URL");
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        let database: String = sqlx::query_scalar("SELECT DATABASE()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let mut config = test_mysql_source_detail(Vec::new());
+        config.database = database;
+        let mut tx = pool.begin().await.unwrap();
+        for (index, collation) in [
+            "utf8mb4_unicode_ci",
+            "utf8mb4_unicode_ci",
+            "utf8mb4_0900_ai_ci",
+            "utf8mb4_general_ci",
+            "utf8mb4_bin",
+            "utf8mb3_general_ci",
+            "latin1_swedish_ci",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let connection_collation = if index == 1 {
+                "utf8mb4_0900_ai_ci"
+            } else {
+                "utf8mb4_unicode_ci"
+            };
+            sqlx::query(&format!("SET NAMES utf8mb4 COLLATE {connection_collation}"))
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            let charset = collation.split('_').next().unwrap();
+            let table = format!("cdc_cursor_collation_{index}");
+            let table_ref = qualified_mysql_table_name(&config.database, &table);
+            sqlx::query(&format!("CREATE TEMPORARY TABLE {table_ref} (id VARCHAR(64) CHARACTER SET {charset} COLLATE {collation} PRIMARY KEY)"))
+                .execute(&mut *tx).await.unwrap();
+            let mut values = vec![
+                "",
+                "Z-last",
+                "a'quote",
+                "b\\slash",
+                "c\0nul",
+                "éclair",
+                "eZ",
+                "Á-start",
+                "lowerCase",
+            ];
+            if charset != "latin1" {
+                values.push("中");
+            }
+            if charset == "utf8mb4" {
+                values.push("😀");
+            }
+            for value in &values {
+                sqlx::query(&format!("INSERT INTO {table_ref} VALUES (?)"))
+                    .bind(*value)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            let expected: Vec<String> =
+                sqlx::query(&format!("SELECT id FROM {table_ref} ORDER BY id"))
+                    .fetch_all(&mut *tx)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.try_get_unchecked::<String, _>(0).unwrap())
+                    .collect();
+            let mut cursor = InitPkCursor::Start;
+            let mut actual = Vec::new();
+            for _ in 0..=values.len() {
+                let rows = config
+                    .extract_init_data(&table, "id", &cursor, 2, false, &mut tx)
+                    .await
+                    .unwrap();
+                if rows.is_empty() {
+                    break;
+                }
+                for row in rows {
+                    let value = row.after.get("id");
+                    actual.push(value.resolve_string());
+                    cursor.advance(InitPkCursor::from_value(value).unwrap());
+                }
+            }
+            assert_eq!(
+                actual, expected,
+                "排序规则 {collation} 的分页必须完整且不重复"
+            );
+            // 字符串边界也使用源列的排序规则，条件保留在原主键列上。
+            let empty_cursor = InitPkCursor::Text(String::new());
+            let after_empty = config
+                .extract_init_data(
+                    &table,
+                    "id",
+                    &empty_cursor,
+                    values.len() + 1,
+                    false,
+                    &mut tx,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                after_empty
+                    .into_iter()
+                    .map(|row| row.after.get("id").resolve_string())
+                    .collect::<Vec<_>>(),
+                expected[1..]
+            );
+            let explain_sql = format!(
+                "EXPLAIN FORMAT=TRADITIONAL SELECT * FROM {table_ref} WHERE id > ? ORDER BY id LIMIT 2"
+            );
+            let plan = empty_cursor
+                .bind_query(sqlx::query(&explain_sql))
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            assert_eq!(plan.len(), 12, "EXPLAIN 列: {:?}", plan.columns());
+            assert_eq!(
+                plan.get::<String, _>(4),
+                "range",
+                "{collation} 应使用范围索引"
+            );
+            assert_eq!(plan.get::<String, _>(6), "PRIMARY");
+        }
+
+        // 数值游标的符号和精度不能因参数化改变。
+        for (table, column_type, values) in [
+            (
+                "cdc_cursor_signed",
+                "BIGINT",
+                vec![
+                    i64::MIN.to_string(),
+                    "-1".into(),
+                    "0".into(),
+                    i64::MAX.to_string(),
+                ],
+            ),
+            (
+                "cdc_cursor_unsigned",
+                "BIGINT UNSIGNED",
+                vec![
+                    "0".into(),
+                    "1".into(),
+                    (i64::MAX as u64 + 1).to_string(),
+                    u64::MAX.to_string(),
+                ],
+            ),
+        ] {
+            let table_ref = qualified_mysql_table_name(&config.database, table);
+            sqlx::query(&format!(
+                "CREATE TEMPORARY TABLE {table_ref} (id {column_type} PRIMARY KEY)"
+            ))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            for value in &values {
+                sqlx::query(&format!("INSERT INTO {table_ref} VALUES ({value})"))
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            let mut cursor = InitPkCursor::Start;
+            let mut actual = Vec::new();
+            for _ in 0..=values.len() {
+                let rows = config
+                    .extract_init_data(table, "id", &cursor, 1, false, &mut tx)
+                    .await
+                    .unwrap();
+                if rows.is_empty() {
+                    break;
+                }
+                let value = rows[0].after.get("id");
+                actual.push(value.resolve_string());
+                cursor.advance(InitPkCursor::from_value(value).unwrap());
+            }
+            assert_eq!(actual, values, "{column_type} 分页边界错误");
+        }
+
+        let error = config
+            .extract_init_data(
+                "cdc_missing_table",
+                "missing_pk",
+                &InitPkCursor::Start,
+                2,
+                false,
+                &mut tx,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.message.contains(&config.database));
+        assert!(error.message.contains("table=cdc_missing_table"));
+        assert!(error.message.contains("pk=missing_pk"));
+        assert!(error.message.contains("stage=分页读取"));
+        assert!(error.message.contains("1146"));
+        assert!(matches!(error.error_type, CustomErrorType::Restart));
     }
 
     #[test]

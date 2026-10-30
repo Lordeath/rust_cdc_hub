@@ -162,6 +162,8 @@ export CONFIG_PATH=/path/to/config.yaml
 
 主键列会从 MySQL 表结构自动识别；参与数据同步的表需要单一整数主键（`tinyint`、`smallint`、`mediumint`、`int`、`bigint` 及其 unsigned 变体），或单一 `char(n)` / `varchar(n)` 字符串主键（当前 `n <= 512`）。不满足该条件的表在 `sync_no_pk_table_schema: true` 时仅同步表结构。只要存在数据同步表，启动时会校验 MySQL `binlog_format=ROW` 且 `binlog_row_image=FULL`，否则直接失败，避免 UPDATE/DELETE 缺少旧行数据。配置项 `pk_column` 已弃用，配置文件中出现该字段会在启动解析时报错。MeiliSearch 目标端的 `meili_table_pk` 仍需单独配置为索引主键字段。
 
+初始化全量读取按源主键顺序分页，分页游标采用参数绑定，字符串主键比较沿用源列的字符集和排序规则，避免 `utf8mb4_unicode_ci`、`utf8mb4_0900_ai_ci` 等规则混用导致错误 1267，无需为此统一修改源表 collation。初始化查询失败时，日志和面板最近错误会显示源库、表、主键、查询阶段及数据库错误；重试耗尽的退出日志也会保留最后一次错误。
+
 外键表默认参与同步。MySQL/Dameng 目标端会先创建基础表并完成初始化数据写入，再补外键约束；如果显式只同步部分表，缺少父表或子表的外键约束会跳过并记录告警，不会自动扩展同步表清单。达梦目标端会尽力补外键约束，单条约束因索引、数据或兼容性原因创建失败时会记录告警并继续同步。
 
 ### 多库同步模式（MySQL → MySQL/Dameng）

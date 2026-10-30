@@ -2319,11 +2319,14 @@ async fn main() {
         let start_result = source.lock().await.start(sink.clone()).await;
         if let Err(e) = start_result {
             retry_times = next_source_retry_count(retry_times, source_run_started_at.elapsed());
+            *ui_state.last_source_error.lock().await = Some(e.message.clone());
             if let Some(exit_code) = source_retry_exit_code(retry_times) {
-                error!("重试次数过多，程序退出: {}", retry_times);
+                error!(
+                    "重试次数过多，程序退出: {}，最后错误: {}",
+                    retry_times, e.message
+                );
                 process::exit(exit_code);
             }
-            *ui_state.last_source_error.lock().await = Some(e.message.clone());
             ui_state
                 .last_source_restart_at
                 .store(Utc::now().timestamp(), Ordering::Relaxed);
