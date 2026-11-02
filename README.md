@@ -246,6 +246,12 @@ ui_port: 8080
 
 checkpoint 使用 SQLite + WAL 持久化。首次启动 SQLite checkpoint 时，会自动扫描同目录旧版 `checkpoint_*.json` 文件并导入，旧 JSON 文件会保留作为回滚备份。运行中只有 `CheckpointService` 后台任务持有 SQLite 连接并执行写入；source/sink 只把已确认安全的表级 checkpoint 和 binlog stream checkpoint 提交到内存队列，由后台任务按 `checkpoint_flush_interval_secs` 合并后批量刷盘。无变化时不会写盘；长时间没有目标表数据但 binlog 持续推进时，stream checkpoint 会记录最近安全消费位点，避免重启后从很旧的表级 checkpoint 重新扫描大量无效 binlog。SQLite WAL 模式会在 checkpoint 文件旁产生 `-wal` 和 `-shm` 文件。状态页和 `/status` 会展示 checkpoint 后台任务的存活、dirty 数量、最近成功/失败和最后持久化位点。
 
+binlog 连续性检查会覆盖启动恢复、全量完成和重连。必需的日志缺失、位点无效或读取损坏时，整个同步任务停止，保留最后安全的恢复位点，禁止自动改用更晚位点或 `Latest`。网络断开允许有限重试。流级 checkpoint 在目标端 flush 成功后按已完整处理的事务推进；没有流级进度的旧 checkpoint 按最早表级位点恢复，所需旧日志已清理时也会停止。
+
+初始化会持久化全量阶段和原始快照起点。全量完成但尚未衔接 CDC 时，重启仍受原始起点约束；全量中断则停止并要求人工处理，不自动重新覆盖目标数据。恢复缺失日志或明确重建方案后再重启；重新全量前需要处理目标端已有的部分数据，直接删除 checkpoint 不能保证修复残余记录。
+
+同步停止后进程继续运行，启用 UI 时 `/status` 返回 `status: "failed"`、`retryable: false` 和错误原因，页面显示恢复提示；后台同步、定时 flush 和 checkpoint 推进停止。`/health` 仅表示进程存活，`/ready` 在初始化、重试及停止时返回 503，进入 CDC 后返回 200。关闭 UI 时不会额外开启监听端口。
+
 开启 `sync_stored_procedure` 后，MySQL/Dameng sink 初始化时会按源库到目标库的路由同步 `PROCEDURE` 和 `FUNCTION`。目标库已有同名对象且 `overwrite_stored_procedure: false` 时会跳过；设为 `true` 时，MySQL 目标端会先 `DROP PROCEDURE/FUNCTION IF EXISTS` 再重建，Dameng 目标端会使用 `CREATE OR REPLACE` 覆盖。同步前会从 `SHOW CREATE PROCEDURE/FUNCTION` 结果里去掉 `DEFINER=\`user\`@\`host\``，避免把源库用户带到目标库。MySQL → Dameng 会做基础 DMSQL 转换，复杂 MySQL 专有语法可能导致初始化失败并输出对象名和错误原因。
 
 `sync_stored_view` 默认开启。MySQL/Dameng sink 会在目标表结构准备好后读取源库 `SHOW CREATE VIEW` 结果，去掉 `DEFINER`，按库/schema 路由创建目标视图；目标库已有同名视图时跳过。MySQL → Dameng 会做基础 DMSQL 转换，若视图依赖其他视图会自动重试，最终仍失败时会输出视图名、目标 schema 和 SQL 摘要。
@@ -436,7 +442,8 @@ plugins:
 | 端点 | 说明 |
 | --- | --- |
 | `/` | HTML 状态页。 |
-| `/health` | 健康检查。 |
+| `/health` | 进程存活检查；同步停止后仍返回 200。 |
+| `/ready` | 同步就绪检查；初始化、重试或停止时返回 503。 |
 | `/status` | JSON 状态、配置摘要、flush 时间、重启次数等。 |
 | `/metrics` | Prometheus metrics。 |
 

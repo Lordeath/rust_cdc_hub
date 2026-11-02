@@ -2,8 +2,10 @@ extern crate core;
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, http::header, web};
 use common::checkpoint_manager::{CheckpointServiceHandle, checkpoint_service_from_config};
+use common::custom_error::{CustomError, CustomErrorType};
 use common::metrics::APP_RESTART_COUNT;
 use common::runtime_progress;
+use common::sync_control::SyncControl;
 use common::{
     CdcConfig, FlushByOperation, Plugin, PluginConfig, PluginType, ResolvedLogFileConfig, Sink,
     Source, TableInfoVo, get_mysql_pool_by_url, mysql_connection_url_from_config,
@@ -15,7 +17,7 @@ use source::SourceFactory;
 use sqlx::{MySql, Pool, Row};
 use std::error::Error;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, Pid, ProcessRefreshKind, RefreshKind, System};
 use tokio::sync::Mutex;
 
@@ -203,6 +205,9 @@ struct UiState {
     last_timer_flush_at: Arc<AtomicI64>,
     timer_flush_count: Arc<AtomicI64>,
     last_source_error: Arc<Mutex<Option<String>>>,
+    failed: Arc<AtomicBool>,
+    failed_at: Arc<AtomicI64>,
+    control: SyncControl,
     last_source_restart_at: Arc<AtomicI64>,
     source_restart_count: Arc<AtomicI64>,
     system_monitor: Arc<Mutex<System>>,
@@ -276,6 +281,9 @@ impl UiState {
             last_timer_flush_at: Arc::new(AtomicI64::new(0)),
             timer_flush_count: Arc::new(AtomicI64::new(0)),
             last_source_error: Arc::new(Mutex::new(None)),
+            failed: Arc::new(AtomicBool::new(false)),
+            failed_at: Arc::new(AtomicI64::new(0)),
+            control: SyncControl::default(),
             last_source_restart_at: Arc::new(AtomicI64::new(0)),
             source_restart_count: Arc::new(AtomicI64::new(0)),
             system_monitor: Arc::new(Mutex::new(System::new_with_specifics(
@@ -286,6 +294,14 @@ impl UiState {
             process_pid: process::id(),
             checkpoint_service,
         }
+    }
+
+    async fn mark_failed(&self, error: CustomError) {
+        self.control.stop(error.clone());
+        *self.last_source_error.lock().await = Some(error.message);
+        self.failed_at
+            .store(Utc::now().timestamp(), Ordering::Release);
+        self.failed.store(true, Ordering::Release);
     }
 
     async fn set_table_info_list(&self, table_info_list: Vec<TableInfoVo>) {
@@ -354,10 +370,22 @@ async fn ui_health() -> impl Responder {
     HttpResponse::Ok().body("ok")
 }
 
+async fn ui_ready(state: web::Data<UiState>) -> impl Responder {
+    if state.control.is_ready() && !state.failed.load(Ordering::Acquire) {
+        HttpResponse::Ok().body("ready")
+    } else {
+        HttpResponse::ServiceUnavailable().body("sync is not ready")
+    }
+}
+
 impl UiState {
     async fn snapshot(&self) -> serde_json::Value {
         let now = Utc::now().timestamp();
-        let last_source_error = self.last_source_error.lock().await.clone();
+        let last_source_error = if self.control.is_ready() {
+            None
+        } else {
+            self.last_source_error.lock().await.clone()
+        };
         let source_restart_count = self.source_restart_count.load(Ordering::Relaxed);
         let last_timer_flush_at = self.last_timer_flush_at.load(Ordering::Relaxed);
         let timer_flush_count = self.timer_flush_count.load(Ordering::Relaxed);
@@ -368,7 +396,9 @@ impl UiState {
             Some(checkpoint_service) => checkpoint_service.snapshot().await,
             None => common::checkpoint_manager::CheckpointServiceSnapshot::disabled_for_tests(),
         };
-        let health_status = if last_source_error.is_some() {
+        let health_status = if self.failed.load(Ordering::Acquire) {
+            "failed"
+        } else if last_source_error.is_some() {
             "degraded"
         } else if runtime_progress.schema_running || runtime_progress.initializing {
             "initializing"
@@ -390,6 +420,9 @@ impl UiState {
             "last_source_restart_at": last_source_restart_at,
             "source_restart_count": source_restart_count,
             "last_source_error": last_source_error,
+            "failed_at": self.failed_at.load(Ordering::Acquire),
+            "retryable": !self.failed.load(Ordering::Acquire),
+            "ready": self.control.is_ready(),
             "runtime_progress": runtime_progress,
             "resources": resources,
             "checkpoint_service": checkpoint_service,
@@ -400,6 +433,7 @@ impl UiState {
                 "status": "status",
                 "metrics": "metrics",
                 "health": "health",
+                "ready": "ready",
                 "split": if self.database_split_enabled() { "split" } else { "" }
             }
         })
@@ -1367,6 +1401,8 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       letter-spacing: .06em;
       font-size: 12px;
     }
+    .status-pill.failed { border-color: #ef4444; background: rgba(239, 68, 68, 0.14); color: #fecaca; }
+    .failed .dot { background: #ef4444; box-shadow: 0 0 0 6px rgba(239, 68, 68, 0.12); }
     .status-pill.degraded { border-color: rgba(249, 115, 22, 0.44); background: rgba(249, 115, 22, 0.14); color: #fed7aa; }
     .status-pill.initializing { border-color: rgba(56, 189, 248, 0.5); background: rgba(56, 189, 248, 0.14); color: #bae6fd; }
     .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent-2); box-shadow: 0 0 0 6px rgba(34, 197, 94, 0.12); }
@@ -1646,6 +1682,8 @@ const translations = {
     status_running: '运行中',
     status_initializing: '初始化中',
     status_degraded: '异常',
+    status_failed: '同步已停止',
+    recovery_hint: '请处理错误后重启任务；缺失 binlog 需恢复原日志或人工重建全量，禁止直接跳过位点。',
     status_unknown: '未知',
     status_stopped: '已停止',
     status_ui_error: '界面错误',
@@ -1762,6 +1800,8 @@ const translations = {
     status_running: 'Running',
     status_initializing: 'Initializing',
     status_degraded: 'Degraded',
+    status_failed: 'Sync stopped',
+    recovery_hint: 'Resolve the error and restart. Restore missing binlogs or manually rebuild the snapshot; do not skip positions.',
     status_unknown: 'Unknown',
     status_stopped: 'Stopped',
     status_ui_error: 'UI Error',
@@ -2140,6 +2180,7 @@ function renderStatusData(data) {
     const degraded = data.status === 'degraded';
     const initializing = data.status === 'initializing';
     el('statusPill').classList.toggle('degraded', degraded);
+    el('statusPill').classList.toggle('failed', data.status === 'failed');
     el('statusPill').classList.toggle('initializing', initializing);
     setText('statusText', displayStatus(data.status));
     setText('sourceType', cfg.source_type);
@@ -2152,7 +2193,7 @@ function renderStatusData(data) {
     setText('lastRestart', `${t('last_restart')}: ${fmtTs(data.last_source_restart_at)}`);
     setText('configScale', `${cfg.source_count ?? 0} → ${cfg.sink_count ?? 0}`);
     setText('pluginCount', `${t('plugins')}: ${cfg.plugin_count ?? 0}`);
-    setText('progressState', displayPhase(progress.initializing ? 'initializing' : (progressTables.length > 0 ? 'cdc' : 'running')));
+    setText('progressState', data.status === 'failed' ? t('status_failed') : displayPhase(progress.initializing ? 'initializing' : (progressTables.length > 0 ? 'cdc' : 'running')));
     setText('progressTable', progress.current_table || '-');
     setText('progressReadSynced', `${progressRead} / ${progressSynced}`);
     setText('progressFiltered', progressFiltered);
@@ -2184,7 +2225,7 @@ function renderStatusData(data) {
       kvRow('UI port', cfg.ui_port),
     ].join('');
     const errBox = el('errorBox');
-    errBox.textContent = data.last_source_error || t('no_source_error');
+    errBox.textContent = (data.last_source_error || t('no_source_error')) + (data.status === 'failed' ? '\n' + t('recovery_hint') : '');
     errBox.classList.toggle('empty', !data.last_source_error);
     setText('lastUpdated', fmtTs(data.now));
     el('rawJson').textContent = JSON.stringify(data, null, 2);
@@ -2231,6 +2272,7 @@ async fn start_ui(ui_state: UiState, bind: String, port: u16) -> Result<(), Box<
             .app_data(web::Data::new(ui_state.clone()))
             .route("/", web::get().to(ui_root))
             .route("/health", web::get().to(ui_health))
+            .route("/ready", web::get().to(ui_ready))
             .route("/status", web::get().to(ui_status))
             .route("/api/status", web::get().to(ui_status))
             .route("/api/admin/memory/trim", web::post().to(ui_memory_trim))
@@ -2297,65 +2339,129 @@ async fn main() {
             })
             .expect("spawn ui-server thread failed");
     }
-    let mut source: Arc<Mutex<dyn Source>> =
-        SourceFactory::create_source(&config, checkpoint_service.clone()).await;
+    let mut source = match setup_source(&config, checkpoint_service.clone()).await {
+        Ok(source) => source,
+        Err(error) => {
+            fail_and_wait(&ui_state, &checkpoint_service, error).await;
+            return;
+        }
+    };
     add_plugin(&config, &source).await;
     info!("成功创建source");
     let table_info_list = source.lock().await.get_table_info().await;
     ui_state.set_table_info_list(table_info_list.clone()).await;
-    let mut sink =
-        SinkFactory::create_sink(&config, table_info_list, checkpoint_service.clone()).await;
+    let mut sink = match setup_sink(&config, table_info_list, checkpoint_service.clone()).await {
+        Ok(sink) => sink,
+        Err(error) => {
+            source.lock().await.close().await;
+            drop(source);
+            fail_and_wait(&ui_state, &checkpoint_service, error).await;
+            return;
+        }
+    };
     info!("成功创建sink");
-    if let Err(e) = sink.lock().await.connect().await {
-        error!("Failed to connect to sink: {}", e);
-        panic!("Failed to connect to sink: {}", e);
+    let connected = sink.lock().await.connect().await;
+    if let Err(error) = connected {
+        source.lock().await.close().await;
+        sink.lock().await.close().await;
+        drop(source);
+        drop(sink);
+        fail_and_wait(
+            &ui_state,
+            &checkpoint_service,
+            CustomError::fatal(format!("目标端连接失败: {error}")),
+        )
+        .await;
+        return;
     }
     info!("成功连接到sink");
-    add_flush_timer(&config, &sink, ui_state.clone());
-    info!("成功增加flush timer");
     let mut retry_times = 0;
     loop {
+        source
+            .lock()
+            .await
+            .set_sync_control(ui_state.control.clone());
+        let timer = add_flush_timer(&config, &sink, ui_state.clone());
         let source_run_started_at = Instant::now();
-        let start_result = source.lock().await.start(sink.clone()).await;
-        if let Err(e) = start_result {
-            retry_times = next_source_retry_count(retry_times, source_run_started_at.elapsed());
-            *ui_state.last_source_error.lock().await = Some(e.message.clone());
-            if let Some(exit_code) = source_retry_exit_code(retry_times) {
-                error!(
-                    "重试次数过多，程序退出: {}，最后错误: {}",
-                    retry_times, e.message
-                );
-                process::exit(exit_code);
+        let source_for_run = source.clone();
+        let sink_for_run = sink.clone();
+        let result =
+            tokio::spawn(async move { source_for_run.lock().await.start(sink_for_run).await })
+                .await
+                .unwrap_or_else(|error| {
+                    Err(CustomError::fatal(format!("同步任务异常终止: {error}")))
+                });
+        let error = match result {
+            Ok(()) => {
+                ui_state.control.stop(CustomError::fatal("同步任务已结束"));
+                let _ = timer.await;
+                break;
             }
-            ui_state
-                .last_source_restart_at
-                .store(Utc::now().timestamp(), Ordering::Relaxed);
-            APP_RESTART_COUNT.with_label_values(&["source"]).inc();
-            ui_state
-                .source_restart_count
-                .fetch_add(1, Ordering::Relaxed);
-            error!("尝试进行重试 {}: {}", retry_times, e.message);
-            // 先关闭旧source释放资源
+            Err(error) => error,
+        };
+        ui_state.control.stop(error.clone());
+        *ui_state.last_source_error.lock().await = Some(error.message.clone());
+        // 协作停止定时器，等待在途 flush 完成，不能直接 abort 数据库写入。
+        let _ = timer.await;
+        let error = ui_state.control.cancelled().await;
+        source.lock().await.close().await;
+        sink.lock().await.close().await;
+        retry_times = next_source_retry_count(retry_times, source_run_started_at.elapsed());
+        *ui_state.last_source_error.lock().await = Some(error.message.clone());
+        if matches!(error.error_type, CustomErrorType::Fatal)
+            || source_retry_exit_code(retry_times).is_some()
+        {
+            drop(source);
+            drop(sink);
+            fail_and_wait(&ui_state, &checkpoint_service, error).await;
+            return;
+        }
+        ui_state
+            .last_source_restart_at
+            .store(Utc::now().timestamp(), Ordering::Relaxed);
+        ui_state
+            .source_restart_count
+            .fetch_add(1, Ordering::Relaxed);
+        APP_RESTART_COUNT.with_label_values(&["source"]).inc();
+        error!("从安全 checkpoint 重试 {}: {}", retry_times, error.message);
+        sleep(Duration::from_secs(2)).await;
+        // 旧任务与定时器均已结束，重试才可以重置停止信号。
+        ui_state.control.reset();
+        source = match setup_source(&config, checkpoint_service.clone()).await {
+            Ok(source) => source,
+            Err(error) => {
+                drop(source);
+                drop(sink);
+                fail_and_wait(&ui_state, &checkpoint_service, error).await;
+                return;
+            }
+        };
+        add_plugin(&config, &source).await;
+        let table_info_list = source.lock().await.get_table_info().await;
+        ui_state.set_table_info_list(table_info_list.clone()).await;
+        sink = match setup_sink(&config, table_info_list, checkpoint_service.clone()).await {
+            Ok(sink) => sink,
+            Err(error) => {
+                source.lock().await.close().await;
+                drop(source);
+                drop(sink);
+                fail_and_wait(&ui_state, &checkpoint_service, error).await;
+                return;
+            }
+        };
+        let connected = sink.lock().await.connect().await;
+        if let Err(error) = connected {
             source.lock().await.close().await;
-            // 关闭sink确保事务被释放
             sink.lock().await.close().await;
-            // 添加重试间隔，避免立即重试导致资源耗尽
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            // 重新创建source获取表信息
-            source = SourceFactory::create_source(&config, checkpoint_service.clone()).await;
-            add_plugin(&config, &source).await;
-            let table_info_list = source.lock().await.get_table_info().await;
-            ui_state.set_table_info_list(table_info_list.clone()).await;
-            // 重新创建sink并连接
-            sink = SinkFactory::create_sink(&config, table_info_list, checkpoint_service.clone())
-                .await;
-            if let Err(e) = sink.lock().await.connect().await {
-                error!("Failed to connect to sink: {}", e);
-                panic!("Failed to connect to sink: {}", e);
-            }
-            add_flush_timer(&config, &sink, ui_state.clone());
-        } else {
-            break;
+            drop(source);
+            drop(sink);
+            fail_and_wait(
+                &ui_state,
+                &checkpoint_service,
+                CustomError::fatal(format!("目标端重连失败: {error}")),
+            )
+            .await;
+            return;
         }
     }
     info!("程序结束");
@@ -2409,7 +2515,7 @@ fn add_flush_timer(
     config: &CdcConfig,
     sink: &Arc<Mutex<dyn Sink + Send + Sync>>,
     ui_state: UiState,
-) {
+) -> tokio::task::JoinHandle<()> {
     let flush_interval_secs = config
         .first_sink("flush_interval_secs")
         .parse::<u64>()
@@ -2422,7 +2528,10 @@ fn add_flush_timer(
 
         loop {
             // 等待时间窗口到达
-            sleep(timer_interval).await;
+            tokio::select! {
+                _ = ui_state_for_timer.control.cancelled() => break,
+                _ = sleep(timer_interval) => {}
+            }
             let Some(sink) = sink_for_timer.upgrade() else {
                 info!("Sink Timer stopped because sink was replaced.");
                 break;
@@ -2433,12 +2542,81 @@ fn add_flush_timer(
             ui_state_for_timer
                 .timer_flush_count
                 .fetch_add(1, Ordering::Relaxed);
-            sink.lock()
-                .await
-                .flush_with_retry(&FlushByOperation::Timer)
-                .await;
+            let mut sink = sink.lock().await;
+            if ui_state_for_timer.control.check().is_err() {
+                break;
+            }
+            if let Err(error) = sink.flush_with_retry(&FlushByOperation::Timer).await {
+                ui_state_for_timer
+                    .control
+                    .stop(CustomError::fatal(format!("定时 flush 失败: {error}")));
+                break;
+            }
         }
-    });
+    })
+}
+
+async fn setup_source(
+    config: &CdcConfig,
+    service: CheckpointServiceHandle,
+) -> Result<Arc<Mutex<dyn Source>>, CustomError> {
+    let config = config.clone();
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            tokio::task::spawn_local(
+                async move { SourceFactory::create_source(&config, service).await },
+            )
+            .await
+        })
+        .await
+        .map_err(|error| CustomError::fatal(format!("源端初始化失败，无法安全启动: {error}")))
+}
+
+async fn setup_sink(
+    config: &CdcConfig,
+    tables: Vec<TableInfoVo>,
+    service: CheckpointServiceHandle,
+) -> Result<Arc<Mutex<dyn Sink + Send + Sync>>, CustomError> {
+    let config = config.clone();
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            tokio::task::spawn_local(async move {
+                SinkFactory::create_sink(&config, tables, service).await
+            })
+            .await
+        })
+        .await
+        .map_err(|error| CustomError::fatal(format!("目标端初始化失败，无法安全启动: {error}")))
+}
+
+async fn fail_and_wait(state: &UiState, service: &CheckpointServiceHandle, error: CustomError) {
+    if let Err(checkpoint_error) = service.suspend().await {
+        error!("停止 checkpoint 写入失败: {}", checkpoint_error);
+    }
+    error!(
+        "同步已停止，状态页面继续提供服务；请人工处理后重启: {}",
+        error.message
+    );
+    state.mark_failed(error).await;
+    wait_for_shutdown().await;
+}
+
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn get_env(key: &str) -> String {
@@ -2562,6 +2740,74 @@ impl FormatTime for CustomTime {
 mod tests {
     use super::*;
     use actix_web::{body::to_bytes, http::StatusCode, test as actix_test};
+
+    #[tokio::test]
+    async fn stopped_flush_timer_exits_without_another_flush() {
+        let cfg = test_config();
+        let state = UiState::new_with_started_at(&cfg, 0);
+        let sink = SinkFactory::create_sink(
+            &cfg,
+            Vec::new(),
+            CheckpointServiceHandle::disabled_for_tests(),
+        )
+        .await;
+        let timer = add_flush_timer(&cfg, &sink, state.clone());
+        state.control.stop(CustomError::fatal("binlog 缺失"));
+        tokio::time::timeout(Duration::from_secs(1), timer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.timer_flush_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[actix_web::test]
+    async fn failed_sync_keeps_status_and_liveness_but_is_not_ready() {
+        let state = UiState::new_with_started_at(&test_config(), 123);
+        state.control.mark_ready();
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(state.clone()))
+                .route("/health", web::get().to(ui_health))
+                .route("/ready", web::get().to(ui_ready))
+                .route("/status", web::get().to(ui_status)),
+        )
+        .await;
+        let ready = actix_test::call_service(
+            &app,
+            actix_test::TestRequest::get().uri("/ready").to_request(),
+        )
+        .await;
+        assert_eq!(ready.status(), StatusCode::OK);
+        state
+            .mark_failed(CustomError::fatal("mysql-bin.000010/120 已被清理"))
+            .await;
+        for (url, expected) in [
+            ("/health", StatusCode::OK),
+            ("/ready", StatusCode::SERVICE_UNAVAILABLE),
+            ("/status", StatusCode::OK),
+        ] {
+            let response = actix_test::call_service(
+                &app,
+                actix_test::TestRequest::get().uri(url).to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), expected);
+            if url == "/status" {
+                let body = to_bytes(response.into_body()).await.unwrap();
+                let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(status["status"], "failed");
+                assert_eq!(status["retryable"], false);
+                assert_eq!(status["ready"], false);
+                assert!(
+                    status["last_source_error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("mysql-bin.000010/120")
+                );
+                assert_eq!(status["source_restart_count"], 0);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn flush_timer_does_not_keep_replaced_sink_alive() {

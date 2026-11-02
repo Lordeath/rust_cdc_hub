@@ -6,6 +6,7 @@ pub mod metrics;
 pub mod mysql_checkpoint;
 pub mod runtime_progress;
 pub mod schema;
+pub mod sync_control;
 
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
@@ -14,9 +15,9 @@ use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{fmt, process};
 use strum_macros::Display;
 use tokio::sync::Mutex;
 use tracing::{error, info, trace};
@@ -33,6 +34,7 @@ use serde_json::Value as JsonValue;
 
 #[async_trait]
 pub trait Source: Send + Sync {
+    fn set_sync_control(&mut self, _control: sync_control::SyncControl) {}
     async fn start(&mut self, sink: Arc<Mutex<dyn Sink + Send + Sync>>) -> Result<(), CustomError>;
 
     async fn add_plugins(&mut self, plugin: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>);
@@ -56,7 +58,7 @@ pub trait Sink: Send + Sync {
         mysql_check_point_detail_entity: &Option<MysqlCheckPointDetailEntity>,
     ) -> Result<(), Box<dyn Error + Send + Sync>>;
 
-    async fn flush_with_retry(&mut self, from_timer: &FlushByOperation) {
+    async fn flush_with_retry(&mut self, from_timer: &FlushByOperation) -> Result<(), String> {
         let mut loop_count = 0;
         loop {
             loop_count += 1;
@@ -64,25 +66,18 @@ pub trait Sink: Send + Sync {
             if sink_result.is_ok() {
                 break;
             }
-            error!(
-                "error occurred {} loop_count: {}",
-                sink_result.expect_err("error not found").to_string(),
-                loop_count
-            );
+            let error = sink_result.expect_err("error not found");
+            error!("error occurred {} loop_count: {}", error, loop_count);
             tokio::time::sleep(Duration::from_millis(100)).await;
             if loop_count > 30 {
                 error!("flush error");
-                process::exit(1);
+                return Err(format!(
+                    "目标端 flush 重试耗尽，缓冲数据未确认写入: {error}"
+                ));
             }
         }
         trace!("flush success");
-        match self.alter_flush().await {
-            Ok(_) => {}
-            Err(e) => {
-                error!("alter flush error: {}", e.to_string());
-                process::exit(1);
-            }
-        }
+        self.alter_flush().await
     }
 
     /// 刷新缓冲区（可选）

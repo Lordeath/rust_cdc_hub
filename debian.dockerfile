@@ -3,7 +3,8 @@
 # =========================
 ARG RUST_IMAGE=rust:1-bullseye
 ARG RUNTIME_IMAGE=debian:bullseye-20260421
-ARG DEBIAN_MIRROR=mirrors.aliyun.com
+# Bullseye 已结束 LTS，使用官方归档，避免普通镜像源的历史软件包 404。
+ARG DEBIAN_MIRROR=archive.debian.org
 ARG CARGO_REGISTRY=sparse+https://rsproxy.cn/index/
 FROM ${RUST_IMAGE} AS builder
 

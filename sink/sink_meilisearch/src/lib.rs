@@ -112,7 +112,9 @@ impl Sink for MeiliSearchSink {
         }
         if buf.len() >= BATCH_SIZE {
             drop(buf);
-            self.flush_with_retry(&FlushByOperation::Signal).await;
+            self.flush_with_retry(&FlushByOperation::Signal)
+                .await
+                .map_err(std::io::Error::other)?;
         }
 
         Ok(())

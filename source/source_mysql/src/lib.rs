@@ -6,11 +6,14 @@ use common::checkpoint_manager::{CheckpointServiceHandle, StreamCheckpoint};
 use common::custom_error::{CustomError, CustomErrorType};
 use common::initialization_timing;
 use common::metrics::{SOURCE_EVENTS_TOTAL, SOURCE_LAG_POSITION};
-use common::mysql_checkpoint::MysqlCheckPointDetailEntity;
+use common::mysql_checkpoint::{
+    MysqlCheckPointDetailEntity, MysqlInitialization, MysqlInitializationPhase,
+};
 use common::runtime_progress;
 use common::schema::{
     extract_mysql_create_table_column_definitions, mysql_type_token_from_column_definition,
 };
+use common::sync_control::SyncControl;
 use common::{
     CdcConfig, DataBuffer, FlushByOperation, ForeignKeyInfo, Operation, Plugin, Sink, Source,
     TableIndexInfo, TableInfoVo, Value, database_table_key,
@@ -55,6 +58,9 @@ pub struct MySQLSource {
     checkpoint_service: CheckpointServiceHandle,
     stream_checkpoints: Mutex<Vec<Option<StreamCheckpoint>>>,
     init_parallelism: usize,
+    control: SyncControl,
+    startup_error: Option<CustomError>,
+    committed_positions: Mutex<Vec<Option<(String, u32)>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1269,6 +1275,7 @@ impl MysqlSourceConfigDetail {
 
 impl MySQLSource {
     pub async fn new(config: &CdcConfig, checkpoint_service: CheckpointServiceHandle) -> Self {
+        let mut startup_error = None;
         let mut streams: Vec<Option<BinlogStream>> = vec![];
         let mut mysql_source: Vec<MysqlSourceConfigDetail> = vec![];
         let mut pools: Vec<Pool<MySql>> = vec![];
@@ -1282,9 +1289,11 @@ impl MySQLSource {
         for i in 0..size {
             let connection_url = cfg.mysql_source[i].connection_url.clone();
             let pool: Pool<MySql> = cfg.pools[i].clone();
-            Self::ensure_binlog_settings_for_data_sync(&cfg.mysql_source[i], &pool)
-                .await
-                .unwrap_or_else(|e| panic!("{}", e.message));
+            if let Err(error) =
+                Self::ensure_binlog_settings_for_data_sync(&cfg.mysql_source[i], &pool).await
+            {
+                startup_error = Some(CustomError::fatal(error.message));
+            }
             let tables: Vec<String> = cfg.mysql_source[i]
                 .table_info_list
                 .clone()
@@ -1308,6 +1317,10 @@ impl MySQLSource {
                             &checkpoint_service,
                         )
                         .await
+                        .unwrap_or_else(|error| {
+                            startup_error = Some(error);
+                            Self::random_check_checkpoint_entity(table.clone())
+                        })
                     };
                 mysql_checkpoint_detail_entity_map
                     .insert(table.to_lowercase(), mysql_checkpoint_detail_entity);
@@ -1345,15 +1358,15 @@ impl MySQLSource {
             {
                 Ok(value) => value,
                 Err(e) => {
-                    warn!(
-                        "读取 stream checkpoint 失败，忽略并回退表级 checkpoint: key={} error={}",
-                        stream_key, e
-                    );
+                    startup_error = Some(CustomError::fatal(format!(
+                        "读取 stream checkpoint 失败: key={stream_key}, error={e}"
+                    )));
                     None
                 }
             };
             stream_checkpoints.push(stream_checkpoint);
         }
+        let stream_count = cfg.stream_groups.len();
         Self {
             streams,
             stream_groups: cfg.stream_groups,
@@ -1366,6 +1379,9 @@ impl MySQLSource {
             checkpoint_service,
             stream_checkpoints: Mutex::new(stream_checkpoints),
             init_parallelism: config.multi_mode_init_parallelism(),
+            committed_positions: Mutex::new(vec![None; stream_count]),
+            control: SyncControl::default(),
+            startup_error,
         }
     }
 
@@ -1374,6 +1390,7 @@ impl MySQLSource {
             last_binlog_filename: String::new(),
             last_binlog_position: 0,
             retry_times: 0,
+            initialization: Default::default(),
             is_new: true,
             checkpoint_filepath: format!("memory://random-check/{}", table),
             table,
@@ -1381,54 +1398,225 @@ impl MySQLSource {
     }
 
     async fn record_stream_checkpoints(&self) -> Result<(), CustomError> {
-        for (stream_index, group) in self.stream_groups.iter().enumerate() {
-            let binlog_filename = self.binlog_filename_list.lock().await[stream_index]
-                .lock()
-                .await
-                .clone();
-            let binlog_position = *self.binlog_position_list.lock().await[stream_index]
-                .lock()
-                .await;
-            if binlog_filename.is_empty() || binlog_position == 0 {
+        self.control.check()?;
+        for (index, group) in self.stream_groups.iter().enumerate() {
+            let Some((file, position)) = self.committed_positions.lock().await[index].clone()
+            else {
                 continue;
-            }
+            };
             self.checkpoint_service
-                .record_stream_consumed(
-                    stream_checkpoint_key(group),
-                    binlog_filename,
-                    binlog_position,
-                )
+                .record_stream_consumed(stream_checkpoint_key(group), file.clone(), position)
                 .await
-                .map_err(|e| CustomError {
-                    message: format!("checkpoint service record stream checkpoint failed: {}", e),
-                    error_type: CustomErrorType::Restart,
-                })?;
+                .map_err(CustomError::fatal)?;
+            self.stream_checkpoints.lock().await[index] = Some(StreamCheckpoint::new(
+                stream_checkpoint_key(group),
+                file.clone(),
+                position,
+            ));
+            // 只有目标 flush 成功后的完整事务位点，才能解除快照恢复约束。
+            let checkpoints = self.checkpoint_entities.lock().await;
+            for source_index in &group.source_indices {
+                let mut tables = checkpoints[*source_index].lock().await;
+                for entity in tables.values_mut() {
+                    if entity.initialization.phase == MysqlInitializationPhase::AwaitingCdc
+                        && compare_binlog_positions(
+                            (file.as_str(), position),
+                            (
+                                entity.initialization.snapshot_file.as_str(),
+                                entity.initialization.snapshot_position,
+                            ),
+                        )
+                        .is_ge()
+                    {
+                        entity.initialization.phase = MysqlInitializationPhase::Streaming;
+                        self.checkpoint_service
+                            .record_table_applied(&entity.table, entity.clone())
+                            .await
+                            .map_err(CustomError::fatal)?;
+                    }
+                }
+            }
         }
+        self.checkpoint_service
+            .flush_now()
+            .await
+            .map_err(CustomError::fatal)
+    }
+
+    async fn flush_cdc(
+        &self,
+        sink: &Arc<Mutex<dyn Sink + Send + Sync>>,
+    ) -> Result<(), CustomError> {
+        let mut sink = sink.lock().await;
+        self.control.check()?;
+        sink.flush_with_retry(&FlushByOperation::Cdc)
+            .await
+            .map_err(CustomError::fatal)?;
+        self.record_stream_checkpoints().await
+    }
+
+    async fn save_resume_floor(
+        &self,
+        index: usize,
+        file: &str,
+        position: u32,
+    ) -> Result<(), CustomError> {
+        let current = self.stream_checkpoints.lock().await[index].clone();
+        if current.as_ref().is_some_and(|checkpoint| {
+            compare_binlog_positions(
+                (
+                    checkpoint.binlog_filename.as_str(),
+                    checkpoint.binlog_position,
+                ),
+                (file, position),
+            )
+            .is_le()
+        }) {
+            return Ok(());
+        }
+        // 首次 CDC flush 之前也要有恢复基线，防止旧表级 checkpoint 在
+        // 多行事件只写了一部分时就推进到事件末尾，导致重启跳过剩余行。
+        let key = stream_checkpoint_key(&self.stream_groups[index]);
+        self.checkpoint_service
+            .record_stream_consumed(key.clone(), file.to_string(), position)
+            .await
+            .map_err(CustomError::fatal)?;
+        self.checkpoint_service
+            .flush_now()
+            .await
+            .map_err(CustomError::fatal)?;
+        self.stream_checkpoints.lock().await[index] =
+            Some(StreamCheckpoint::new(key, file.to_string(), position));
         Ok(())
     }
 
-    async fn write_record_with_retry(
+    async fn write_record_checked(
         sink: &mut Arc<Mutex<dyn Sink + Send + Sync>>,
         data_buffer: &DataBuffer,
-        mysql_check_point_detail_entity: Option<MysqlCheckPointDetailEntity>,
-    ) {
-        let mut loop_count = 0;
-        loop {
-            trace!("write record retry: {}", loop_count);
-            let sink_result = sink
-                .lock()
-                .await
-                .write_record(data_buffer, &mysql_check_point_detail_entity)
-                .await;
-            trace!("write record retry result: {:?}", sink_result);
-            if sink_result.is_ok() {
-                break;
+        checkpoint: Option<MysqlCheckPointDetailEntity>,
+        control: &SyncControl,
+    ) -> Result<(), CustomError> {
+        // write_record 可能先入缓冲再触发 flush，失败后再次入队会重复数据。
+        let mut sink = sink.lock().await;
+        control.check()?;
+        sink.write_record(data_buffer, &checkpoint)
+            .await
+            .map_err(|error| CustomError::fatal(format!("目标端写入未确认: {error}")))
+    }
+
+    async fn ensure_binlog_position(
+        pool: &Pool<MySql>,
+        file: &str,
+        position: u32,
+        context: &str,
+    ) -> Result<(), CustomError> {
+        let rows = tokio::time::timeout(
+            Duration::from_secs(10),
+            sqlx::query("SHOW BINARY LOGS").fetch_all(pool),
+        )
+        .await
+        .map_err(|error| {
+            CustomError::fatal(format!(
+                "验证 binlog 超时: {context}, file={file}, position={position}, error={error}"
+            ))
+        })?
+        .map_err(|error| {
+            CustomError::fatal(format!(
+                "无法验证 binlog: {context}, file={file}, position={position}, error={error}"
+            ))
+        })?;
+        let logs = rows
+            .iter()
+            .map(|row| Ok((row.try_get::<String, _>(0)?, row.try_get::<u64, _>(1)?)))
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(|error| {
+                CustomError::fatal(format!("解析 binlog 列表失败: {context}, error={error}"))
+            })?;
+        validate_binlog_position(file, position, &logs, context)
+    }
+
+    async fn validate_resume_positions(&self) -> Result<(), CustomError> {
+        for (index, group) in self.stream_groups.iter().enumerate() {
+            let mut tables = HashMap::new();
+            let checkpoints = self.checkpoint_entities.lock().await;
+            for source_index in &group.source_indices {
+                tables.extend(checkpoints[*source_index].lock().await.clone());
             }
-            loop_count += 1;
-            if loop_count >= 3 {
-                panic!("flush error");
+            drop(checkpoints);
+            for cp in tables.values() {
+                if cp.initialization.phase == MysqlInitializationPhase::Copying {
+                    return Err(CustomError::fatal(format!(
+                        "全量初始化中断，需人工处理后重建: table={}, file={}, position={}",
+                        cp.table,
+                        cp.initialization.snapshot_file,
+                        cp.initialization.snapshot_position
+                    )));
+                }
+                if !cp.is_new && (cp.last_binlog_filename.is_empty() || cp.last_binlog_position < 4)
+                {
+                    return Err(CustomError::fatal(format!(
+                        "已有表缺少有效 checkpoint，禁止回退 Latest: table={}",
+                        cp.table
+                    )));
+                }
+                if cp.initialization.phase == MysqlInitializationPhase::AwaitingCdc
+                    && (cp.initialization.snapshot_file.is_empty()
+                        || cp.initialization.snapshot_position < 4)
+                {
+                    return Err(CustomError::fatal(format!(
+                        "初始化快照起点无效，停止同步: table={}",
+                        cp.table
+                    )));
+                }
+            }
+            let stream = self.stream_checkpoints.lock().await[index].clone();
+            if let Some(cp) = &stream
+                && (cp.binlog_filename.is_empty() || cp.binlog_position < 4)
+            {
+                return Err(CustomError::fatal(format!(
+                    "无效的流级 checkpoint: key={}",
+                    cp.stream_key
+                )));
+            }
+            let safe = compute_resume_position(None, None, stream.as_ref(), &tables);
+            if let (Some(file), Some(position)) =
+                (&group.start_binlog_filename, group.start_binlog_position)
+            {
+                if let ResumePosition::BinlogPosition(safe_file, safe_position) = &safe
+                    && compare_binlog_positions(
+                        (file.as_str(), position),
+                        (safe_file.as_str(), *safe_position),
+                    )
+                    .is_gt()
+                {
+                    return Err(CustomError::fatal(format!(
+                        "配置起点会跳过未确认数据，停止同步: configured={file}/{position}, safe={safe_file}/{safe_position}"
+                    )));
+                }
+                Self::ensure_binlog_position(
+                    &self.pools[group.source_indices[0]],
+                    file,
+                    position,
+                    "配置起点",
+                )
+                .await?;
+            } else if group.start_binlog_filename.is_some() != group.start_binlog_position.is_some()
+            {
+                return Err(CustomError::fatal(
+                    "binlog_filename 与 binlog_position 必须同时提供",
+                ));
+            }
+            if let ResumePosition::BinlogPosition(file, position) = safe {
+                Self::ensure_binlog_position(
+                    &self.pools[group.source_indices[0]],
+                    &file,
+                    position,
+                    "启动恢复",
+                )
+                .await?;
             }
         }
+        Ok(())
     }
 
     async fn fetch_master_status(pool: &Pool<MySql>) -> Result<(String, u32), CustomError> {
@@ -1568,7 +1756,18 @@ impl MySQLSource {
         plugins: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>,
         mut sink: Arc<Mutex<dyn Sink + Send + Sync>>,
         checkpoint_service: CheckpointServiceHandle,
+        control: SyncControl,
     ) -> Result<(usize, HashMap<String, MysqlCheckPointDetailEntity>, bool), CustomError> {
+        control.check()?;
+        if let Some(cp) = checkpoints
+            .values()
+            .find(|cp| cp.initialization.phase == MysqlInitializationPhase::Copying)
+        {
+            return Err(CustomError::fatal(format!(
+                "初始化中断，需人工处理目标端后重新全量: table={}, file={}, position={}",
+                cp.table, cp.initialization.snapshot_file, cp.initialization.snapshot_position
+            )));
+        }
         let any_new = config.table_info_list.iter().any(|table_info| {
             if !MysqlSourceConfigDetail::is_cdc_table(table_info) {
                 return false;
@@ -1607,9 +1806,33 @@ impl MySQLSource {
             {
                 cp.last_binlog_filename = file.clone();
                 cp.last_binlog_position = pos;
+                cp.initialization = MysqlInitialization {
+                    phase: MysqlInitializationPhase::Copying,
+                    snapshot_file: file.clone(),
+                    snapshot_position: pos,
+                };
+                if !config.random_check_data_after_init {
+                    checkpoint_service
+                        .record_table_applied(&table_key, cp.clone())
+                        .await
+                        .map_err(CustomError::fatal)?;
+                }
             }
         }
-
+        Self::ensure_binlog_position(
+            &pool,
+            &file,
+            pos,
+            &format!("database={}, stage=全量开始", config.database),
+        )
+        .await?;
+        if !config.random_check_data_after_init {
+            checkpoint_service
+                .flush_now()
+                .await
+                .map_err(CustomError::fatal)?;
+        }
+        let mut completed_tables = Vec::new();
         let mut tx = pool.begin().await.map_err(|e| CustomError {
             message: e.to_string(),
             error_type: CustomErrorType::Restart,
@@ -1652,17 +1875,19 @@ impl MySQLSource {
                 );
             }
             loop {
+                control.check()?;
                 let extract_limit = validation_init_limit.unwrap_or(config.batchsize);
-                let data_buffer_list: Vec<DataBuffer> = config
-                    .extract_init_data(
+                let data_buffer_list: Vec<DataBuffer> = tokio::select! {
+                    error = control.cancelled() => return Err(error),
+                    rows = config.extract_init_data(
                         &table_name,
                         &pk_column,
                         &cursor,
                         extract_limit,
                         validation_init_limit.is_some(),
                         &mut tx,
-                    )
-                    .await?;
+                    ) => rows?,
+                };
                 let len = data_buffer_list.len();
                 for data_buffer in data_buffer_list {
                     runtime_progress::record_read(
@@ -1680,7 +1905,7 @@ impl MySQLSource {
                     });
                     let plugin_data = detail_with_plugin(&plugins, data_buffer).await;
                     if let Ok(item) = plugin_data {
-                        Self::write_record_with_retry(&mut sink, &item, None).await;
+                        Self::write_record_checked(&mut sink, &item, None, &control).await?;
                         runtime_progress::record_synced(&progress_label).await;
                     } else {
                         runtime_progress::record_filtered(&progress_label).await;
@@ -1700,7 +1925,8 @@ impl MySQLSource {
                 sink.lock()
                     .await
                     .flush_with_retry(&FlushByOperation::Init)
-                    .await;
+                    .await
+                    .map_err(CustomError::fatal)?;
             }
             info!(
                 "MySQL数据源初始化完成 {}.{} count: {} cost: {:?}",
@@ -1710,7 +1936,7 @@ impl MySQLSource {
                 start.elapsed()
             );
             runtime_progress::finish_table_initialization(&progress_label).await;
-            if let Some(cp) = checkpoints.get_mut(table_key.to_lowercase().as_str()) {
+            if checkpoints.contains_key(table_key.to_lowercase().as_str()) {
                 if validation_init_limit.is_some() {
                     info!(
                         "MySQL数据源初始化验证模式跳过checkpoint完成标记: {}.{}",
@@ -1718,28 +1944,38 @@ impl MySQLSource {
                     );
                     continue;
                 }
-                cp.is_new = false;
-                checkpoint_service
-                    .record_table_applied(&table_key, cp.clone())
-                    .await
-                    .map_err(|e| CustomError {
-                        message: format!("checkpoint service record init checkpoint failed: {}", e),
-                        error_type: CustomErrorType::Restart,
-                    })?;
-                checkpoint_service
-                    .flush_now()
-                    .await
-                    .map_err(|e| CustomError {
-                        message: format!("checkpoint service flush init checkpoint failed: {}", e),
-                        error_type: CustomErrorType::Restart,
-                    })?;
-                info!("checkpoint init flush success {}", cp.checkpoint_filepath);
+                completed_tables.push(table_key);
             }
         }
         tx.commit().await.map_err(|e| CustomError {
             message: e.to_string(),
             error_type: CustomErrorType::Restart,
         })?;
+        control.check()?;
+        Self::ensure_binlog_position(
+            &pool,
+            &file,
+            pos,
+            &format!("database={}, stage=全量完成", config.database),
+        )
+        .await?;
+        for key in completed_tables {
+            let cp = checkpoints
+                .get_mut(&key.to_lowercase())
+                .expect("初始化 checkpoint 存在");
+            cp.is_new = false;
+            cp.initialization.phase = MysqlInitializationPhase::AwaitingCdc;
+            checkpoint_service
+                .record_table_applied(&key, cp.clone())
+                .await
+                .map_err(CustomError::fatal)?;
+        }
+        if !config.random_check_data_after_init {
+            checkpoint_service
+                .flush_now()
+                .await
+                .map_err(CustomError::fatal)?;
+        }
         Ok((source_index, checkpoints, true))
     }
 
@@ -2433,55 +2669,73 @@ enum ResumePosition {
     BinlogPosition(String, u32),
 }
 
+fn compare_binlog_positions(left: (&str, u32), right: (&str, u32)) -> std::cmp::Ordering {
+    let filenames = match (left.0.rsplit_once('.'), right.0.rsplit_once('.')) {
+        (Some((prefix_a, suffix_a)), Some((prefix_b, suffix_b))) if prefix_a == prefix_b => {
+            match (suffix_a.parse::<u64>(), suffix_b.parse::<u64>()) {
+                (Ok(a), Ok(b)) => a.cmp(&b),
+                _ => left.0.cmp(right.0),
+            }
+        }
+        _ => left.0.cmp(right.0),
+    };
+    filenames.then(left.1.cmp(&right.1))
+}
+
 fn compute_resume_position(
     runtime_binlog_filename: Option<&str>,
     runtime_binlog_position: Option<u32>,
     stream_checkpoint: Option<&StreamCheckpoint>,
     checkpoints: &HashMap<String, MysqlCheckPointDetailEntity>,
 ) -> ResumePosition {
-    if let (Some(f), Some(p)) = (runtime_binlog_filename, runtime_binlog_position)
-        && !f.is_empty()
-        && p > 0
-    {
-        return ResumePosition::BinlogPosition(f.to_string(), p);
+    let valid = |file: &str, position| !file.is_empty() && position >= 4;
+    let stream = stream_checkpoint
+        .filter(|cp| valid(&cp.binlog_filename, cp.binlog_position))
+        .map(|cp| (cp.binlog_filename.clone(), cp.binlog_position));
+    let mut positions = Vec::new();
+    if let Some(stream) = stream.clone() {
+        positions.push(stream);
+    } else {
+        positions.extend(
+            checkpoints
+                .values()
+                .filter(|cp| valid(&cp.last_binlog_filename, cp.last_binlog_position))
+                .map(|cp| (cp.last_binlog_filename.clone(), cp.last_binlog_position)),
+        );
     }
-
-    let table_max = checkpoints.values().max_by(|a, b| {
-        a.last_binlog_filename
-            .cmp(&b.last_binlog_filename)
-            .then(a.last_binlog_position.cmp(&b.last_binlog_position))
-    });
-    let mut best = table_max.and_then(|cp| {
-        if cp.last_binlog_filename.is_empty() || cp.last_binlog_position == 0 {
-            None
-        } else {
-            Some((cp.last_binlog_filename.clone(), cp.last_binlog_position))
+    for cp in checkpoints.values() {
+        if cp.initialization.phase == MysqlInitializationPhase::AwaitingCdc
+            && valid(
+                &cp.initialization.snapshot_file,
+                cp.initialization.snapshot_position,
+            )
+            && stream.as_ref().is_none_or(|stream| {
+                compare_binlog_positions(
+                    (stream.0.as_str(), stream.1),
+                    (
+                        cp.initialization.snapshot_file.as_str(),
+                        cp.initialization.snapshot_position,
+                    ),
+                )
+                .is_lt()
+            })
+        {
+            positions.push((
+                cp.initialization.snapshot_file.clone(),
+                cp.initialization.snapshot_position,
+            ));
         }
-    });
-
-    if let Some(stream) = stream_checkpoint
-        && !stream.binlog_filename.is_empty()
-        && stream.binlog_position > 0
-    {
-        let stream_position = (stream.binlog_filename.clone(), stream.binlog_position);
-        best = match best {
-            Some(current)
-                if current
-                    .0
-                    .cmp(&stream_position.0)
-                    .then(current.1.cmp(&stream_position.1))
-                    .is_gt() =>
-            {
-                Some(current)
-            }
-            _ => Some(stream_position),
-        };
     }
-
-    let Some((file, pos)) = best else {
-        return ResumePosition::Latest;
-    };
-    ResumePosition::BinlogPosition(file, pos)
+    if let (Some(file), Some(position)) = (runtime_binlog_filename, runtime_binlog_position)
+        && valid(file, position)
+    {
+        positions.push((file.to_string(), position));
+    }
+    positions
+        .into_iter()
+        .min_by(|a, b| compare_binlog_positions((a.0.as_str(), a.1), (b.0.as_str(), b.1)))
+        .map(|(file, position)| ResumePosition::BinlogPosition(file, position))
+        .unwrap_or(ResumePosition::Latest)
 }
 
 fn compute_resume_position_after_initialization(
@@ -2489,44 +2743,60 @@ fn compute_resume_position_after_initialization(
     runtime_binlog_position: Option<u32>,
     stream_checkpoint: Option<&StreamCheckpoint>,
     checkpoints: &HashMap<String, MysqlCheckPointDetailEntity>,
-    initialization_happened: bool,
+    _initialization_happened: bool,
 ) -> ResumePosition {
-    if !initialization_happened
-        || matches!(
-            (runtime_binlog_filename, runtime_binlog_position),
-            (Some(file), Some(position)) if !file.is_empty() && position > 0
-        )
-    {
-        return compute_resume_position(
-            runtime_binlog_filename,
-            runtime_binlog_position,
-            stream_checkpoint,
-            checkpoints,
-        );
-    }
+    compute_resume_position(
+        runtime_binlog_filename,
+        runtime_binlog_position,
+        stream_checkpoint,
+        checkpoints,
+    )
+}
 
-    let mut positions = checkpoints
-        .values()
-        .filter_map(|checkpoint| {
-            (!checkpoint.last_binlog_filename.is_empty() && checkpoint.last_binlog_position > 0)
-                .then(|| {
-                    (
-                        checkpoint.last_binlog_filename.clone(),
-                        checkpoint.last_binlog_position,
-                    )
-                })
-        })
-        .collect::<Vec<_>>();
-    if let Some(stream) = stream_checkpoint
-        && !stream.binlog_filename.is_empty()
-        && stream.binlog_position > 0
-    {
-        positions.push((stream.binlog_filename.clone(), stream.binlog_position));
+fn validate_binlog_position(
+    file: &str,
+    position: u32,
+    logs: &[(String, u64)],
+    context: &str,
+) -> Result<(), CustomError> {
+    let size = logs
+        .iter()
+        .find(|(name, _)| name == file)
+        .map(|(_, size)| *size);
+    if file.is_empty() || position < 4 || size.is_none_or(|size| u64::from(position) > size) {
+        return Err(CustomError::fatal(format!(
+            "binlog 连续性已中断，停止同步: {context}, file={file}, position={position}, available_size={size:?}；请恢复原日志或人工重建全量，禁止跳过缺口"
+        )));
     }
-    let Some((file, position)) = positions.into_iter().min() else {
-        return ResumePosition::Latest;
-    };
-    ResumePosition::BinlogPosition(file, position)
+    Ok(())
+}
+
+fn binlog_read_error(message: &str, context: &str) -> CustomError {
+    // 连接器丢弃了服务端错误码，先匹配不可恢复错误，不能被 timeout 等子串吞掉。
+    let lower = message.to_ascii_lowercase();
+    if [
+        "could not find first log file",
+        "purged",
+        "1236",
+        "impossible position",
+        "bogus data",
+        "checksum",
+        "truncated",
+        "fatal error",
+    ]
+    .iter()
+    .any(|part| lower.contains(part))
+    {
+        return CustomError::fatal(format!(
+            "binlog 回放失败，停止同步: {context}, error={message}"
+        ));
+    }
+    if should_reconnect_read_error(message) || should_ignore_read_error(message) {
+        return CustomError::restart(format!("binlog 连接中断: {context}, error={message}"));
+    }
+    CustomError::fatal(format!(
+        "binlog 读取无法保证连续性: {context}, error={message}"
+    ))
 }
 
 fn should_ignore_read_error(message: &str) -> bool {
@@ -2613,57 +2883,69 @@ impl MySQLSource {
 
 #[async_trait]
 impl Source for MySQLSource {
+    fn set_sync_control(&mut self, control: SyncControl) {
+        self.control = control;
+    }
+
     async fn start(
         &mut self,
         mut sink: Arc<Mutex<dyn Sink + Send + Sync>>,
     ) -> Result<(), CustomError> {
+        if let Some(error) = &self.startup_error {
+            return Err(error.clone());
+        }
+        self.control.check()?;
+        self.validate_resume_positions().await?;
+        let mut resume_floors = vec![None; self.stream_groups.len()];
         {
             info!("开始MySQL数据源初始化");
             let start_all = Instant::now();
             let semaphore = Arc::new(Semaphore::new(self.init_parallelism));
             let mut init_tasks = JoinSet::new();
             for i in 0..self.pools.len() {
-                let permit = semaphore
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| CustomError {
-                        message: e.to_string(),
-                        error_type: CustomErrorType::Restart,
-                    })?;
+                let semaphore = semaphore.clone();
+                let control = self.control.clone();
                 let config = self.mysql_source[i].clone();
                 let pool = self.pools[i].clone();
-                let checkpoints = {
-                    let checkpoints_guard = self.checkpoint_entities.lock().await;
-                    checkpoints_guard[i].lock().await.clone()
-                };
+                let checkpoints = self.checkpoint_entities.lock().await[i]
+                    .lock()
+                    .await
+                    .clone();
                 let plugins = self.plugins.clone();
                 let sink_for_task = sink.clone();
                 let checkpoint_service = self.checkpoint_service.clone();
                 init_tasks.spawn(async move {
-                    let _permit = permit;
-                    Self::initialize_source_index(
-                        i,
-                        config,
-                        pool,
-                        checkpoints,
-                        plugins,
-                        sink_for_task,
-                        checkpoint_service,
-                    )
-                    .await
+                    let _permit = tokio::select! {
+                        error = control.cancelled() => return Err(error),
+                        permit = semaphore.acquire_owned() => permit.map_err(|e| CustomError::fatal(e.to_string()))?,
+                    };
+                    let result = Self::initialize_source_index(i, config, pool, checkpoints, plugins, sink_for_task, checkpoint_service, control.clone()).await;
+                    if let Err(error) = &result {
+                        control.stop(CustomError::fatal(format!("初始化无法安全完成: {}", error.message)));
+                    }
+                    result
                 });
             }
             let mut any_initialized = false;
+            let mut first_error = None;
             while let Some(result) = init_tasks.join_next().await {
-                let (source_index, checkpoints, initialized) =
-                    result.map_err(|e| CustomError {
-                        message: e.to_string(),
-                        error_type: CustomErrorType::Restart,
-                    })??;
-                any_initialized |= initialized;
-                let checkpoints_guard = self.checkpoint_entities.lock().await;
-                *checkpoints_guard[source_index].lock().await = checkpoints;
+                match result.unwrap_or_else(|error| {
+                    Err(CustomError::fatal(format!("初始化任务失败: {error}")))
+                }) {
+                    Ok((index, checkpoints, initialized)) => {
+                        any_initialized |= initialized;
+                        *self.checkpoint_entities.lock().await[index].lock().await = checkpoints;
+                    }
+                    Err(error) => {
+                        self.control.stop(error.clone());
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
+            }
+            if first_error.is_some() {
+                return Err(self.control.cancelled().await);
             }
             if any_initialized {
                 runtime_progress::finish_initialization().await;
@@ -2702,6 +2984,24 @@ impl Source for MySQLSource {
                     &group_checkpoints,
                     any_initialized,
                 );
+                if let ResumePosition::BinlogPosition(file, position) = &resume_position {
+                    resume_floors[stream_index] = Some((file.clone(), *position));
+                    *self.binlog_filename_list.lock().await[stream_index]
+                        .lock()
+                        .await = file.clone();
+                    *self.binlog_position_list.lock().await[stream_index]
+                        .lock()
+                        .await = *position;
+                    Self::ensure_binlog_position(
+                        &self.pools[group.source_indices[0]],
+                        file,
+                        *position,
+                        "CDC 衔接",
+                    )
+                    .await?;
+                    self.save_resume_floor(stream_index, file, *position)
+                        .await?;
+                }
                 let start_position = match resume_position {
                     ResumePosition::Latest => StartPosition::Latest,
                     ResumePosition::BinlogPosition(f, p) => StartPosition::BinlogPosition(f, p),
@@ -2722,14 +3022,7 @@ impl Source for MySQLSource {
                         .with_keepalive(Duration::from_secs(60), Duration::from_secs(10))
                         .connect()
                         .await
-                        .unwrap_or_else(|e| {
-                            error!(
-                                "MySQL source binlog连接失败 url: {} error: {}",
-                                redact_connection_url_password(&group.connection_url),
-                                e
-                            );
-                            panic!("MySQL source binlog连接失败: {}", e);
-                        });
+                        .map_err(|error| binlog_read_error(&error.to_string(), &start_pos_str))?;
                 self.streams[stream_index] = Some(client);
             }
             info!("MySQL数据源初始化完成, cost: {:?}", start_all.elapsed());
@@ -2744,25 +3037,52 @@ impl Source for MySQLSource {
         let mut table_column_info_map: HashMap<(usize, u64), BinlogTableColumnInfo> =
             HashMap::new();
         let mut last_checkpoint_save = Instant::now();
+        let mut in_transaction = vec![false; self.stream_groups.len()];
+        let mut stream_seen = vec![false; self.stream_groups.len()];
         loop {
+            self.control.check()?;
             if last_checkpoint_save.elapsed().as_secs() >= 5 {
-                sink.lock()
-                    .await
-                    .flush_with_retry(&FlushByOperation::Cdc)
-                    .await;
-                self.record_stream_checkpoints().await?;
+                self.flush_cdc(&sink).await?;
                 last_checkpoint_save = Instant::now();
             }
             let max = self.streams.len();
             for i in 0..max {
-                match self.streams[i].as_mut().unwrap().read().await {
+                let read = tokio::select! {
+                    error = self.control.cancelled() => return Err(error),
+                    read = self.streams[i].as_mut().unwrap().read() => read,
+                };
+                match read {
                     Ok((header, data)) => {
-                        *self.binlog_position_list.lock().await[i].lock().await =
-                            header.next_event_position;
+                        stream_seen[i] = true;
+                        if stream_seen.iter().all(|seen| *seen) {
+                            self.control.mark_ready();
+                        }
+                        let is_commit = matches!(&data, EventData::Xid(_))
+                            || matches!(&data, EventData::Query(event) if event.query.trim().eq_ignore_ascii_case("COMMIT"));
+                        let is_begin = matches!(
+                            &data,
+                            EventData::Gtid(_)
+                                | EventData::TableMap(_)
+                                | EventData::WriteRows(_)
+                                | EventData::UpdateRows(_)
+                                | EventData::DeleteRows(_)
+                        ) || matches!(&data, EventData::Query(event) if event.query.trim().eq_ignore_ascii_case("BEGIN"));
+                        if is_begin {
+                            in_transaction[i] = true;
+                        }
+                        let standalone =
+                            !in_transaction[i] && !matches!(&data, EventData::HeartBeat);
+                        if header.next_event_position >= 4 {
+                            *self.binlog_position_list.lock().await[i].lock().await =
+                                header.next_event_position;
+                        }
                         match data {
                             EventData::Rotate(event) => {
                                 *self.binlog_filename_list.lock().await[i].lock().await =
                                     event.binlog_filename.clone();
+                                *self.binlog_position_list.lock().await[i].lock().await =
+                                    u32::try_from(event.binlog_position)
+                                        .map_err(|_| CustomError::fatal("Rotate 位点超出范围"))?;
                             }
                             EventData::TableMap(event) => {
                                 let key = (i, event.table_id);
@@ -2897,12 +3217,13 @@ impl Source for MySQLSource {
                                         let plugin_data =
                                             detail_with_plugin(&plugins, data_buffer).await;
                                         if let Ok(item) = plugin_data {
-                                            Self::write_record_with_retry(
+                                            Self::write_record_checked(
                                                 &mut sink,
                                                 &item,
                                                 Some(event_checkpoint_entity.clone()),
+                                                &self.control,
                                             )
-                                            .await;
+                                            .await?;
                                             runtime_progress::record_synced(&progress_label).await;
                                         } else {
                                             runtime_progress::record_filtered(&progress_label)
@@ -3031,12 +3352,13 @@ impl Source for MySQLSource {
                                         let plugin_data =
                                             detail_with_plugin(&plugins, data_buffer).await;
                                         if let Ok(item) = plugin_data {
-                                            Self::write_record_with_retry(
+                                            Self::write_record_checked(
                                                 &mut sink,
                                                 &item,
                                                 Some(event_checkpoint_entity.clone()),
+                                                &self.control,
                                             )
-                                            .await;
+                                            .await?;
                                             runtime_progress::record_synced(&progress_label).await;
                                         } else {
                                             runtime_progress::record_filtered(&progress_label)
@@ -3177,12 +3499,13 @@ impl Source for MySQLSource {
                                             let plugin_data =
                                                 detail_with_plugin(&plugins, sink_record).await;
                                             if let Ok(item) = plugin_data {
-                                                Self::write_record_with_retry(
+                                                Self::write_record_checked(
                                                     &mut sink,
                                                     &item,
                                                     Some(event_checkpoint_entity.clone()),
+                                                    &self.control,
                                                 )
-                                                .await;
+                                                .await?;
                                                 runtime_progress::record_synced(&progress_label)
                                                     .await;
                                             } else {
@@ -3208,87 +3531,59 @@ impl Source for MySQLSource {
                                     .lock()
                                     .await = to_modify;
                             }
+                            EventData::TransactionPayload(_) | EventData::XaPrepare(_) => {
+                                return Err(CustomError::fatal(
+                                    "当前不支持压缩事务或 XA 事务，停止以避免跳过数据",
+                                ));
+                            }
                             _ => {}
                         }
-                    }
-                    Err(e) => {
-                        let message = e.to_string();
-                        if should_ignore_read_error(&message) {
-                            continue;
+                        if is_commit {
+                            in_transaction[i] = false;
                         }
-                        if should_reconnect_read_error(&message) {
-                            let group = self.stream_groups[i].clone();
-                            let connection_url = group.connection_url.clone();
-                            let server_id = group.server_id;
-                            let runtime_binlog_filename = self.binlog_filename_list.lock().await[i]
+                        if is_commit || standalone {
+                            let file = self.binlog_filename_list.lock().await[i]
                                 .lock()
                                 .await
                                 .clone();
-                            let runtime_binlog_position =
-                                *self.binlog_position_list.lock().await[i].lock().await;
-                            let mut checkpoints = HashMap::new();
+                            let position = *self.binlog_position_list.lock().await[i].lock().await;
+                            if !file.is_empty()
+                                && position >= 4
+                                && resume_floors[i].as_ref().is_none_or(|floor| {
+                                    compare_binlog_positions(
+                                        (file.as_str(), position),
+                                        (floor.0.as_str(), floor.1),
+                                    )
+                                    .is_ge()
+                                })
                             {
-                                let checkpoints_guard = self.checkpoint_entities.lock().await;
-                                for source_index in &group.source_indices {
-                                    checkpoints.extend(
-                                        checkpoints_guard[*source_index].lock().await.clone(),
-                                    );
-                                }
-                            }
-                            let resume_position = compute_resume_position(
-                                if runtime_binlog_filename.is_empty() {
-                                    None
-                                } else {
-                                    Some(runtime_binlog_filename.as_str())
-                                },
-                                if runtime_binlog_position == 0 {
-                                    None
-                                } else {
-                                    Some(runtime_binlog_position)
-                                },
-                                None,
-                                &checkpoints,
-                            );
-                            let start_position = match resume_position {
-                                ResumePosition::Latest => StartPosition::Latest,
-                                ResumePosition::BinlogPosition(f, p) => {
-                                    StartPosition::BinlogPosition(f, p)
-                                }
-                            };
-                            match BinlogClient::new(&connection_url, server_id, start_position)
-                                .with_master_heartbeat(Duration::from_secs(5))
-                                .with_keepalive(Duration::from_secs(60), Duration::from_secs(10))
-                                .connect()
-                                .await
-                            {
-                                Ok(new_stream) => {
-                                    self.streams[i] = Some(new_stream);
-                                    continue;
-                                }
-                                Err(connect_err) => {
-                                    error!(
-                                        "遇到错误，重连失败，尝试重新开启source，Error: {}, ConnectError: {}",
-                                        message, connect_err
-                                    );
-                                    return Err(CustomError {
-                                        message,
-                                        error_type: CustomErrorType::Restart,
-                                    });
-                                }
+                                self.committed_positions.lock().await[i] = Some((file, position));
                             }
                         }
-                        error!(
-                            "遇到错误，结束内部循环，尝试重新开启source，Error: {}",
-                            message
-                        );
-                        return Err(CustomError {
-                            message,
-                            error_type: CustomErrorType::Restart,
-                        });
+                    }
+                    Err(error) => {
+                        let file = self.binlog_filename_list.lock().await[i]
+                            .lock()
+                            .await
+                            .clone();
+                        let position = *self.binlog_position_list.lock().await[i].lock().await;
+                        let databases = self.stream_groups[i]
+                            .source_indices
+                            .iter()
+                            .map(|index| self.mysql_source[*index].database.as_str())
+                            .collect::<Vec<_>>();
+                        return Err(binlog_read_error(
+                            &error.to_string(),
+                            &format!("databases={databases:?}, file={file}, position={position}"),
+                        ));
                     }
                 }
             }
         }
+    }
+
+    async fn close(&mut self) {
+        MySQLSource::close(self).await;
     }
 
     async fn add_plugins(&mut self, plugin: Vec<Arc<Mutex<dyn Plugin + Send + Sync>>>) {
@@ -3507,6 +3802,7 @@ mod tests {
             last_binlog_filename: last_binlog_filename.to_string(),
             last_binlog_position,
             retry_times: 0,
+            initialization: Default::default(),
             is_new,
             checkpoint_filepath: "x".to_string(),
             table: table.to_string(),
@@ -3957,7 +4253,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_resume_position_prefers_runtime() {
+    fn compute_resume_position_preserves_safe_point_over_config() {
         let mut checkpoints = HashMap::new();
         checkpoints.insert(
             "t".to_string(),
@@ -3966,7 +4262,7 @@ mod tests {
         let rp = compute_resume_position(Some("mysql-bin.000020"), Some(456), None, &checkpoints);
         assert_eq!(
             rp,
-            ResumePosition::BinlogPosition("mysql-bin.000020".to_string(), 456)
+            ResumePosition::BinlogPosition("mysql-bin.000010".to_string(), 120)
         );
     }
 
@@ -3989,7 +4285,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_resume_position_uses_max_checkpoint() {
+    fn compute_resume_position_uses_earliest_legacy_checkpoint() {
         let mut checkpoints = HashMap::new();
         checkpoints.insert(
             "a".to_string(),
@@ -4002,7 +4298,7 @@ mod tests {
         let rp = compute_resume_position(None, None, None, &checkpoints);
         assert_eq!(
             rp,
-            ResumePosition::BinlogPosition("mysql-bin.000011".to_string(), 4)
+            ResumePosition::BinlogPosition("mysql-bin.000010".to_string(), 120)
         );
     }
 
@@ -4052,6 +4348,603 @@ mod tests {
         assert_eq!(
             rp,
             ResumePosition::BinlogPosition("mysql-bin.000010".to_string(), 120)
+        );
+    }
+
+    #[test]
+    fn initialization_retry_preserves_unconsumed_snapshot_position() {
+        // 两个库共用一条 binlog 流，先后完成全量，尚未消费任何 CDC 事件。
+        // initialize_source_index 已将两个初始化位点持久化，并标记 is_new=false。
+        let checkpoints = HashMap::from([
+            (
+                "db_a.orders".to_string(),
+                mk_entity(false, "mysql-bin.000010", 120, "db_a.orders"),
+            ),
+            (
+                "db_b.orders".to_string(),
+                mk_entity(false, "mysql-bin.000012", 4, "db_b.orders"),
+            ),
+        ]);
+        let before_retry =
+            compute_resume_position_after_initialization(None, None, None, &checkpoints, true);
+        assert_eq!(
+            before_retry,
+            ResumePosition::BinlogPosition("mysql-bin.000010".to_string(), 120)
+        );
+
+        // 假设 .000010 在全量期间被清理，首次 CDC 读取失败触发 source 重建。
+        // 重建时所有表均已非 is_new，initialization_happened 变为 false。
+        // 没有消费事件就不能推进起点；否则会绕过缺失日志，丢失 db_a 的增量。
+        let after_retry =
+            compute_resume_position_after_initialization(None, None, None, &checkpoints, false);
+        assert_eq!(
+            after_retry, before_retry,
+            "初始化重试未消费任何增量，不能从最早快照位点跳到较晚库的位点"
+        );
+    }
+
+    #[test]
+    fn initialization_retry_preserves_existing_stream_position() {
+        // 已有库停在 .000010，新库的全量起点为 .000012，尚未回放中间增量。
+        let checkpoints = HashMap::from([
+            (
+                "existing.orders".to_string(),
+                mk_entity(false, "mysql-bin.000010", 120, "existing.orders"),
+            ),
+            (
+                "new_db.orders".to_string(),
+                mk_entity(false, "mysql-bin.000012", 4, "new_db.orders"),
+            ),
+        ]);
+        let stream = StreamCheckpoint::new(
+            "mysql:1:abc".to_string(),
+            "mysql-bin.000010".to_string(),
+            120,
+        );
+        let after_retry = compute_resume_position_after_initialization(
+            None,
+            None,
+            Some(&stream),
+            &checkpoints,
+            false,
+        );
+
+        assert_eq!(
+            after_retry,
+            ResumePosition::BinlogPosition(stream.binlog_filename, stream.binlog_position),
+            "新增库全量后的重试不能用新库快照位点覆盖已有流的消费进度"
+        );
+    }
+
+    #[test]
+    fn rotation_sequence_is_compared_numerically_when_width_increases() {
+        let tables = HashMap::from([
+            (
+                "a".to_string(),
+                mk_entity(false, "mysql-bin.999999", 900, "a"),
+            ),
+            (
+                "b".to_string(),
+                mk_entity(false, "mysql-bin.1000000", 4, "b"),
+            ),
+        ]);
+        assert_eq!(
+            compute_resume_position(None, None, None, &tables),
+            ResumePosition::BinlogPosition("mysql-bin.999999".to_string(), 900)
+        );
+    }
+
+    #[test]
+    fn retention_validation_accepts_rotation_and_eof_but_rejects_missing_or_invalid_offsets() {
+        let logs = vec![
+            ("mysql-bin.000010".to_string(), 1000),
+            ("mysql-bin.000011".to_string(), 157),
+        ];
+        for (file, position) in [
+            ("mysql-bin.000010", 120),
+            ("mysql-bin.000010", 1000),
+            ("mysql-bin.000011", 4),
+        ] {
+            assert!(validate_binlog_position(file, position, &logs, "test").is_ok());
+        }
+        for (file, position) in [
+            ("mysql-bin.000009", 120),
+            ("mysql-bin.000010", 1001),
+            ("mysql-bin.000011", 0),
+            ("", 4),
+        ] {
+            let error =
+                validate_binlog_position(file, position, &logs, "source.orders").unwrap_err();
+            assert!(matches!(error.error_type, CustomErrorType::Fatal));
+            assert!(error.message.contains("source.orders"));
+        }
+    }
+
+    #[test]
+    fn missing_binlog_error_cannot_be_hidden_by_timeout_text() {
+        for message in [
+            "Could not find first log file name in binary log index file",
+            "fatal error 1236: purged binlog; previous timeout",
+            "event checksum mismatch",
+            "binlog truncated",
+        ] {
+            assert!(matches!(
+                binlog_read_error(message, "source").error_type,
+                CustomErrorType::Fatal
+            ));
+        }
+        for message in [
+            "io error: unexpected end of file",
+            "Read binlog header timeout",
+            "connection reset by peer",
+        ] {
+            assert!(matches!(
+                binlog_read_error(message, "source").error_type,
+                CustomErrorType::Restart
+            ));
+        }
+    }
+
+    #[test]
+    fn snapshot_floor_survives_buffered_progress_until_stream_is_confirmed() {
+        let mut checkpoint = mk_entity(false, "mysql-bin.000012", 900, "source.orders");
+        checkpoint.initialization = MysqlInitialization {
+            phase: MysqlInitializationPhase::AwaitingCdc,
+            snapshot_file: "mysql-bin.000010".to_string(),
+            snapshot_position: 120,
+        };
+        let tables = HashMap::from([("source.orders".to_string(), checkpoint)]);
+        assert_eq!(
+            compute_resume_position(None, None, None, &tables),
+            ResumePosition::BinlogPosition("mysql-bin.000010".to_string(), 120)
+        );
+        let stream = StreamCheckpoint::new("stream".to_string(), "mysql-bin.000011".to_string(), 4);
+        assert_eq!(
+            compute_resume_position(None, None, Some(&stream), &tables),
+            ResumePosition::BinlogPosition("mysql-bin.000011".to_string(), 4)
+        );
+    }
+
+    struct GuardTestSink {
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+        fail_flush: bool,
+    }
+
+    #[async_trait]
+    impl Sink for GuardTestSink {
+        async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn write_record(
+            &mut self,
+            _: &DataBuffer,
+            _: &Option<MysqlCheckPointDetailEntity>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn flush(&self, _: &FlushByOperation) -> Result<(), String> {
+            if self.fail_flush {
+                Err("injected flush failure".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        async fn flush_with_retry(&mut self, operation: &FlushByOperation) -> Result<(), String> {
+            self.flush(operation).await
+        }
+        async fn alter_flush(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn guard_test_source(
+        tables: HashMap<String, MysqlCheckPointDetailEntity>,
+        service: CheckpointServiceHandle,
+    ) -> MySQLSource {
+        MySQLSource {
+            streams: vec![None],
+            stream_groups: vec![MysqlStreamGroup {
+                connection_url: String::new(),
+                server_id: 1,
+                source_indices: vec![0],
+                start_binlog_filename: None,
+                start_binlog_position: None,
+            }],
+            mysql_source: vec![test_mysql_source_detail(vec![])],
+            pools: vec![
+                sqlx::mysql::MySqlPoolOptions::new()
+                    .connect_lazy("mysql://test.invalid/source")
+                    .unwrap(),
+            ],
+            checkpoint_entities: Mutex::new(vec![Mutex::new(tables)]),
+            plugins: vec![],
+            binlog_filename_list: Mutex::new(vec![Mutex::new(String::new())]),
+            binlog_position_list: Mutex::new(vec![Mutex::new(0)]),
+            checkpoint_service: service,
+            stream_checkpoints: Mutex::new(vec![None]),
+            init_parallelism: 1,
+            control: SyncControl::default(),
+            startup_error: None,
+            committed_positions: Mutex::new(vec![None]),
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_snapshot_and_missing_existing_position_fail_before_mysql_access() {
+        for copying in [true, false] {
+            let mut checkpoint = mk_entity(copying, "", 0, "source.orders");
+            if copying {
+                checkpoint.initialization.phase = MysqlInitializationPhase::Copying;
+            }
+            let source = guard_test_source(
+                HashMap::from([("source.orders".to_string(), checkpoint)]),
+                CheckpointServiceHandle::disabled_for_tests(),
+            );
+            let error = source.validate_resume_positions().await.unwrap_err();
+            assert!(matches!(error.error_type, CustomErrorType::Fatal));
+            assert!(error.message.contains(if copying {
+                "初始化中断"
+            } else {
+                "禁止回退 Latest"
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_configuration_override_fails_before_attempting_connection() {
+        let mut source = guard_test_source(
+            HashMap::from([(
+                "source.orders".to_string(),
+                mk_entity(false, "mysql-bin.000010", 120, "source.orders"),
+            )]),
+            CheckpointServiceHandle::disabled_for_tests(),
+        );
+        source.stream_groups[0].start_binlog_filename = Some("mysql-bin.000012".to_string());
+        source.stream_groups[0].start_binlog_position = Some(4);
+        let error = source.validate_resume_positions().await.unwrap_err();
+        assert!(matches!(error.error_type, CustomErrorType::Fatal));
+        assert!(error.message.contains("配置起点会跳过未确认数据"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_for_sink_lock_prevents_a_new_write() {
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink: Arc<Mutex<dyn Sink + Send + Sync>> = Arc::new(Mutex::new(GuardTestSink {
+            writes: writes.clone(),
+            fail_flush: false,
+        }));
+        let locked = sink.lock().await;
+        let control = SyncControl::default();
+        let worker_control = control.clone();
+        let mut worker_sink = sink.clone();
+        let worker = tokio::spawn(async move {
+            let row = DataBuffer::new_with_route(
+                "source".to_string(),
+                "target".to_string(),
+                "orders".to_string(),
+                CaseInsensitiveHashMap::new(HashMap::new()),
+                CaseInsensitiveHashMap::new(HashMap::new()),
+                Operation::CREATE(true),
+                String::new(),
+                0,
+                0,
+            );
+            MySQLSource::write_record_checked(&mut worker_sink, &row, None, &worker_control).await
+        });
+        tokio::task::yield_now().await;
+        control.stop(CustomError::fatal("other source lost binlog"));
+        drop(locked);
+        assert!(worker.await.unwrap().is_err());
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_target_flush_never_advances_stream_checkpoint() {
+        let source = guard_test_source(
+            HashMap::new(),
+            CheckpointServiceHandle::disabled_for_tests(),
+        );
+        source.committed_positions.lock().await[0] = Some(("mysql-bin.000010".to_string(), 900));
+        let sink: Arc<Mutex<dyn Sink + Send + Sync>> = Arc::new(Mutex::new(GuardTestSink {
+            writes: Default::default(),
+            fail_flush: true,
+        }));
+        let error = source.flush_cdc(&sink).await.unwrap_err();
+        assert!(error.message.contains("injected flush failure"));
+        assert!(source.stream_checkpoints.lock().await[0].is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_checkpoint_has_durable_floor_before_a_partial_event_flush() {
+        let directory = format!(
+            "/tmp/cdc-legacy-floor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let service = CheckpointServiceHandle::start(directory.clone(), 3600)
+            .await
+            .unwrap();
+        let mut checkpoint = mk_entity(false, "mysql-bin.000010", 120, "source.orders");
+        checkpoint.checkpoint_filepath = format!("{directory}/checkpoint.json");
+        let source = guard_test_source(
+            HashMap::from([("source.orders".to_string(), checkpoint.clone())]),
+            service.clone(),
+        );
+        source
+            .save_resume_floor(0, "mysql-bin.000010", 120)
+            .await
+            .unwrap();
+        // sink 自动 flush 了某个多行事件的前半批，表级记录已经指向事件末尾。
+        checkpoint.last_binlog_position = 900;
+        service
+            .record_table_applied("source.orders", checkpoint.clone())
+            .await
+            .unwrap();
+        service.flush_now().await.unwrap();
+        let stream = service
+            .load_stream_checkpoint(&stream_checkpoint_key(&source.stream_groups[0]))
+            .await
+            .unwrap()
+            .unwrap();
+        let tables = HashMap::from([("source.orders".to_string(), checkpoint)]);
+        assert_eq!(
+            compute_resume_position(None, None, Some(&stream), &tables),
+            ResumePosition::BinlogPosition("mysql-bin.000010".to_string(), 120)
+        );
+        drop(source);
+        drop(service);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirmed_stream_position_does_not_use_later_buffered_table_progress() {
+        let directory = format!(
+            "/tmp/cdc-safe-stream-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let service = CheckpointServiceHandle::start(directory.clone(), 3600)
+            .await
+            .unwrap();
+        let mut checkpoint = mk_entity(false, "mysql-bin.000010", 900, "source.orders");
+        checkpoint.checkpoint_filepath = format!("{directory}/checkpoint.json");
+        checkpoint.initialization = MysqlInitialization {
+            phase: MysqlInitializationPhase::AwaitingCdc,
+            snapshot_file: "mysql-bin.000010".to_string(),
+            snapshot_position: 120,
+        };
+        let source = guard_test_source(
+            HashMap::from([("source.orders".to_string(), checkpoint)]),
+            service.clone(),
+        );
+        // 已完整处理的事务只到 600；表级 900 可能属于尚未提交的下一笔事务。
+        source.committed_positions.lock().await[0] = Some(("mysql-bin.000010".to_string(), 600));
+        let sink: Arc<Mutex<dyn Sink + Send + Sync>> = Arc::new(Mutex::new(GuardTestSink {
+            writes: Default::default(),
+            fail_flush: false,
+        }));
+        source.flush_cdc(&sink).await.unwrap();
+        let saved = service
+            .load_stream_checkpoint(&stream_checkpoint_key(&source.stream_groups[0]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.binlog_position, 600);
+        let tables = source.checkpoint_entities.lock().await[0]
+            .lock()
+            .await
+            .clone();
+        assert_eq!(
+            compute_resume_position(None, None, Some(&saved), &tables),
+            ResumePosition::BinlogPosition("mysql-bin.000010".to_string(), 600)
+        );
+        assert_eq!(
+            tables["source.orders"].initialization.snapshot_position,
+            120
+        );
+        service.suspend().await.unwrap();
+        drop(source);
+        drop(service);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "需 CDC_TEST_MYSQL_PURGE_URL 指向可清理 binlog 的独占 MySQL 8 实例"]
+    async fn initialization_rejects_binlog_purged_during_snapshot() {
+        // 此测试会执行 PURGE BINARY LOGS，只能使用可丢弃的独占测试实例。
+        // 用真实初始化路径和真实清理操作验证，不能仅靠伪造文件列表断言。
+        struct PurgingSnapshotSink {
+            pool: Pool<MySql>,
+            table_ref: String,
+            snapshot_value: Option<String>,
+        }
+
+        #[async_trait]
+        impl Sink for PurgingSnapshotSink {
+            async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
+            }
+
+            async fn write_record(
+                &mut self,
+                record: &DataBuffer,
+                _checkpoint: &Option<MysqlCheckPointDetailEntity>,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                assert!(self.snapshot_value.is_none(), "测试只初始化一条记录");
+                self.snapshot_value = Some(record.after.get("payload").resolve_string());
+                // 快照已经读出旧值，更新只能依靠初始化起点之后的 binlog 补齐。
+                sqlx::query(&format!(
+                    "UPDATE {} SET payload = 'during_snapshot' WHERE id = 1",
+                    self.table_ref
+                ))
+                .execute(&self.pool)
+                .await
+                .expect("在全量期间更新源记录");
+                sqlx::query("FLUSH BINARY LOGS")
+                    .execute(&self.pool)
+                    .await
+                    .expect("轮转测试实例 binlog");
+                let (current_file, _) = MySQLSource::fetch_master_status(&self.pool).await.unwrap();
+                // PURGE 不支持预处理协议，必须通过普通文本协议执行。
+                sqlx::raw_sql(&format!(
+                    "PURGE BINARY LOGS TO '{}'",
+                    current_file.replace('\'', "''")
+                ))
+                .execute(&self.pool)
+                .await
+                .expect("清理包含快照起点及期间更新的 binlog");
+                Ok(())
+            }
+
+            async fn flush(&self, _from: &FlushByOperation) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn alter_flush(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let url = std::env::var("CDC_TEST_MYSQL_PURGE_URL")
+            .expect("CDC_TEST_MYSQL_PURGE_URL 必须指向可丢弃的独占测试实例");
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .unwrap();
+        let database: String = sqlx::query_scalar("SELECT DATABASE()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let suffix = format!(
+            "{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let table = format!("cdc_binlog_retention_{suffix}");
+        let table_ref = qualified_mysql_table_name(&database, &table);
+        sqlx::query(&format!(
+            "CREATE TABLE {table_ref} (id INT PRIMARY KEY, payload VARCHAR(64)) ENGINE=InnoDB"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(&format!(
+            "INSERT INTO {table_ref} VALUES (1, 'before_snapshot')"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (snapshot_file, snapshot_position) =
+            MySQLSource::fetch_master_status(&pool).await.unwrap();
+        let table_info = test_table_info(
+            &table,
+            "id",
+            &format!("CREATE TABLE `{table}` (`id` int PRIMARY KEY, `payload` varchar(64))"),
+        );
+        let mut config = test_mysql_source_detail(vec![table_info]);
+        config.database = database;
+        config.connection_url = url.clone();
+        let table_key = config.source_table_key(&table);
+        let checkpoint_dir = format!("/tmp/rust-cdc-binlog-retention-{suffix}");
+        let service = CheckpointServiceHandle::start(checkpoint_dir.clone(), 3600)
+            .await
+            .unwrap();
+        let mut checkpoint = mk_entity(true, "", 0, &table_key);
+        checkpoint.checkpoint_filepath = format!("{checkpoint_dir}/checkpoint.json");
+        let sink = Arc::new(Mutex::new(PurgingSnapshotSink {
+            pool: pool.clone(),
+            table_ref: table_ref.clone(),
+            snapshot_value: None,
+        }));
+        let result = MySQLSource::initialize_source_index(
+            0,
+            config,
+            pool.clone(),
+            HashMap::from([(table_key.to_lowercase(), checkpoint)]),
+            vec![],
+            sink.clone(),
+            service.clone(),
+            SyncControl::default(),
+        )
+        .await;
+
+        let source_value: String =
+            sqlx::query_scalar(&format!("SELECT payload FROM {table_ref} WHERE id = 1"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let available_files = sqlx::query("SHOW BINARY LOGS")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect::<Vec<_>>();
+        let persisted = service
+            .load_table_checkpoint(&format!("{checkpoint_dir}/checkpoint.json"))
+            .await
+            .unwrap();
+        let snapshot_value = sink.lock().await.snapshot_value.clone();
+        // 连接器发送 dump 命令时可能先返回成功，清理错误要到 read 才暴露。
+        let replay_error = match BinlogClient::new(
+            &url,
+            73902,
+            StartPosition::BinlogPosition(snapshot_file.clone(), snapshot_position),
+        )
+        .with_read_timeout(Duration::from_secs(5))
+        .connect()
+        .await
+        {
+            Ok(mut stream) => {
+                let error = tokio::time::timeout(Duration::from_secs(5), stream.read())
+                    .await
+                    .expect("等待已清理 binlog 的读取错误超时")
+                    .expect_err("已清理的 binlog 不应能够回放");
+                stream.close().await.unwrap();
+                error.to_string()
+            }
+            Err(error) => error.to_string(),
+        };
+
+        sqlx::query(&format!("DROP TABLE {table_ref}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        drop(service);
+        // 数据库文件只在 /tmp；先清理，再触发红灯断言。
+        std::fs::remove_dir_all(&checkpoint_dir).unwrap();
+        pool.close().await;
+
+        assert_eq!(snapshot_value.as_deref(), Some("before_snapshot"));
+        assert_eq!(source_value, "during_snapshot");
+        assert!(
+            replay_error.contains("Could not find first log file"),
+            "必须确认是 binlog 被清理导致回放失败：{replay_error}"
+        );
+        assert!(
+            !available_files.contains(&snapshot_file),
+            "前置条件：快照起点 {snapshot_file}/{snapshot_position} 必须确实已被清理"
+        );
+        assert!(
+            result.is_err(),
+            "快照起点 {snapshot_file}/{snapshot_position} 已被清理，目标仍是旧值，初始化却成功；\
+             available_files={available_files:?}, persisted_checkpoint={persisted:?}"
+        );
+        assert!(
+            persisted.is_none_or(|checkpoint| checkpoint.is_new),
+            "无法衔接 CDC 时不能持久化初始化已完成"
         );
     }
 

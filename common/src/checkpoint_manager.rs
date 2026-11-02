@@ -222,6 +222,9 @@ impl CheckpointServiceSnapshot {
 type CheckpointCommandResult<T> = oneshot::Sender<Result<T, String>>;
 
 enum CheckpointServiceCommand {
+    Suspend {
+        resp: CheckpointCommandResult<()>,
+    },
     LoadTable {
         key: String,
         resp: CheckpointCommandResult<Option<MysqlCheckPointDetailEntity>>,
@@ -362,6 +365,16 @@ impl CheckpointServiceHandle {
             .map_err(|e| format!("checkpoint service 写入 stream 队列失败: {}", e))?
     }
 
+    /// 同步任务停止后仅保留读取服务，禁止后台继续推进 checkpoint。
+    pub async fn suspend(&self) -> Result<(), String> {
+        let (resp, rx) = oneshot::channel();
+        self.tx
+            .send(CheckpointServiceCommand::Suspend { resp })
+            .await
+            .map_err(|e| e.to_string())?;
+        rx.await.map_err(|e| e.to_string())?
+    }
+
     pub async fn flush_now(&self) -> Result<(), String> {
         let (resp, rx) = oneshot::channel();
         self.tx
@@ -414,6 +427,7 @@ async fn run_checkpoint_service(
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticker.tick().await;
 
+    let mut suspended = false;
     loop {
         tokio::select! {
             command = rx.recv() => {
@@ -421,6 +435,23 @@ async fn run_checkpoint_service(
                     break;
                 };
                 touch_heartbeat(&snapshot).await;
+                if let CheckpointServiceCommand::Suspend { resp } = command {
+                    let result = flush_dirty_checkpoints(&store, &snapshot, &mut dirty_tables, &mut dirty_streams).await;
+                    suspended = true;
+                    let _ = resp.send(result);
+                    continue;
+                }
+                if suspended {
+                    match command {
+                        CheckpointServiceCommand::RecordTables { resp, .. }
+                        | CheckpointServiceCommand::RecordStream { resp, .. }
+                        | CheckpointServiceCommand::FlushNow { resp } => {
+                            let _ = resp.send(Err("同步已停止，checkpoint 只读".to_string()));
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 handle_checkpoint_command(
                     command,
                     &store,
@@ -432,6 +463,7 @@ async fn run_checkpoint_service(
             }
             _ = ticker.tick() => {
                 touch_heartbeat(&snapshot).await;
+                if suspended { continue; }
                 let _ = flush_dirty_checkpoints(
                     &store,
                     &snapshot,
@@ -443,7 +475,10 @@ async fn run_checkpoint_service(
         }
     }
 
-    let _ = flush_dirty_checkpoints(&store, &snapshot, &mut dirty_tables, &mut dirty_streams).await;
+    if !suspended {
+        let _ =
+            flush_dirty_checkpoints(&store, &snapshot, &mut dirty_tables, &mut dirty_streams).await;
+    }
     {
         let mut snapshot = snapshot.lock().await;
         snapshot.running = false;
@@ -460,6 +495,7 @@ async fn handle_checkpoint_command(
     dirty_streams: &mut HashMap<String, StreamCheckpoint>,
 ) {
     match command {
+        CheckpointServiceCommand::Suspend { .. } => unreachable!("由服务循环处理"),
         CheckpointServiceCommand::LoadTable { key, resp } => {
             let dirty = dirty_tables
                 .get(key.as_str())
@@ -1022,11 +1058,61 @@ mod tests {
         ))
     }
 
+    #[tokio::test]
+    async fn suspended_service_keeps_reads_and_rejects_all_progress_updates() {
+        let directory = temp_checkpoint_dir("suspended");
+        let service = CheckpointServiceHandle::start(directory.display().to_string(), 1)
+            .await
+            .unwrap();
+        service
+            .record_stream_consumed("stream".to_string(), "mysql-bin.000010".to_string(), 120)
+            .await
+            .unwrap();
+        service.suspend().await.unwrap();
+        let before = service
+            .load_stream_checkpoint("stream")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            service
+                .record_stream_consumed("stream".to_string(), "mysql-bin.000011".to_string(), 4)
+                .await
+                .is_err()
+        );
+        let entity = test_entity(&directory.join("checkpoint.json"), "db.orders", 900);
+        assert!(
+            service
+                .record_table_applied("db.orders", entity)
+                .await
+                .is_err()
+        );
+        assert!(service.flush_now().await.is_err());
+        assert_eq!(
+            service
+                .load_stream_checkpoint("stream")
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert!(
+            service
+                .load_table_checkpoint("db.orders")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(service);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn test_entity(path: &Path, table: &str, position: u32) -> MysqlCheckPointDetailEntity {
         MysqlCheckPointDetailEntity {
             last_binlog_filename: "mysql-bin.000001".to_string(),
             last_binlog_position: position,
             retry_times: 0,
+            initialization: Default::default(),
             is_new: false,
             checkpoint_filepath: path.display().to_string(),
             table: table.to_string(),

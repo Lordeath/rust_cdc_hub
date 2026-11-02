@@ -491,7 +491,9 @@ impl Sink for StarrocksSink {
 
         if buf.len() >= self.sink_batch_size {
             drop(buf);
-            self.flush_with_retry(&FlushByOperation::Signal).await;
+            self.flush_with_retry(&FlushByOperation::Signal)
+                .await
+                .map_err(std::io::Error::other)?;
         }
 
         Ok(())

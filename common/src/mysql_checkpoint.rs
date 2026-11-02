@@ -1,7 +1,7 @@
 use crate::checkpoint_manager::{
     CheckpointManager, CheckpointServiceHandle, FileCheckpointManager, resolve_checkpoint_path,
 };
-use crate::{get_mysql_pool_by_url, redact_connection_url_password};
+use crate::custom_error::CustomError;
 use serde::{Deserialize, Serialize};
 use sqlx::{Column, MySql, Pool, Row};
 use std::fs;
@@ -9,7 +9,24 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use tokio::time::{Duration, timeout};
-use tracing::{info, warn};
+use tracing::info;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MysqlInitializationPhase {
+    #[default]
+    Legacy,
+    Copying,
+    AwaitingCdc,
+    Streaming,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MysqlInitialization {
+    pub phase: MysqlInitializationPhase,
+    pub snapshot_file: String,
+    pub snapshot_position: u32,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MysqlCheckPointDetailEntity {
@@ -17,6 +34,8 @@ pub struct MysqlCheckPointDetailEntity {
     pub last_binlog_position: u32,
     pub retry_times: u32,
     pub is_new: bool,
+    #[serde(default)]
+    pub initialization: MysqlInitialization,
 
     pub checkpoint_filepath: String,
     pub table: String,
@@ -41,7 +60,7 @@ impl MysqlCheckPointDetailEntity {
         checkpoint_file_path: String,
         connection_url: &String,
         table: String,
-    ) -> Self {
+    ) -> Result<Self, CustomError> {
         let manager = FileCheckpointManager::new(checkpoint_file_path.clone());
         Self::from_config_with_manager(checkpoint_file_path, connection_url, table, &manager).await
     }
@@ -51,86 +70,28 @@ impl MysqlCheckPointDetailEntity {
         connection_url: &String,
         table: String,
         checkpoint_manager: &dyn CheckpointManager,
-    ) -> Self {
-        let legacy_checkpoint_dir = resolve_checkpoint_path(checkpoint_file_path.as_str())
-            .legacy_scan_dir
-            .display()
-            .to_string();
-        // 1. 确保 checkpoint 目录存在
-        let dir = Path::new(&legacy_checkpoint_dir);
-        if !dir.exists() {
-            fs::create_dir_all(dir)
-                .unwrap_or_else(|_| panic!("创建目录失败: {}", &legacy_checkpoint_dir));
-        }
-        let checkpoint_filepath =
-            Self::checkpoint_filepath(&legacy_checkpoint_dir, connection_url, table.as_str());
+    ) -> Result<Self, CustomError> {
+        let path = Self::resolved_filepath(&checkpoint_file_path, connection_url, &table);
+        let entity = checkpoint_manager.load(&path).await.map_err(|e| {
+            CustomError::fatal(format!("读取 checkpoint 失败: table={table}, error={e}"))
+        })?;
+        Ok(entity.unwrap_or_else(|| Self::new_uninitialized(path, table)))
+    }
 
-        // 3. 建立 MySQL Pool
-        let pool: Pool<MySql> = get_mysql_pool_by_url(
-            connection_url,
-            &format!("checkpoint 初始化建立连接 {}", &table),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "获取mysql连接池失败: {}",
-                redact_connection_url_password(connection_url)
-            )
-        });
+    fn resolved_filepath(directory: &str, connection_url: &str, table: &str) -> String {
+        let directory = resolve_checkpoint_path(directory).legacy_scan_dir;
+        Self::checkpoint_filepath(&directory.to_string_lossy(), connection_url, table)
+    }
 
-        // 4. 获取当前 MySQL binlog 起点
-        let (last_binlog_filename, last_binlog_position) =
-            fetch_mysql_start_position(&pool, &table).await;
-
-        // 获取这个文件，如果没有，就新增这个文件
-        let checkpoint_file = Path::new(&checkpoint_filepath);
-        match checkpoint_manager.load(checkpoint_filepath.as_str()).await {
-            Ok(Some(mut entity)) => {
-                if entity.last_binlog_filename.eq(&last_binlog_filename)
-                    && entity.last_binlog_position > last_binlog_position
-                {
-                    warn!(
-                        "发现错误的起点，尝试进行修正 {} {} -> {}",
-                        &last_binlog_filename, &entity.last_binlog_position, &last_binlog_position
-                    );
-                    entity.last_binlog_position = last_binlog_position;
-                }
-                entity.is_new = false;
-                return entity;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!(
-                    "读取 checkpoint manager 失败，回退旧文件读取: path={} error={}",
-                    checkpoint_filepath, e
-                );
-            }
-        }
-
-        if checkpoint_file.exists() {
-            let json = fs::read_to_string(checkpoint_file).expect("读取文件失败");
-            let mut entity = serde_json::from_str::<MysqlCheckPointDetailEntity>(&json)
-                .unwrap_or_else(|_| panic!("json转换失败: {}", &checkpoint_filepath));
-            if entity.last_binlog_filename.eq(&last_binlog_filename)
-                && entity.last_binlog_position > last_binlog_position
-            {
-                warn!(
-                    "发现错误的起点，尝试进行修正 {} {} -> {}",
-                    &last_binlog_filename, &entity.last_binlog_position, &last_binlog_position
-                );
-                entity.last_binlog_position = last_binlog_position;
-            }
-            entity.is_new = false;
-            return entity;
-        }
-
-        MysqlCheckPointDetailEntity {
-            last_binlog_filename,
-            last_binlog_position,
+    fn new_uninitialized(checkpoint_filepath: String, table: String) -> Self {
+        Self {
+            last_binlog_filename: String::new(),
+            last_binlog_position: 0,
             retry_times: 0,
             is_new: true,
-            checkpoint_filepath: checkpoint_filepath.to_string(),
+            checkpoint_filepath,
             table,
+            initialization: MysqlInitialization::default(),
         }
     }
 
@@ -139,86 +100,27 @@ impl MysqlCheckPointDetailEntity {
         connection_url: &String,
         table: String,
         checkpoint_service: &CheckpointServiceHandle,
-    ) -> Self {
-        let legacy_checkpoint_dir = resolve_checkpoint_path(checkpoint_file_path.as_str())
-            .legacy_scan_dir
-            .display()
-            .to_string();
-        let dir = Path::new(&legacy_checkpoint_dir);
-        if !dir.exists() {
-            fs::create_dir_all(dir)
-                .unwrap_or_else(|_| panic!("创建目录失败: {}", &legacy_checkpoint_dir));
-        }
-        let checkpoint_filepath =
-            Self::checkpoint_filepath(&legacy_checkpoint_dir, connection_url, table.as_str());
-
-        let pool: Pool<MySql> = get_mysql_pool_by_url(
-            connection_url,
-            &format!("checkpoint 初始化建立连接 {}", &table),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "获取mysql连接池失败: {}",
-                redact_connection_url_password(connection_url)
-            )
-        });
-
-        let (last_binlog_filename, last_binlog_position) =
-            fetch_mysql_start_position(&pool, &table).await;
-
-        let checkpoint_file = Path::new(&checkpoint_filepath);
-        match checkpoint_service
-            .load_table_checkpoint(checkpoint_filepath.as_str())
+    ) -> Result<Self, CustomError> {
+        let path = Self::resolved_filepath(&checkpoint_file_path, connection_url, &table);
+        if let Some(entity) = checkpoint_service
+            .load_table_checkpoint(&path)
             .await
+            .map_err(|e| {
+                CustomError::fatal(format!("读取 checkpoint 失败: table={table}, error={e}"))
+            })?
         {
-            Ok(Some(mut entity)) => {
-                if entity.last_binlog_filename.eq(&last_binlog_filename)
-                    && entity.last_binlog_position > last_binlog_position
-                {
-                    warn!(
-                        "发现错误的起点，尝试进行修正 {} {} -> {}",
-                        &last_binlog_filename, &entity.last_binlog_position, &last_binlog_position
-                    );
-                    entity.last_binlog_position = last_binlog_position;
-                }
-                entity.is_new = false;
-                return entity;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!(
-                    "读取 checkpoint service 失败，回退旧文件读取: path={} error={}",
-                    checkpoint_filepath, e
-                );
-            }
+            return Ok(entity);
         }
-
-        if checkpoint_file.exists() {
-            let json = fs::read_to_string(checkpoint_file).expect("读取文件失败");
-            let mut entity = serde_json::from_str::<MysqlCheckPointDetailEntity>(&json)
-                .unwrap_or_else(|_| panic!("json转换失败: {}", &checkpoint_filepath));
-            if entity.last_binlog_filename.eq(&last_binlog_filename)
-                && entity.last_binlog_position > last_binlog_position
-            {
-                warn!(
-                    "发现错误的起点，尝试进行修正 {} {} -> {}",
-                    &last_binlog_filename, &entity.last_binlog_position, &last_binlog_position
-                );
-                entity.last_binlog_position = last_binlog_position;
-            }
-            entity.is_new = false;
-            return entity;
+        // 仅在服务确认没有记录时读取旧文件；读取失败不能当成新任务。
+        if Path::new(&path).exists() {
+            let json = fs::read_to_string(&path).map_err(|e| {
+                CustomError::fatal(format!("读取旧 checkpoint 失败: table={table}, error={e}"))
+            })?;
+            return serde_json::from_str(&json).map_err(|e| {
+                CustomError::fatal(format!("解析旧 checkpoint 失败: table={table}, error={e}"))
+            });
         }
-
-        MysqlCheckPointDetailEntity {
-            last_binlog_filename,
-            last_binlog_position,
-            retry_times: 0,
-            is_new: true,
-            checkpoint_filepath: checkpoint_filepath.to_string(),
-            table,
-        }
+        Ok(Self::new_uninitialized(path, table))
     }
 
     // 刷新现在的binlog的记录
@@ -294,6 +196,82 @@ pub async fn fetch_mysql_start_position(pool: &Pool<MySql>, table: &str) -> (Str
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn checkpoint_reload_preserves_incomplete_snapshot_and_invalid_position() {
+        let directory = format!(
+            "/tmp/cdc-checkpoint-state-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        );
+        let url = "mysql://test.invalid/source".to_string();
+        let table = "source.orders".to_string();
+        let path = MysqlCheckPointDetailEntity::resolved_filepath(&directory, &url, &table);
+        let service = CheckpointServiceHandle::start(directory.clone(), 3600)
+            .await
+            .unwrap();
+        let mut checkpoint =
+            MysqlCheckPointDetailEntity::new_uninitialized(path.clone(), table.clone());
+        checkpoint.last_binlog_filename = "mysql-bin.000010".to_string();
+        checkpoint.last_binlog_position = u32::MAX;
+        checkpoint.initialization = MysqlInitialization {
+            phase: MysqlInitializationPhase::Copying,
+            snapshot_file: checkpoint.last_binlog_filename.clone(),
+            snapshot_position: u32::MAX,
+        };
+        service
+            .record_table_applied(&table, checkpoint)
+            .await
+            .unwrap();
+        service.flush_now().await.unwrap();
+        let loaded = MysqlCheckPointDetailEntity::from_config_with_service(
+            directory.clone(),
+            &url,
+            table,
+            &service,
+        )
+        .await
+        .unwrap();
+        assert!(loaded.is_new);
+        assert_eq!(
+            loaded.initialization.phase,
+            MysqlInitializationPhase::Copying
+        );
+        assert_eq!(loaded.last_binlog_position, u32::MAX, "不能静默修正位点");
+        drop(service);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unavailable_checkpoint_service_is_not_a_new_task() {
+        let error = MysqlCheckPointDetailEntity::from_config_with_service(
+            "/tmp/cdc-no-fallback".to_string(),
+            &"mysql://test.invalid/source".to_string(),
+            "source.orders".to_string(),
+            &CheckpointServiceHandle::disabled_for_tests(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.error_type,
+            crate::custom_error::CustomErrorType::Fatal
+        ));
+    }
+
+    #[test]
+    fn legacy_checkpoint_deserialization_remains_supported() {
+        let checkpoint: MysqlCheckPointDetailEntity = serde_json::from_str(r#"{
+            "last_binlog_filename":"mysql-bin.000010","last_binlog_position":120,
+            "retry_times":0,"is_new":false,"checkpoint_filepath":"/tmp/legacy.json","table":"source.orders"
+        }"#).unwrap();
+        assert_eq!(
+            checkpoint.initialization.phase,
+            MysqlInitializationPhase::Legacy
+        );
+        assert!(!checkpoint.is_new);
+    }
+
     #[test]
     fn test1() {
         assert_eq!(

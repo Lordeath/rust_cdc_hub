@@ -1826,7 +1826,9 @@ impl Sink for MySqlSink {
         }
         if buf.len() >= self.sink_batch_size {
             drop(buf);
-            self.flush_with_retry(&FlushByOperation::Signal).await;
+            self.flush_with_retry(&FlushByOperation::Signal)
+                .await
+                .map_err(std::io::Error::other)?;
         }
 
         Ok(())
@@ -2076,8 +2078,14 @@ impl Sink for MySqlSink {
         Ok(())
     }
 
+    async fn close(&mut self) {
+        for pool in self.target_pools.values() {
+            pool.close().await;
+        }
+    }
+
     async fn after_initialization(&mut self) -> Result<(), String> {
-        self.flush_with_retry(&FlushByOperation::Init).await;
+        self.flush_with_retry(&FlushByOperation::Init).await?;
         *self.source_initializing.write().await = false;
         self.ensure_foreign_keys().await?;
         runtime_progress::finish_schema_initialization().await;

@@ -31,7 +31,6 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::process;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
@@ -7515,7 +7514,7 @@ impl DamengSink {
 
 #[async_trait]
 impl Sink for DamengSink {
-    async fn flush_with_retry(&mut self, from_timer: &FlushByOperation) {
+    async fn flush_with_retry(&mut self, from_timer: &FlushByOperation) -> Result<(), String> {
         let mut loop_count = 0u32;
         let mut connection_retry_elapsed_secs = 0u64;
         loop {
@@ -7531,7 +7530,7 @@ impl Sink for DamengSink {
                         "Dameng flush connection error exceeded retry window: elapsed={}s attempts={} error={}",
                         connection_retry_elapsed_secs, loop_count, error
                     );
-                    process::exit(1);
+                    return Err(error);
                 }
                 let remaining_secs = DAMENG_CONNECTION_RETRY_MAX_ELAPSED_SECS
                     .saturating_sub(connection_retry_elapsed_secs);
@@ -7551,17 +7550,11 @@ impl Sink for DamengSink {
             tokio::time::sleep(Duration::from_millis(100)).await;
             if loop_count > 30 {
                 error!("flush error");
-                process::exit(1);
+                return Err(error);
             }
         }
         trace!("flush success");
-        match self.alter_flush().await {
-            Ok(_) => {}
-            Err(e) => {
-                error!("alter flush error: {}", e);
-                process::exit(1);
-            }
-        }
+        self.alter_flush().await
     }
 
     async fn connect(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -7585,7 +7578,9 @@ impl Sink for DamengSink {
         }
         if buf.len() >= self.sink_batch_size {
             drop(buf);
-            self.flush_with_retry(&FlushByOperation::Signal).await;
+            self.flush_with_retry(&FlushByOperation::Signal)
+                .await
+                .map_err(std::io::Error::other)?;
         }
         Ok(())
     }
@@ -7992,7 +7987,7 @@ impl Sink for DamengSink {
     }
 
     async fn after_initialization(&mut self) -> Result<(), String> {
-        self.flush_with_retry(&FlushByOperation::Init).await;
+        self.flush_with_retry(&FlushByOperation::Init).await?;
         if self.random_check_data_after_init {
             info!(
                 "Dameng random data check init mode keeps foreign key constraints disabled and skips foreign key synchronization"

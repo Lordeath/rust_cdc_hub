@@ -9,4 +9,21 @@ pub struct CustomError {
 #[derive(Debug, Clone, Serialize, Deserialize, Display)]
 pub enum CustomErrorType {
     Restart,
+    Fatal,
+}
+
+impl CustomError {
+    pub fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            error_type: CustomErrorType::Fatal,
+        }
+    }
+
+    pub fn restart(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            error_type: CustomErrorType::Restart,
+        }
+    }
 }
