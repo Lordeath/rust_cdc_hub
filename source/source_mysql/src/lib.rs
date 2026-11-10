@@ -7,7 +7,8 @@ use common::custom_error::{CustomError, CustomErrorType};
 use common::initialization_timing;
 use common::metrics::{SOURCE_EVENTS_TOTAL, SOURCE_LAG_POSITION};
 use common::mysql_checkpoint::{
-    MysqlCheckPointDetailEntity, MysqlInitialization, MysqlInitializationPhase,
+    MysqlCheckPointDetailEntity, MysqlInitialization, MysqlInitializationCursor,
+    MysqlInitializationPhase,
 };
 use common::runtime_progress;
 use common::schema::{
@@ -963,6 +964,24 @@ impl InitPkCursor {
         }
     }
 
+    fn from_checkpoint(cursor: Option<&MysqlInitializationCursor>) -> Self {
+        match cursor {
+            None => Self::Start,
+            Some(MysqlInitializationCursor::Signed(value)) => Self::Signed(*value),
+            Some(MysqlInitializationCursor::Unsigned(value)) => Self::Unsigned(*value),
+            Some(MysqlInitializationCursor::Text(value)) => Self::Text(value.clone()),
+        }
+    }
+
+    fn to_checkpoint(&self) -> Option<MysqlInitializationCursor> {
+        match self {
+            Self::Start => None,
+            Self::Signed(value) => Some(MysqlInitializationCursor::Signed(*value)),
+            Self::Unsigned(value) => Some(MysqlInitializationCursor::Unsigned(*value)),
+            Self::Text(value) => Some(MysqlInitializationCursor::Text(value.clone())),
+        }
+    }
+
     fn bind_query<'q>(
         &'q self,
         query: Query<'q, MySql, MySqlArguments>,
@@ -1544,14 +1563,6 @@ impl MySQLSource {
             }
             drop(checkpoints);
             for cp in tables.values() {
-                if cp.initialization.phase == MysqlInitializationPhase::Copying {
-                    return Err(CustomError::fatal(format!(
-                        "全量初始化中断，需人工处理后重建: table={}, file={}, position={}",
-                        cp.table,
-                        cp.initialization.snapshot_file,
-                        cp.initialization.snapshot_position
-                    )));
-                }
                 if !cp.is_new && (cp.last_binlog_filename.is_empty() || cp.last_binlog_position < 4)
                 {
                     return Err(CustomError::fatal(format!(
@@ -1559,9 +1570,11 @@ impl MySQLSource {
                         cp.table
                     )));
                 }
-                if cp.initialization.phase == MysqlInitializationPhase::AwaitingCdc
-                    && (cp.initialization.snapshot_file.is_empty()
-                        || cp.initialization.snapshot_position < 4)
+                if matches!(
+                    cp.initialization.phase,
+                    MysqlInitializationPhase::Copying | MysqlInitializationPhase::AwaitingCdc
+                ) && (cp.initialization.snapshot_file.is_empty()
+                    || cp.initialization.snapshot_position < 4)
                 {
                     return Err(CustomError::fatal(format!(
                         "初始化快照起点无效，停止同步: table={}",
@@ -1759,15 +1772,6 @@ impl MySQLSource {
         control: SyncControl,
     ) -> Result<(usize, HashMap<String, MysqlCheckPointDetailEntity>, bool), CustomError> {
         control.check()?;
-        if let Some(cp) = checkpoints
-            .values()
-            .find(|cp| cp.initialization.phase == MysqlInitializationPhase::Copying)
-        {
-            return Err(CustomError::fatal(format!(
-                "初始化中断，需人工处理目标端后重新全量: table={}, file={}, position={}",
-                cp.table, cp.initialization.snapshot_file, cp.initialization.snapshot_position
-            )));
-        }
         let any_new = config.table_info_list.iter().any(|table_info| {
             if !MysqlSourceConfigDetail::is_cdc_table(table_info) {
                 return false;
@@ -1790,7 +1794,26 @@ impl MySQLSource {
             "Detected new tables for {}, starting consistent snapshot initialization",
             config.database
         );
-        let (file, pos) = Self::fetch_master_status(&pool).await?;
+        // 恢复已有快照时沿用最早起点；不能用重启时的新位点覆盖它。
+        let saved_start = checkpoints
+            .values()
+            .filter(|cp| {
+                matches!(
+                    cp.initialization.phase,
+                    MysqlInitializationPhase::Copying | MysqlInitializationPhase::AwaitingCdc
+                )
+            })
+            .map(|cp| {
+                (
+                    cp.initialization.snapshot_file.clone(),
+                    cp.initialization.snapshot_position,
+                )
+            })
+            .min_by(|a, b| compare_binlog_positions((&a.0, a.1), (&b.0, b.1)));
+        let (file, pos) = match saved_start {
+            Some(position) => position,
+            None => Self::fetch_master_status(&pool).await?,
+        };
         info!(
             "Consistent Snapshot Position for {}: {}/{}",
             config.database, file, pos
@@ -1803,6 +1826,7 @@ impl MySQLSource {
             let table_key = config.source_table_key(table_info.table_name.as_str());
             if let Some(cp) = checkpoints.get_mut(table_key.to_lowercase().as_str())
                 && cp.is_new
+                && cp.initialization.phase != MysqlInitializationPhase::Copying
             {
                 cp.last_binlog_filename = file.clone();
                 cp.last_binlog_position = pos;
@@ -1810,6 +1834,7 @@ impl MySQLSource {
                     phase: MysqlInitializationPhase::Copying,
                     snapshot_file: file.clone(),
                     snapshot_position: pos,
+                    cursor: None,
                 };
                 if !config.random_check_data_after_init {
                     checkpoint_service
@@ -1832,7 +1857,6 @@ impl MySQLSource {
                 .await
                 .map_err(CustomError::fatal)?;
         }
-        let mut completed_tables = Vec::new();
         let mut tx = pool.begin().await.map_err(|e| CustomError {
             message: e.to_string(),
             error_type: CustomErrorType::Restart,
@@ -1864,7 +1888,12 @@ impl MySQLSource {
             runtime_progress::begin_table_initialization(&progress_label).await;
             let start = Instant::now();
             let mut count = 0;
-            let mut cursor = InitPkCursor::Start;
+            let mut cursor = InitPkCursor::from_checkpoint(
+                checkpoints
+                    .get(&table_key.to_lowercase())
+                    .and_then(|cp| cp.initialization.cursor.as_ref()),
+            );
+            let mut pages_since_checkpoint = 0usize;
             let validation_init_limit = config
                 .random_check_data_after_init
                 .then_some(config.random_check_data_after_init_batch_size_min);
@@ -1912,6 +1941,33 @@ impl MySQLSource {
                     }
                     cursor.advance(next_id);
                 }
+                if len > 0 {
+                    pages_since_checkpoint += 1;
+                }
+                if validation_init_limit.is_none()
+                    && pages_since_checkpoint > 0
+                    && (pages_since_checkpoint >= 8 || len < config.batchsize)
+                {
+                    sink.lock()
+                        .await
+                        .flush_with_retry(&FlushByOperation::Init)
+                        .await
+                        .map_err(CustomError::fatal)?;
+                    control.check()?;
+                    let cp = checkpoints
+                        .get_mut(&table_key.to_lowercase())
+                        .expect("初始化 checkpoint 存在");
+                    cp.initialization.cursor = cursor.to_checkpoint();
+                    checkpoint_service
+                        .record_table_applied(&table_key, cp.clone())
+                        .await
+                        .map_err(CustomError::fatal)?;
+                    checkpoint_service
+                        .flush_now()
+                        .await
+                        .map_err(CustomError::fatal)?;
+                    pages_since_checkpoint = 0;
+                }
                 count += len;
                 debug!("当前最大id为 {}", cursor.display_value());
                 if validation_init_limit.is_some() {
@@ -1944,7 +2000,19 @@ impl MySQLSource {
                     );
                     continue;
                 }
-                completed_tables.push(table_key);
+                let cp = checkpoints
+                    .get_mut(&table_key.to_lowercase())
+                    .expect("初始化 checkpoint 存在");
+                cp.is_new = false;
+                cp.initialization.phase = MysqlInitializationPhase::AwaitingCdc;
+                checkpoint_service
+                    .record_table_applied(&table_key, cp.clone())
+                    .await
+                    .map_err(CustomError::fatal)?;
+                checkpoint_service
+                    .flush_now()
+                    .await
+                    .map_err(CustomError::fatal)?;
             }
         }
         tx.commit().await.map_err(|e| CustomError {
@@ -1959,17 +2027,6 @@ impl MySQLSource {
             &format!("database={}, stage=全量完成", config.database),
         )
         .await?;
-        for key in completed_tables {
-            let cp = checkpoints
-                .get_mut(&key.to_lowercase())
-                .expect("初始化 checkpoint 存在");
-            cp.is_new = false;
-            cp.initialization.phase = MysqlInitializationPhase::AwaitingCdc;
-            checkpoint_service
-                .record_table_applied(&key, cp.clone())
-                .await
-                .map_err(CustomError::fatal)?;
-        }
         if !config.random_check_data_after_init {
             checkpoint_service
                 .flush_now()
@@ -2704,22 +2761,13 @@ fn compute_resume_position(
         );
     }
     for cp in checkpoints.values() {
-        if cp.initialization.phase == MysqlInitializationPhase::AwaitingCdc
-            && valid(
-                &cp.initialization.snapshot_file,
-                cp.initialization.snapshot_position,
-            )
-            && stream.as_ref().is_none_or(|stream| {
-                compare_binlog_positions(
-                    (stream.0.as_str(), stream.1),
-                    (
-                        cp.initialization.snapshot_file.as_str(),
-                        cp.initialization.snapshot_position,
-                    ),
-                )
-                .is_lt()
-            })
-        {
+        if matches!(
+            cp.initialization.phase,
+            MysqlInitializationPhase::Copying | MysqlInitializationPhase::AwaitingCdc
+        ) && valid(
+            &cp.initialization.snapshot_file,
+            cp.initialization.snapshot_position,
+        ) {
             positions.push((
                 cp.initialization.snapshot_file.clone(),
                 cp.initialization.snapshot_position,
@@ -4492,6 +4540,7 @@ mod tests {
             phase: MysqlInitializationPhase::AwaitingCdc,
             snapshot_file: "mysql-bin.000010".to_string(),
             snapshot_position: 120,
+            cursor: None,
         };
         let tables = HashMap::from([("source.orders".to_string(), checkpoint)]);
         assert_eq!(
@@ -4501,8 +4550,35 @@ mod tests {
         let stream = StreamCheckpoint::new("stream".to_string(), "mysql-bin.000011".to_string(), 4);
         assert_eq!(
             compute_resume_position(None, None, Some(&stream), &tables),
-            ResumePosition::BinlogPosition("mysql-bin.000011".to_string(), 4)
+            ResumePosition::BinlogPosition("mysql-bin.000010".to_string(), 120)
         );
+    }
+
+    #[test]
+    fn interrupted_copy_keeps_original_floor_and_cursor_types() {
+        let mut cp = mk_entity(true, "mysql-bin.000010", 120, "source.orders");
+        cp.initialization = MysqlInitialization {
+            phase: MysqlInitializationPhase::Copying,
+            snapshot_file: "mysql-bin.000010".to_string(),
+            snapshot_position: 120,
+            cursor: Some(MysqlInitializationCursor::Text("A中".to_string())),
+        };
+        let cursor = InitPkCursor::from_checkpoint(cp.initialization.cursor.as_ref());
+        assert_eq!(cursor, InitPkCursor::Text("A中".to_string()));
+        assert_eq!(cursor.to_checkpoint(), cp.initialization.cursor);
+        let tables = HashMap::from([("source.orders".to_string(), cp)]);
+        let stream = StreamCheckpoint::new("stream".to_string(), "mysql-bin.000011".to_string(), 4);
+        assert_eq!(
+            compute_resume_position(None, None, Some(&stream), &tables),
+            ResumePosition::BinlogPosition("mysql-bin.000010".to_string(), 120)
+        );
+        assert_eq!(InitPkCursor::from_checkpoint(None), InitPkCursor::Start);
+        for cursor in [InitPkCursor::Signed(-1), InitPkCursor::Unsigned(u64::MAX)] {
+            assert_eq!(
+                InitPkCursor::from_checkpoint(cursor.to_checkpoint().as_ref()),
+                cursor
+            );
+        }
     }
 
     struct GuardTestSink {
@@ -4585,7 +4661,7 @@ mod tests {
             let error = source.validate_resume_positions().await.unwrap_err();
             assert!(matches!(error.error_type, CustomErrorType::Fatal));
             assert!(error.message.contains(if copying {
-                "初始化中断"
+                "初始化快照起点无效"
             } else {
                 "禁止回退 Latest"
             }));
@@ -4720,6 +4796,7 @@ mod tests {
             phase: MysqlInitializationPhase::AwaitingCdc,
             snapshot_file: "mysql-bin.000010".to_string(),
             snapshot_position: 120,
+            cursor: None,
         };
         let source = guard_test_source(
             HashMap::from([("source.orders".to_string(), checkpoint)]),

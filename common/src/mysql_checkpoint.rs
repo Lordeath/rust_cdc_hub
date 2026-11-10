@@ -21,11 +21,21 @@ pub enum MysqlInitializationPhase {
     Streaming,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum MysqlInitializationCursor {
+    Signed(i64),
+    Unsigned(u64),
+    Text(String),
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MysqlInitialization {
     pub phase: MysqlInitializationPhase,
     pub snapshot_file: String,
     pub snapshot_position: u32,
+    #[serde(default)]
+    pub cursor: Option<MysqlInitializationCursor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,6 +229,7 @@ mod tests {
             phase: MysqlInitializationPhase::Copying,
             snapshot_file: checkpoint.last_binlog_filename.clone(),
             snapshot_position: u32::MAX,
+            cursor: Some(MysqlInitializationCursor::Text("主键 A".to_string())),
         };
         service
             .record_table_applied(&table, checkpoint)
@@ -237,6 +248,10 @@ mod tests {
         assert_eq!(
             loaded.initialization.phase,
             MysqlInitializationPhase::Copying
+        );
+        assert_eq!(
+            loaded.initialization.cursor,
+            Some(MysqlInitializationCursor::Text("主键 A".to_string()))
         );
         assert_eq!(loaded.last_binlog_position, u32::MAX, "不能静默修正位点");
         drop(service);
@@ -270,6 +285,13 @@ mod tests {
             MysqlInitializationPhase::Legacy
         );
         assert!(!checkpoint.is_new);
+        let old_copy: MysqlInitialization = serde_json::from_str(
+            r#"{
+            "phase":"copying","snapshot_file":"mysql-bin.000010","snapshot_position":120
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(old_copy.cursor, None);
     }
 
     #[test]
