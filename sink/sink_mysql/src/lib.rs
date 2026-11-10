@@ -1624,9 +1624,15 @@ impl MySqlSink {
             let pk_name = pk_by_table
                 .get(table_key.to_ascii_lowercase().as_str())
                 .cloned()
-                .unwrap_or_else(|| panic!("pk not found: {}", table_key));
+                .ok_or_else(|| format!("pk not found: {}", table_key))?;
             match r.op {
                 Operation::CREATE(_) | Operation::UPDATE => {
+                    if r.after.get(&pk_name).is_none() {
+                        return Err(format!(
+                            "missing primary key for write: {}.{} {}",
+                            database, table_name, pk_name
+                        ));
+                    }
                     insert_map
                         .entry(table_name.clone())
                         .or_default()
@@ -1634,12 +1640,16 @@ impl MySqlSink {
                 }
                 Operation::DELETE => {
                     let pk = r.get_pk(pk_name.as_str());
-                    if !pk.is_none() {
-                        delete_map
-                            .entry(table_name.clone())
-                            .or_default()
-                            .push(pk.resolve_string());
+                    if pk.is_none() {
+                        return Err(format!(
+                            "missing primary key for delete: {}.{}",
+                            database, table_name
+                        ));
                     }
+                    delete_map
+                        .entry(table_name.clone())
+                        .or_default()
+                        .push(pk.resolve_string());
                 }
                 _ => {
                     panic!("unexpected operation {:?}", r.op);
@@ -1659,8 +1669,37 @@ impl MySqlSink {
                 .cloned()
                 .unwrap_or_default();
             if columns.is_empty() {
-                error!("columns is empty: {}.{}", database, table_name);
-                continue;
+                return Err(format!(
+                    "writable columns are empty: {}.{}",
+                    database, table_name
+                ));
+            }
+            let pk_name = pk_by_table
+                .get(&table_key)
+                .ok_or_else(|| format!("pk not found: {}", table_key))?;
+            if !columns
+                .iter()
+                .any(|column| column.eq_ignore_ascii_case(pk_name))
+            {
+                return Err(format!(
+                    "primary key is not writable: {}.{} {}",
+                    database, table_name, pk_name
+                ));
+            }
+            for record in &inserts {
+                let missing: Vec<_> = columns
+                    .iter()
+                    .filter(|column| !record.contains_key(column))
+                    .cloned()
+                    .collect();
+                if !missing.is_empty() {
+                    return Err(format!(
+                        "source record is missing columns: {}.{} [{}]",
+                        database,
+                        table_name,
+                        missing.join(", ")
+                    ));
+                }
             }
             let _timing = write_timings.get(&table_name).map(WriteTimingBatch::start);
             if let Err(e) = Self::execute_upsert_batch(
@@ -1691,7 +1730,7 @@ impl MySqlSink {
             let pk_name = pk_by_table
                 .get(table_key.as_str())
                 .cloned()
-                .unwrap_or_else(|| panic!("pk not found: {}", table_key));
+                .ok_or_else(|| format!("pk not found: {}", table_key))?;
             if let Err(e) = Self::execute_delete_batch(
                 &pool,
                 connection_url.as_str(),
@@ -1729,15 +1768,15 @@ impl MySqlSink {
             let pool = self
                 .target_pools
                 .get(database.to_ascii_lowercase().as_str())
-                .unwrap_or_else(|| panic!("target database pool not found: {}", database));
+                .ok_or_else(|| format!("target database pool not found: {}", database))?;
             let connection_url = self
                 .connection_urls
                 .get(database.to_ascii_lowercase().as_str())
-                .unwrap_or_else(|| panic!("target database url not found: {}", database));
+                .ok_or_else(|| format!("target database url not found: {}", database))?;
             let pk_name = pk_by_table
                 .get(table_key.as_str())
                 .cloned()
-                .unwrap_or_else(|| panic!("pk not found: {}", table_key));
+                .ok_or_else(|| format!("pk not found: {}", table_key))?;
             match record.op {
                 Operation::CREATE(_) | Operation::UPDATE => {
                     let columns = columns_by_table
@@ -1745,8 +1784,38 @@ impl MySqlSink {
                         .cloned()
                         .unwrap_or_default();
                     if columns.is_empty() {
-                        error!("columns is empty: {}.{}", database, table_name);
-                        continue;
+                        return Err(format!(
+                            "writable columns are empty: {}.{}",
+                            database, table_name
+                        ));
+                    }
+                    if !columns
+                        .iter()
+                        .any(|column| column.eq_ignore_ascii_case(&pk_name))
+                    {
+                        return Err(format!(
+                            "primary key is not writable: {}.{} {}",
+                            database, table_name, pk_name
+                        ));
+                    }
+                    if record.after.get(&pk_name).is_none() {
+                        return Err(format!(
+                            "missing primary key for write: {}.{} {}",
+                            database, table_name, pk_name
+                        ));
+                    }
+                    let missing: Vec<_> = columns
+                        .iter()
+                        .filter(|column| !record.after.contains_key(column))
+                        .cloned()
+                        .collect();
+                    if !missing.is_empty() {
+                        return Err(format!(
+                            "source record is missing columns: {}.{} [{}]",
+                            database,
+                            table_name,
+                            missing.join(", ")
+                        ));
                     }
                     let _timing = initialization_timing::track_write(std::slice::from_ref(record));
                     Self::execute_upsert_batch(
@@ -1764,7 +1833,10 @@ impl MySqlSink {
                 Operation::DELETE => {
                     let pk = record.get_pk(pk_name.as_str());
                     if pk.is_none() {
-                        continue;
+                        return Err(format!(
+                            "missing primary key for delete: {}.{} {}",
+                            database, table_name, pk_name
+                        ));
                     }
                     let deletes = vec![pk.resolve_string()];
                     Self::execute_delete_batch(
@@ -1891,6 +1963,23 @@ impl Sink for MySqlSink {
                 let stored_cols = Self::get_stored_cols(pool, database.as_str(), &table_name).await;
                 let exists_cols = Self::get_exists_cols(pool, database.as_str(), &table_name).await;
                 cols = Self::remove_cols(&mut cols, &stored_cols);
+                let missing: Vec<_> = cols
+                    .iter()
+                    .filter(|column| {
+                        !exists_cols
+                            .iter()
+                            .any(|existing| existing.eq_ignore_ascii_case(column))
+                    })
+                    .cloned()
+                    .collect();
+                if !missing.is_empty() {
+                    return Err(format!(
+                        "target columns are missing: {}.{} [{}]",
+                        database,
+                        table_name,
+                        missing.join(", ")
+                    ));
+                }
                 cols = Self::contains_cols(&mut cols, &exists_cols);
 
                 for c in cols {
@@ -2120,6 +2209,103 @@ mod tests {
             indexes: vec![],
             foreign_keys: vec![],
         }
+    }
+
+    fn test_sink_for_write_failures(record: DataBuffer, columns: &[&str]) -> MySqlSink {
+        let url = "mysql://invalid.invalid/dst";
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy(url)
+            .unwrap();
+        let mut columns_cache = CaseInsensitiveHashMapVecString::new_with_no_arg();
+        for column in columns {
+            columns_cache.entry_insert("dst.orders", (*column).to_string());
+        }
+        MySqlSink {
+            primary_database: "dst".to_string(),
+            target_pools: HashMap::from([("dst".to_string(), pool)]),
+            connection_urls: HashMap::from([("dst".to_string(), url.to_string())]),
+            table_info_list: vec![table_info("src", "dst", "varchar(64)")],
+            buffer: Mutex::new(vec![record]),
+            initialized: RwLock::new(true),
+            source_initializing: RwLock::new(false),
+            sink_batch_size: 256,
+            sync_foreign_key_tables: false,
+            table_info_cache: Mutex::new(CaseInsensitiveHashMapTableInfoVo::new_with_no_arg()),
+            columns_cache: Mutex::new(columns_cache),
+            checkpoint: Mutex::new(HashMap::new()),
+            checkpoint_service: CheckpointServiceHandle::disabled_for_tests(),
+        }
+    }
+
+    fn test_record(op: Operation, after: HashMap<String, Value>) -> DataBuffer {
+        DataBuffer::new_with_route(
+            "src".to_string(),
+            "dst".to_string(),
+            "orders".to_string(),
+            common::case_insensitive_hash_map::CaseInsensitiveHashMap::new_with_no_arg(),
+            common::case_insensitive_hash_map::CaseInsensitiveHashMap::new(after),
+            op,
+            "binlog.000001".to_string(),
+            0,
+            100,
+        )
+    }
+
+    #[tokio::test]
+    async fn missing_writable_columns_fails_and_keeps_buffer() {
+        let sink = test_sink_for_write_failures(
+            test_record(
+                Operation::UPDATE,
+                HashMap::from([("id".to_string(), Value::Int64(1))]),
+            ),
+            &[],
+        );
+        let error = sink.flush(&FlushByOperation::Cdc).await.unwrap_err();
+        assert!(error.contains("writable columns are empty"), "{error}");
+        assert_eq!(sink.buffer.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_primary_key_fails_and_keeps_buffer() {
+        for op in [Operation::UPDATE, Operation::DELETE] {
+            let sink =
+                test_sink_for_write_failures(test_record(op, HashMap::new()), &["id", "name"]);
+            let error = sink.flush(&FlushByOperation::Cdc).await.unwrap_err();
+            assert!(error.contains("missing primary key"), "{error}");
+            assert_eq!(sink.buffer.lock().await.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_non_key_field_fails_and_keeps_buffer() {
+        let sink = test_sink_for_write_failures(
+            test_record(
+                Operation::UPDATE,
+                HashMap::from([("id".to_string(), Value::Int64(1))]),
+            ),
+            &["id", "name"],
+        );
+        let error = sink.flush(&FlushByOperation::Cdc).await.unwrap_err();
+        assert!(
+            error.contains("source record is missing columns"),
+            "{error}"
+        );
+        assert_eq!(sink.buffer.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_table_metadata_fails_and_keeps_buffer() {
+        let mut sink = test_sink_for_write_failures(
+            test_record(
+                Operation::UPDATE,
+                HashMap::from([("id".to_string(), Value::Int64(1))]),
+            ),
+            &["id"],
+        );
+        sink.table_info_list.clear();
+        let error = sink.flush(&FlushByOperation::Cdc).await.unwrap_err();
+        assert!(error.contains("pk not found"), "{error}");
+        assert_eq!(sink.buffer.lock().await.len(), 1);
     }
 
     #[test]
