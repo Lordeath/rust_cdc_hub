@@ -29,7 +29,7 @@ use std::error::Error;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tracing::log::trace;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 pub struct MySqlSink {
     primary_database: String,
@@ -40,6 +40,7 @@ pub struct MySqlSink {
     initialized: RwLock<bool>,
     source_initializing: RwLock<bool>,
     sink_batch_size: usize,
+    adaptive_upsert_limits: Mutex<HashMap<(String, String), usize>>,
     sync_foreign_key_tables: bool,
 
     // 缓存所有字段名（第一批数据会取一次）
@@ -388,6 +389,7 @@ impl MySqlSink {
             initialized: RwLock::new(false),
             source_initializing: RwLock::new(true),
             sink_batch_size,
+            adaptive_upsert_limits: Mutex::new(HashMap::new()),
             sync_foreign_key_tables: config.sync_foreign_key_tables_enabled(),
             table_info_cache: Mutex::new(CaseInsensitiveHashMapTableInfoVo::new_with_no_arg()),
             columns_cache: Mutex::new(CaseInsensitiveHashMapVecString::new_with_no_arg()),
@@ -1753,6 +1755,48 @@ impl MySqlSink {
         Ok(())
     }
 
+    /// 同一次多行写入只包含连续的同库、同表插入/更新。
+    fn contiguous_upsert_count(
+        &self,
+        batch: &[DataBuffer],
+        start: usize,
+        limit: usize,
+        columns: &[String],
+    ) -> usize {
+        const MAX_BATCH_BYTES: usize = 512 * 1024;
+        let first = &batch[start];
+        let database = self.record_target_database(first);
+        let mut bytes = 0usize;
+        let mut count = 0;
+        for record in batch[start..].iter().take(limit) {
+            if !matches!(record.op, Operation::CREATE(_) | Operation::UPDATE)
+                || self.record_target_database(record) != database
+                || record.table_name != first.table_name
+            {
+                break;
+            }
+            let row_bytes = columns.iter().fold(0usize, |size, column| {
+                let value_size = match record.after.get(column) {
+                    Value::String(value)
+                    | Value::Decimal(value)
+                    | Value::Time(value)
+                    | Value::Date(value)
+                    | Value::DateTime(value)
+                    | Value::Json(value) => value.len(),
+                    Value::Blob(value) => value.len(),
+                    _ => 64,
+                };
+                size.saturating_add(value_size).saturating_add(16)
+            });
+            if count > 0 && bytes.saturating_add(row_bytes) > MAX_BATCH_BYTES {
+                break;
+            }
+            bytes = bytes.saturating_add(row_bytes);
+            count += 1;
+        }
+        count
+    }
+
     async fn flush_records_in_order(
         &self,
         batch: &[DataBuffer],
@@ -1760,11 +1804,12 @@ impl MySqlSink {
         pk_by_table: &HashMap<String, String>,
         disable_foreign_key_checks: bool,
     ) -> Result<(), String> {
-        for record in batch {
+        let mut index = 0;
+        while index < batch.len() {
+            let record = &batch[index];
             let database = self.record_target_database(record);
             let table_name = record.table_name.clone();
-            let table_key =
-                Self::target_table_key(database.as_str(), table_name.as_str()).to_ascii_lowercase();
+            let table_key = Self::target_table_key(&database, &table_name).to_ascii_lowercase();
             let pool = self
                 .target_pools
                 .get(database.to_ascii_lowercase().as_str())
@@ -1774,13 +1819,12 @@ impl MySqlSink {
                 .get(database.to_ascii_lowercase().as_str())
                 .ok_or_else(|| format!("target database url not found: {}", database))?;
             let pk_name = pk_by_table
-                .get(table_key.as_str())
-                .cloned()
+                .get(&table_key)
                 .ok_or_else(|| format!("pk not found: {}", table_key))?;
             match record.op {
                 Operation::CREATE(_) | Operation::UPDATE => {
                     let columns = columns_by_table
-                        .get(table_key.as_str())
+                        .get(&table_key)
                         .cloned()
                         .unwrap_or_default();
                     if columns.is_empty() {
@@ -1791,69 +1835,119 @@ impl MySqlSink {
                     }
                     if !columns
                         .iter()
-                        .any(|column| column.eq_ignore_ascii_case(&pk_name))
+                        .any(|column| column.eq_ignore_ascii_case(pk_name))
                     {
                         return Err(format!(
                             "primary key is not writable: {}.{} {}",
                             database, table_name, pk_name
                         ));
                     }
-                    if record.after.get(&pk_name).is_none() {
+                    // MySQL 预编译语句最多 65535 个参数；为协议留余量。
+                    // 使用原始库名与表名区分大小写和标识符中的点。
+                    let adaptive_key = (database.clone(), table_name.clone());
+                    let learned_limit = self
+                        .adaptive_upsert_limits
+                        .lock()
+                        .await
+                        .get(&adaptive_key)
+                        .copied()
+                        .unwrap_or(256);
+                    let max_rows = (60_000 / columns.len()).min(256).min(learned_limit);
+                    if max_rows == 0 {
                         return Err(format!(
-                            "missing primary key for write: {}.{} {}",
-                            database, table_name, pk_name
+                            "too many writable columns: {}.{}",
+                            database, table_name
                         ));
                     }
-                    let missing: Vec<_> = columns
-                        .iter()
-                        .filter(|column| !record.after.contains_key(column))
-                        .cloned()
-                        .collect();
-                    if !missing.is_empty() {
-                        return Err(format!(
-                            "source record is missing columns: {}.{} [{}]",
-                            database,
-                            table_name,
-                            missing.join(", ")
-                        ));
+                    let count = self.contiguous_upsert_count(batch, index, max_rows, &columns);
+                    let group = &batch[index..index + count];
+                    let mut inserts = Vec::with_capacity(count);
+                    for item in group {
+                        if item.after.get(pk_name).is_none() {
+                            return Err(format!(
+                                "missing primary key for write: {}.{} {}",
+                                database, table_name, pk_name
+                            ));
+                        }
+                        let missing: Vec<_> = columns
+                            .iter()
+                            .filter(|column| !item.after.contains_key(column))
+                            .cloned()
+                            .collect();
+                        if !missing.is_empty() {
+                            return Err(format!(
+                                "source record is missing columns: {}.{} [{}]",
+                                database,
+                                table_name,
+                                missing.join(", ")
+                            ));
+                        }
+                        inserts.push(item.after.clone());
                     }
-                    let _timing = initialization_timing::track_write(std::slice::from_ref(record));
-                    Self::execute_upsert_batch(
-                        pool,
-                        connection_url.as_str(),
-                        database.as_str(),
-                        table_name.as_str(),
-                        &columns,
-                        std::slice::from_ref(&record.after),
-                        disable_foreign_key_checks,
-                    )
-                    .await
-                    .map(|_| ())?;
+                    let _timing = initialization_timing::track_write(group);
+                    let mut offset = 0;
+                    let mut write_limit = count;
+                    let mut reduced = false;
+                    while offset < inserts.len() {
+                        let end = offset.saturating_add(write_limit).min(inserts.len());
+                        match Self::execute_upsert_batch(
+                            pool,
+                            connection_url,
+                            &database,
+                            &table_name,
+                            &columns,
+                            &inserts[offset..end],
+                            disable_foreign_key_checks,
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                offset = end;
+                                if reduced {
+                                    let mut limits = self.adaptive_upsert_limits.lock().await;
+                                    let limit =
+                                        limits.entry(adaptive_key.clone()).or_insert(write_limit);
+                                    *limit = (*limit).min(write_limit);
+                                    reduced = false;
+                                }
+                            }
+                            Err(error) => {
+                                let attempted = end - offset;
+                                if attempted == 1 {
+                                    return Err(error);
+                                }
+                                write_limit = (attempted / 2).max(1);
+                                reduced = true;
+                                warn!(
+                                    "MySQL batch upsert failed; reducing batch size to {}: {}.{}: {}",
+                                    write_limit, database, table_name, error
+                                );
+                            }
+                        }
+                    }
+                    index += count;
                 }
                 Operation::DELETE => {
-                    let pk = record.get_pk(pk_name.as_str());
+                    let pk = record.get_pk(pk_name);
                     if pk.is_none() {
                         return Err(format!(
                             "missing primary key for delete: {}.{} {}",
                             database, table_name, pk_name
                         ));
                     }
-                    let deletes = vec![pk.resolve_string()];
                     Self::execute_delete_batch(
                         pool,
-                        connection_url.as_str(),
-                        database.as_str(),
-                        table_name.as_str(),
-                        pk_name.as_str(),
-                        &deletes,
+                        connection_url,
+                        &database,
+                        &table_name,
+                        pk_name,
+                        &[pk.resolve_string()],
                         disable_foreign_key_checks,
                     )
-                    .await
-                    .map(|_| ())?;
+                    .await?;
+                    index += 1;
                 }
-                _ => {
-                    return Err(format!("unexpected operation {:?}", record.op));
-                }
+                _ => return Err(format!("unexpected operation {:?}", record.op)),
             }
         }
         Ok(())
@@ -2229,6 +2323,7 @@ mod tests {
             initialized: RwLock::new(true),
             source_initializing: RwLock::new(false),
             sink_batch_size: 256,
+            adaptive_upsert_limits: Mutex::new(HashMap::new()),
             sync_foreign_key_tables: false,
             table_info_cache: Mutex::new(CaseInsensitiveHashMapTableInfoVo::new_with_no_arg()),
             columns_cache: Mutex::new(columns_cache),
@@ -2306,6 +2401,73 @@ mod tests {
         let error = sink.flush(&FlushByOperation::Cdc).await.unwrap_err();
         assert!(error.contains("pk not found"), "{error}");
         assert_eq!(sink.buffer.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn upsert_batches_stop_at_delete_table_and_size_boundaries() {
+        let row = || HashMap::from([("id".to_string(), Value::Int64(1))]);
+        let mut other_table = test_record(Operation::CREATE(false), row());
+        other_table.table_name = "other".to_string();
+        let batch = vec![
+            test_record(Operation::CREATE(false), row()),
+            test_record(Operation::UPDATE, row()),
+            test_record(Operation::DELETE, row()),
+            test_record(Operation::UPDATE, row()),
+            other_table,
+        ];
+        let sink = test_sink_for_write_failures(batch[0].clone(), &["id"]);
+        assert_eq!(
+            sink.contiguous_upsert_count(&batch, 0, 256, &["id".to_string()]),
+            2
+        );
+        assert_eq!(
+            sink.contiguous_upsert_count(&batch, 0, 1, &["id".to_string()]),
+            1
+        );
+        assert_eq!(
+            sink.contiguous_upsert_count(&batch, 3, 256, &["id".to_string()]),
+            1
+        );
+        let mut case_variant = test_record(Operation::UPDATE, row());
+        case_variant.table_name = "ORDERS".to_string();
+        let cases = vec![test_record(Operation::CREATE(false), row()), case_variant];
+        assert_eq!(
+            sink.contiguous_upsert_count(&cases, 0, 256, &["id".to_string()]),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn learned_batch_limits_are_scoped_to_exact_target_table() {
+        let sink =
+            test_sink_for_write_failures(test_record(Operation::UPDATE, HashMap::new()), &["id"]);
+        let mut limits = sink.adaptive_upsert_limits.lock().await;
+        limits.insert(("dst".to_string(), "orders".to_string()), 4);
+        assert_eq!(
+            limits.get(&("dst".to_string(), "orders".to_string())),
+            Some(&4)
+        );
+        assert!(!limits.contains_key(&("dst".to_string(), "ORDERS".to_string())));
+        assert!(!limits.contains_key(&("other".to_string(), "orders".to_string())));
+    }
+
+    #[tokio::test]
+    async fn upsert_batch_bounds_large_values_without_rejecting_a_single_large_row() {
+        let row = || {
+            HashMap::from([
+                ("id".to_string(), Value::Int64(1)),
+                ("name".to_string(), Value::String("x".repeat(300_000))),
+            ])
+        };
+        let batch = vec![
+            test_record(Operation::CREATE(false), row()),
+            test_record(Operation::UPDATE, row()),
+        ];
+        let sink = test_sink_for_write_failures(batch[0].clone(), &["id", "name"]);
+        assert_eq!(
+            sink.contiguous_upsert_count(&batch, 0, 256, &["id".into(), "name".into()]),
+            1
+        );
     }
 
     #[test]
